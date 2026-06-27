@@ -586,8 +586,10 @@ export class GameServer {
           return;
         }
         
-        // Kirim waktu setiap detik
-        this._broadcastToRoom(room, ["gameLowCardTimeLeft", `${timeLeft}s`]);
+        // Kirim hanya di detik 15, 10, 5, dan 0
+        if (timeLeft === 15 || timeLeft === 10 || timeLeft === 5) {
+          this._broadcastToRoom(room, ["gameLowCardTimeLeft", `${timeLeft}s`]);
+        }
         
         if (timeLeft === 0) {
           clearInterval(timer);
@@ -743,8 +745,10 @@ export class GameServer {
           return;
         }
         
-        // Kirim waktu setiap detik
-        this._broadcastToRoom(room, ["gameLowCardTimeLeft", `${timeLeft}s`]);
+        // Kirim hanya di detik 15, 10, 5, dan 0
+        if (timeLeft === 15 || timeLeft === 10 || timeLeft === 5) {
+          this._broadcastToRoom(room, ["gameLowCardTimeLeft", `${timeLeft}s`]);
+        }
         
         if (timeLeft === 0) {
           clearInterval(timer);

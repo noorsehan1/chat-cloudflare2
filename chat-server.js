@@ -1,11 +1,12 @@
-// ==================== CHAT SERVER - STABLE WITH ALARM (NO IDLE KICK) ====================
+// ==================== CHAT SERVER - NO KICK INACTIVE USER ====================
 
- const C = {
-  NUMBER_CHANGE_TICKS: 90,
+const C = {
+  NUMBER_CHANGE_TICKS: 180,  // 180 ticks × 5 detik = 15 menit
   MAX_SEATS: 45,
   MAX_GLOBAL_CONNECTIONS: 500,
-  ALARM_INTERVAL: 10000,
   MAX_MESSAGE_SIZE: 5000,
+  CLEANUP_INTERVAL: 30000,   // 30 detik
+  TICK_INTERVAL: 5000,       // 5 detik
 };
 
 const ROOMS = [
@@ -148,21 +149,12 @@ export class ChatServer {
     this._isCleaningUp = false;
     this._cleanupInProgress = false;
     
-    // Alarm system
-    this._alarmProcessing = false;
+    // Tick system
     this._tickCount = 0;
     this.currentNumber = 1;
-    this._lastAlarmTime = Date.now();
-    this._alarmFailCount = 0;
-    this._alarmStartTime = 0;
-    this._alarmScheduled = false;
-    this._alarmTimeout = null;
-    this._alarmRescheduleAttempts = 0;
-    this._maxAlarmRescheduleAttempts = 5;
-    
-    // PERBAIKAN: Tambahkan heartbeat interval
-    this._heartbeatInterval = null;
-    this._lastHeartbeatTime = Date.now();
+    this._tickInterval = null;
+    this._cleanupInterval = null;
+    this._lastActivityTime = Date.now();
     
     // Initialize rooms
     for (const room of ROOMS) {
@@ -170,232 +162,41 @@ export class ChatServer {
       this.roomClients.set(room, new Set());
     }
     
-    // Initialize state from storage
-    this._initState();
+    // Start intervals
+    this._startTickSystem();
   }
   
-  // ==================== INIT STATE ====================
+  // ==================== TICK SYSTEM ====================
   
-  async _initState() {
-    try {
-      const savedNumber = await this.state.storage.get("currentNumber");
-      if (savedNumber !== undefined) this.currentNumber = savedNumber;
-      
-      const savedTick = await this.state.storage.get("tickCount");
-      if (savedTick !== undefined) this._tickCount = savedTick;
-      
-      // PERBAIKAN: Cek kapan terakhir server hidup
-      const lastAlive = await this.state.storage.get("lastAlive");
-      if (lastAlive && (Date.now() - lastAlive > 120000)) {
-        console.log("Server was down for more than 2 minutes, resetting some states");
-        // Reset jika perlu
-      }
-      
-      // PERBAIKAN: Simpan timestamp alive
-      await this.state.storage.put("lastAlive", Date.now());
-    } catch(e) {
-      // Use defaults
+  _startTickSystem() {
+    if (this._tickInterval) {
+      clearInterval(this._tickInterval);
+    }
+    if (this._cleanupInterval) {
+      clearInterval(this._cleanupInterval);
     }
     
-    this._scheduleAlarm(100);
-    
-    // PERBAIKAN: Start heartbeat
-    this._startHeartbeat();
-  }
-  
-  // PERBAIKAN: Tambahkan method heartbeat
-  _startHeartbeat() {
-    if (this._heartbeatInterval) {
-      clearInterval(this._heartbeatInterval);
-    }
-    
-    this._heartbeatInterval = setInterval(() => {
+    // Tick untuk update number (setiap 5 detik)
+    this._tickInterval = setInterval(() => {
       if (!this.closing && !this.isDestroyed) {
-        this._doHeartbeat();
+        this._doTick();
       }
-    }, 15000); // Setiap 15 detik
+    }, C.TICK_INTERVAL);
+    
+    // Cleanup untuk dead connections (setiap 30 detik)
+    this._cleanupInterval = setInterval(() => {
+      if (!this.closing && !this.isDestroyed) {
+        this._doCleanup();
+      }
+    }, C.CLEANUP_INTERVAL);
   }
   
-  // PERBAIKAN: Method heartbeat
-  async _doHeartbeat() {
+  _doTick() {
     try {
-      this._lastHeartbeatTime = Date.now();
+      this._tickCount++;
+      this._lastActivityTime = Date.now();
       
-      // Simpan state secara periodik
-      await this.state.storage.put("lastAlive", Date.now());
-      
-      // Jika alarm tidak berjalan, restart
-      if (!this._alarmScheduled && !this._alarmProcessing) {
-        console.log("Heartbeat: Alarm not running, restarting...");
-        await this._scheduleAlarm(100);
-      }
-      
-      // Cleanup jika perlu
-      if (this.wsSet.size === 0 && !this._cleanupInProgress) {
-        // Server idle, tetap hidup
-        if (this._tickCount % 5 === 0) {
-          await this._saveState();
-        }
-      }
-    } catch(e) {
-      // Ignore
-    }
-  }
-  
-  // ==================== ALARM SYSTEM ====================
-  
-  async _scheduleAlarm(delayMs = C.ALARM_INTERVAL) {
-    if (this.closing || this.isDestroyed) {
-      this._alarmScheduled = false;
-      return;
-    }
-    
-    // Clean up any existing timeout
-    if (this._alarmTimeout) {
-      clearTimeout(this._alarmTimeout);
-      this._alarmTimeout = null;
-    }
-    
-    try {
-      await this.state.storage.setAlarm(Date.now() + delayMs);
-      this._alarmScheduled = true;
-      this._lastAlarmTime = Date.now();
-      this._alarmRescheduleAttempts = 0;
-      
-      // PERBAIKAN: Simpan status alarm
-      await this.state.storage.put("alarmScheduled", true);
-      await this.state.storage.put("lastAlarmSchedule", Date.now());
-    } catch(e) {
-      this._alarmScheduled = false;
-      this._alarmRescheduleAttempts++;
-      
-      // PERBAIKAN: Simpan status gagal
-      try {
-        await this.state.storage.put("alarmScheduled", false);
-        await this.state.storage.put("lastAlarmError", Date.now());
-      } catch(e2) {}
-      
-      // Fallback with exponential backoff
-      const backoffDelay = Math.min(5000 * Math.pow(2, this._alarmRescheduleAttempts), 30000);
-      
-      this._alarmTimeout = setTimeout(() => {
-        if (!this.closing && !this.isDestroyed && this._alarmRescheduleAttempts < this._maxAlarmRescheduleAttempts) {
-          this._scheduleAlarm(backoffDelay);
-        } else if (this._alarmRescheduleAttempts >= this._maxAlarmRescheduleAttempts) {
-          // Force reset alarm
-          this._alarmScheduled = false;
-          this._alarmRescheduleAttempts = 0;
-          this._alarmProcessing = false;
-          
-          // PERBAIKAN: Coba lagi dengan delay lebih panjang
-          setTimeout(() => {
-            if (!this.closing && !this.isDestroyed) {
-              this._scheduleAlarm(5000);
-            }
-          }, 10000);
-        }
-      }, 5000);
-    }
-  }
-  
-  async _cleanupDeadConnections() {
-    if (this._cleanupInProgress) return;
-    this._cleanupInProgress = true;
-    
-    try {
-      const toRemove = [];
-      
-      for (const ws of this.wsSet) {
-        // Hanya membersihkan koneksi yang sudah mati/terputus
-        // TIDAK ADA auto-kick untuk user diam
-        if (!ws || ws.readyState !== 1 || ws._closing) {
-          toRemove.push(ws);
-        }
-      }
-      
-      for (const ws of toRemove) {
-        try {
-          await this.cleanup(ws);
-        } catch(e) {
-          // Ignore cleanup errors
-        }
-      }
-    } catch(e) {
-      // Ignore
-    } finally {
-      this._cleanupInProgress = false;
-    }
-  }
-  
-  async _saveState() {
-    try {
-      await this.state.storage.put("currentNumber", this.currentNumber);
-      await this.state.storage.put("tickCount", this._tickCount);
-      await this.state.storage.put("lastAlive", Date.now()); // PERBAIKAN
-    } catch(e) {
-      // Log but don't crash
-      console.error("Failed to save state:", e.message);
-    }
-  }
-  
-  // PERBAIKAN: Tambahkan method untuk recover
-  async _recoverFromStaleState() {
-    try {
-      if (!this._alarmScheduled && !this._alarmProcessing && !this.closing && !this.isDestroyed) {
-        console.log("Recovering stale server state...");
-        
-        // Cek storage
-        const lastAlive = await this.state.storage.get("lastAlive");
-        const alarmScheduled = await this.state.storage.get("alarmScheduled");
-        
-        if (!alarmScheduled || (lastAlive && Date.now() - lastAlive > 60000)) {
-          // Reset alarm
-          await this._scheduleAlarm(100);
-          await this._saveState();
-          console.log("Server recovered successfully");
-        }
-      }
-    } catch(e) {
-      console.error("Recovery failed:", e.message);
-    }
-  }
-  
-  async alarm() {
-    if (this.closing || this.isDestroyed) {
-      this._alarmScheduled = false;
-      return;
-    }
-    
-    // PERBAIKAN: Update heartbeat time
-    this._lastHeartbeatTime = Date.now();
-    
-    // Handle stuck alarm
-    if (this._alarmProcessing) {
-      if (Date.now() - this._alarmStartTime > 30000) {
-        // Force reset stuck alarm
-        this._alarmProcessing = false;
-        this._alarmFailCount++;
-        
-        // Reschedule
-        if (!this.closing && !this.isDestroyed) {
-          await this._scheduleAlarm(C.ALARM_INTERVAL);
-        }
-      }
-      return;
-    }
-    
-    this._alarmProcessing = true;
-    this._alarmStartTime = Date.now();
-    this._lastAlarmTime = Date.now();
-    
-    try {
-      // Cleanup dead connections
-      await this._cleanupDeadConnections();
-      
-      // Increment tick
-      this._tickCount = (this._tickCount || 0) + 1;
-      
-      // Change number every N ticks
+      // Change number every N ticks (default 180 ticks = 15 menit)
       if (this._tickCount % C.NUMBER_CHANGE_TICKS === 0) {
         this.currentNumber = this.currentNumber < 6 ? this.currentNumber + 1 : 1;
         
@@ -408,33 +209,49 @@ export class ChatServer {
         const numberMsg = JSON.stringify(["currentNumber", this.currentNumber]);
         for (const [room, clients] of this.roomClients) {
           if (clients && clients.size > 0) {
-            await this._broadcastToRoom(room, numberMsg);
+            this._broadcastToRoom(room, numberMsg).catch(() => {});
           }
         }
       }
       
-      // Save state
-      await this._saveState();
-      this._alarmFailCount = 0;
-      
-      // PERBAIKAN: Simpan status alarm sukses
-      await this.state.storage.put("alarmScheduled", true);
-      await this.state.storage.put("lastAlive", Date.now());
-      
-    } catch(e) {
-      this._alarmFailCount++;
-      console.error("Alarm error:", e.message);
-      
-      // PERBAIKAN: Simpan error state
-      try {
-        await this.state.storage.put("lastAlarmError", Date.now());
-      } catch(e2) {}
-    } finally {
-      this._alarmProcessing = false;
-      
-      if (!this.closing && !this.isDestroyed) {
-        await this._scheduleAlarm(C.ALARM_INTERVAL);
+      // Update user count in all rooms
+      for (const room of ROOMS) {
+        const roomMan = this.rooms.get(room);
+        if (roomMan) {
+          this.broadcast(room, ["roomUserCount", room, roomMan.getCount()]).catch(() => {});
+        }
       }
+    } catch(e) {
+      // Silent catch
+    }
+  }
+  
+  async _doCleanup() {
+    if (this._cleanupInProgress) return;
+    this._cleanupInProgress = true;
+    
+    try {
+      const toRemove = [];
+      
+      for (const ws of this.wsSet) {
+        // HANYA hapus koneksi yang sudah mati/terputus
+        // TIDAK ADA KICK untuk user yang tidak aktif
+        if (!ws || ws.readyState !== 1 || ws._closing) {
+          toRemove.push(ws);
+        }
+      }
+      
+      for (const ws of toRemove) {
+        try {
+          await this.cleanup(ws);
+        } catch(e) {
+          // Ignore
+        }
+      }
+    } catch(e) {
+      // Ignore
+    } finally {
+      this._cleanupInProgress = false;
     }
   }
   
@@ -449,7 +266,6 @@ export class ChatServer {
     const toRemove = [];
     
     for (const ws of clients) {
-      // Skip if ws is invalid
       if (!ws || ws.readyState !== 1 || ws._closing || this._cleaningUp.has(ws)) {
         toRemove.push(ws);
         continue;
@@ -463,7 +279,6 @@ export class ChatServer {
       }
     }
     
-    // Cleanup failed connections
     for (const ws of toRemove) {
       clients.delete(ws);
       try {
@@ -481,7 +296,7 @@ export class ChatServer {
     try {
       await this._broadcastToRoom(room, JSON.stringify(msg));
     } catch(e) {
-      // Ignore broadcast errors
+      // Ignore
     }
   }
   
@@ -546,7 +361,6 @@ export class ChatServer {
   // ==================== CLEANUP ====================
   
   async cleanup(ws) {
-    // Prevent multiple cleanup
     if (!ws || ws._cleaning || this._cleaningUp.has(ws) || this._isCleaningUp) {
       return;
     }
@@ -559,13 +373,11 @@ export class ChatServer {
       const username = ws.username;
       const room = ws.room;
       
-      // Remove from room clients
       if (room) {
         const clients = this.roomClients.get(room);
         if (clients) clients.delete(ws);
       }
       
-      // Remove from multi room
       const activeData = this.wsActiveMulti.get(ws);
       if (activeData?.room) {
         const clients = this.roomClients.get(activeData.room);
@@ -573,7 +385,6 @@ export class ChatServer {
       }
       this.wsActiveMulti.delete(ws);
       
-      // Remove user connections
       if (username) {
         const connections = this.userConnections.get(username);
         if (connections) {
@@ -582,7 +393,6 @@ export class ChatServer {
           const seatInfo = this.userSeat.get(username);
           const isMulti = seatInfo?.isMulti === true;
           
-          // Only remove seat if not multi and no connections left
           if (!isMulti && connections.size === 0) {
             this.userConnections.delete(username);
             this.userCountry.delete(username);
@@ -605,7 +415,6 @@ export class ChatServer {
         }
       }
       
-      // Remove from wsSet
       this.wsSet.delete(ws);
       
     } catch(e) {
@@ -615,7 +424,6 @@ export class ChatServer {
       this._cleaningUp.delete(ws);
       this._isCleaningUp = false;
       
-      // Close connection if still open
       try {
         if (ws && ws.readyState === 1) {
           ws.close(1000, "Cleanup");
@@ -1030,7 +838,6 @@ export class ChatServer {
       return;
     }
     
-    // Clean up existing connections for this user
     const existingConns = this.userConnections.get(username);
     if (existingConns?.size > 0) {
       for (const oldWs of Array.from(existingConns)) {
@@ -1125,9 +932,7 @@ export class ChatServer {
     
     this.updateRoomCount(roomName);
     
-    // Schedule delayed state send with cleanup
-    const timeout = setTimeout(() => {
-      this._pendingTimeouts.delete(timeout);
+    setTimeout(() => {
       try {
         if (ws && ws.readyState === 1 && !this.closing && !this.isDestroyed) {
           this.sendAllStateTo(ws, roomName, true);
@@ -1137,29 +942,12 @@ export class ChatServer {
       }
     }, 1000);
     
-    this._pendingTimeouts.add(timeout);
-    
     return true;
   }
   
   // ==================== FETCH ====================
   
   async fetch(req) {
-    // PERBAIKAN: Recover dari stale state
-    if (!this._alarmScheduled && !this._alarmProcessing && !this.closing && !this.isDestroyed) {
-      await this._recoverFromStaleState();
-    }
-    
-    // Ensure alarm is running
-    if (!this._alarmProcessing && !this.closing && !this.isDestroyed) {
-      try {
-        await this.alarm();
-        await this._scheduleAlarm(C.ALARM_INTERVAL);
-      } catch(e) {
-        // Ignore
-      }
-    }
-    
     if (this.closing || this.isDestroyed) {
       return new Response("Shutting down", { status: 503 });
     }
@@ -1167,7 +955,6 @@ export class ChatServer {
     try {
       const url = new URL(req.url);
       
-      // Health check
       if (url.pathname === "/health") {
         const roomCounts = {};
         for (const [room, rm] of this.rooms) {
@@ -1176,49 +963,12 @@ export class ChatServer {
         
         return new Response(JSON.stringify({
           status: "alive",
-          alarmScheduled: this._alarmScheduled,
-          alarmProcessing: this._alarmProcessing,
-          lastAlarm: this._lastAlarmTime,
-          timeSinceLastAlarm: Date.now() - this._lastAlarmTime,
           tickCount: this._tickCount,
           currentNumber: this.currentNumber,
           wsConnections: this.wsSet.size,
           userCount: this.userConnections.size,
-          alarmFailCount: this._alarmFailCount,
           roomCounts: roomCounts,
-          pendingTimeouts: this._pendingTimeouts.size,
-          cleaningUp: this._cleaningUp.size,
-          heartbeatActive: this._heartbeatInterval !== null,
-          lastHeartbeat: this._lastHeartbeatTime
-        }), { 
-          headers: { 
-            "Content-Type": "application/json",
-            "Cache-Control": "no-cache" // PERBAIKAN
-          } 
-        });
-      }
-      
-      // PERBAIKAN: Endpoint ping untuk keep-alive
-      if (url.pathname === "/ping") {
-        return new Response("pong", { 
-          headers: { 
-            "Content-Type": "text/plain",
-            "Cache-Control": "no-cache"
-          } 
-        });
-      }
-      
-      // PERBAIKAN: Endpoint keep-alive
-      if (url.pathname === "/keep-alive" && req.method === "POST") {
-        if (!this._alarmProcessing) {
-          await this.alarm();
-          await this._scheduleAlarm(C.ALARM_INTERVAL);
-        }
-        await this._saveState();
-        return new Response(JSON.stringify({
-          success: true,
-          alarmScheduled: this._alarmScheduled,
-          timestamp: Date.now()
+          uptime: Date.now() - this._lastActivityTime
         }), { 
           headers: { 
             "Content-Type": "application/json",
@@ -1227,14 +977,14 @@ export class ChatServer {
         });
       }
       
-      // PERBAIKAN: Endpoint status lengkap
       if (url.pathname === "/status") {
         return new Response(JSON.stringify({
           alive: true,
-          alarmRunning: this._alarmScheduled || this._alarmProcessing,
           wsCount: this.wsSet.size,
           userCount: this.userConnections.size,
-          uptime: Date.now() - this._lastAlarmTime,
+          rooms: this.rooms.size,
+          tickRunning: this._tickInterval !== null,
+          cleanupRunning: this._cleanupInterval !== null,
           timestamp: Date.now()
         }), { 
           headers: { 
@@ -1244,43 +994,9 @@ export class ChatServer {
         });
       }
       
-      // Trigger alarm manually
-      if (url.pathname === "/trigger-alarm" && req.method === "POST") {
-        await this.alarm();
-        return new Response(JSON.stringify({ 
-          success: true, 
-          message: "Alarm triggered manually" 
-        }), { 
-          headers: { "Content-Type": "application/json" } 
-        });
-      }
-      
-      // Reset server
-      if (url.pathname === "/reset" && req.method === "POST") {
-        await this.reset();
-        return new Response(JSON.stringify({ 
-          success: true, 
-          message: "Server reset successfully" 
-        }), { 
-          headers: { "Content-Type": "application/json" } 
-        });
-      }
-      
-      // Force cleanup
-      if (url.pathname === "/cleanup" && req.method === "POST") {
-        await this._cleanupDeadConnections();
-        return new Response(JSON.stringify({ 
-          success: true, 
-          message: "Cleanup triggered" 
-        }), { 
-          headers: { "Content-Type": "application/json" } 
-        });
-      }
-      
-      // WebSocket upgrade
       const upgrade = req.headers.get("Upgrade");
       if (upgrade !== "websocket") {
-        return new Response("Chat Server - ALARM ACTIVE", { 
+        return new Response("Chat Server - RUNNING", { 
           status: 200,
           headers: {
             "Cache-Control": "no-cache"
@@ -1288,7 +1004,6 @@ export class ChatServer {
         });
       }
       
-      // Check max connections
       if (this.wsSet.size >= C.MAX_GLOBAL_CONNECTIONS) {
         return new Response("Server full", { status: 503 });
       }
@@ -1303,16 +1018,14 @@ export class ChatServer {
         return new Response("WebSocket acceptance failed", { status: 500 }); 
       }
       
-      // Initialize server WebSocket
       server.username = null;
       server.room = null;
       server.roomname = null;
       server.idtarget = null;
       server._closing = false;
       server.clientCountry = clientCountry;
-      server._wsId = Date.now() + Math.random(); // Unique ID
+      server._wsId = Date.now() + Math.random();
       
-      // Add to wsSet
       if (!this.wsSet.has(server)) {
         this.wsSet.add(server);
       }
@@ -1322,85 +1035,6 @@ export class ChatServer {
     } catch(e) {
       console.error("Fetch error:", e.message);
       return new Response("Internal Server Error", { status: 500 });
-    }
-  }
-  
-  // ==================== RESET ====================
-  
-  async reset() {
-    this.closing = true;
-    
-    // Clear all pending timeouts
-    for (const timeout of this._pendingTimeouts) {
-      clearTimeout(timeout);
-    }
-    this._pendingTimeouts.clear();
-    
-    // PERBAIKAN: Clear heartbeat
-    if (this._heartbeatInterval) {
-      clearInterval(this._heartbeatInterval);
-      this._heartbeatInterval = null;
-    }
-    
-    // Notify and close all connections
-    const wsCopy = Array.from(this.wsSet);
-    for (const ws of wsCopy) {
-      if (ws?.readyState === 1) {
-        try { 
-          ws.send(JSON.stringify(["serverRestart", "Restarting..."])); 
-        } catch(e) {}
-        try { 
-          ws.close(1000, "Restart"); 
-        } catch(e) {}
-      }
-      try {
-        await this.cleanup(ws);
-      } catch(e) {
-        // Ignore
-      }
-    }
-    
-    // Clear all data
-    this.wsSet.clear();
-    this.userConnections.clear();
-    this.userSeat.clear();
-    this.userRoom.clear();
-    this.userCountry.clear();
-    this.wsActiveMulti.clear();
-    this._processingMessages.clear();
-    this._cleaningUp.clear();
-    
-    // Reinitialize rooms
-    for (const room of ROOMS) {
-      this.rooms.set(room, new RoomManager(room));
-      this.roomClients.set(room, new Set());
-    }
-    
-    // Reset state
-    this.currentNumber = 1;
-    this._tickCount = 0;
-    this._alarmProcessing = false;
-    this._alarmScheduled = false;
-    this._alarmFailCount = 0;
-    this._alarmRescheduleAttempts = 0;
-    this._lastHeartbeatTime = Date.now(); // PERBAIKAN
-    
-    if (this._alarmTimeout) {
-      clearTimeout(this._alarmTimeout);
-      this._alarmTimeout = null;
-    }
-    
-    this.closing = false;
-    this.isDestroyed = false;
-    
-    // Restart alarm
-    try {
-      await this.alarm();
-      await this._scheduleAlarm(C.ALARM_INTERVAL);
-      // PERBAIKAN: Restart heartbeat
-      this._startHeartbeat();
-    } catch(e) {
-      // Ignore
     }
   }
   
@@ -1428,25 +1062,20 @@ export class ChatServer {
     this.closing = true;
     this.isDestroyed = true;
     
-    // PERBAIKAN: Clear heartbeat
-    if (this._heartbeatInterval) {
-      clearInterval(this._heartbeatInterval);
-      this._heartbeatInterval = null;
+    if (this._tickInterval) {
+      clearInterval(this._tickInterval);
+      this._tickInterval = null;
+    }
+    if (this._cleanupInterval) {
+      clearInterval(this._cleanupInterval);
+      this._cleanupInterval = null;
     }
     
-    // Clear all pending timeouts
     for (const timeout of this._pendingTimeouts) {
       clearTimeout(timeout);
     }
     this._pendingTimeouts.clear();
     
-    // Clear alarm timeout
-    if (this._alarmTimeout) {
-      clearTimeout(this._alarmTimeout);
-      this._alarmTimeout = null;
-    }
-    
-    // Close all connections
     const wsCopy = Array.from(this.wsSet);
     for (const ws of wsCopy) {
       if (ws?.readyState === 1) {
@@ -1464,7 +1093,6 @@ export class ChatServer {
       }
     }
     
-    // Clear all data
     this.wsSet.clear();
     this.userConnections.clear();
     this.userSeat.clear();

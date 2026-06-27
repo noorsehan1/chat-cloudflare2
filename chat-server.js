@@ -763,7 +763,9 @@ export class ChatServer {
             break;
           }
           
-          if (ws.room && ws.room !== kursiRoom) {
+          // PERBAIKAN: Cek apakah user ada di room tersebut (termasuk MULTI)
+          const seatInfo = this.userSeat.get(ws.username);
+          if (!seatInfo || seatInfo.room !== kursiRoom) {
             break;
           }
           
@@ -797,7 +799,9 @@ export class ChatServer {
             break;
           }
           
-          if (ws.room && ws.room !== pointRoom) {
+          // PERBAIKAN: Cek apakah user ada di room tersebut (termasuk MULTI)
+          const seatInfo = this.userSeat.get(ws.username);
+          if (!seatInfo || seatInfo.room !== pointRoom) {
             break;
           }
           
@@ -817,7 +821,9 @@ export class ChatServer {
             break;
           }
           
-          if (ws.room && ws.room !== removeRoom) {
+          // PERBAIKAN: Cek apakah user ada di room tersebut (termasuk MULTI)
+          const seatInfo = this.userSeat.get(ws.username);
+          if (!seatInfo || seatInfo.room !== removeRoom) {
             break;
           }
           

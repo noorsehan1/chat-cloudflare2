@@ -103,18 +103,20 @@ class RoomManager {
     const old = this.seats.get(seat);
     if (!old) return false;
     
+    // PERBAIKAN: HANYA data dari input, TIDAK ada data server yang masuk
     const updateData = {
-      noimageUrl: data.noimageUrl !== undefined ? data.noimageUrl : old.noimageUrl,
-      namauser: old.namauser,
-      color: data.color !== undefined ? data.color : old.color,
-      itembawah: data.itembawah !== undefined ? data.itembawah : old.itembawah,
-      itematas: data.itematas !== undefined ? data.itematas : old.itematas,
-      vip: data.vip !== undefined ? data.vip : old.vip,
-      viptanda: data.viptanda !== undefined ? data.viptanda : old.viptanda,
+      noimageUrl: data.noimageUrl !== undefined ? data.noimageUrl : "",
+      namauser: old.namauser, // PERTAHANKAN username dari server
+      color: data.color !== undefined ? data.color : "",
+      itembawah: data.itembawah !== undefined ? data.itembawah : 0,
+      itematas: data.itematas !== undefined ? data.itematas : 0,
+      vip: data.vip !== undefined ? data.vip : 0,
+      viptanda: data.viptanda !== undefined ? data.viptanda : 0,
     };
     
+    // Jika ada percobaan ganti username, tetap pakai username lama
     if (data.namauser && data.namauser !== old.namauser) {
-      // Block username change
+      // Block username change - tetap pakai old.namauser
     }
     
     this.seats.set(seat, updateData);
@@ -486,7 +488,6 @@ export class ChatServer {
     return count;
   }
   
-  // PERBAIKAN: Validasi seat global
   _findUserSeatGlobal(username) {
     if (!username) return null;
     for (const [roomName, roomMan] of this.rooms) {
@@ -499,7 +500,6 @@ export class ChatServer {
     return null;
   }
   
-  // PERBAIKAN: Hapus user dari semua room
   async _removeUserFromAllRooms(username) {
     if (!username) return;
     
@@ -516,7 +516,6 @@ export class ChatServer {
       this.userRoom.delete(username);
     }
     
-    // Cek dan hapus dari room lain jika ada
     const globalSeat = this._findUserSeatGlobal(username);
     if (globalSeat) {
       const roomMan = this.rooms.get(globalSeat.room);
@@ -592,7 +591,6 @@ export class ChatServer {
       const username = ws.username;
       const room = ws.room;
       
-      // PERBAIKAN: Hapus dari semua room clients
       for (const [roomName, clients] of this.roomClients) {
         if (clients.has(ws)) {
           clients.delete(ws);
@@ -677,7 +675,6 @@ export class ChatServer {
           const multiRoomname = args[1];
           if (!multiUsername || !multiRoomname || this.closing || this.isDestroyed) break;
           
-          // PERBAIKAN: Hapus user dari semua room terlebih dahulu
           await this._removeUserFromAllRooms(multiUsername);
           
           const roomMan = this.rooms.get(multiRoomname);
@@ -784,11 +781,13 @@ export class ChatServer {
           const roomMan = this.rooms.get(kursiRoom);
           if (!roomMan) break;
           
+          // PERBAIKAN: Validasi - hanya user yang duduk di kursi itu yang bisa update
           const currentSeatData = roomMan.getSeat(kursiSeat);
           if (!currentSeatData || currentSeatData.namauser !== ws.username) {
             break;
           }
           
+          // PERBAIKAN: HANYA data dari input, TIDAK ada data server
           const updated = roomMan.updateSeat(kursiSeat, {
             noimageUrl: kursiNoimg, 
             namauser: kursiName, 
@@ -992,7 +991,6 @@ export class ChatServer {
     
     const userCountry = ws.clientCountry || "Unknown";
     
-    // PERBAIKAN: Batasi koneksi per user
     const existingConns = this.userConnections.get(username);
     if (existingConns && existingConns.size >= C.MAX_CONNECTIONS_PER_USER) {
       try {
@@ -1049,7 +1047,6 @@ export class ChatServer {
       return;
     }
     
-    // PERBAIKAN: Hapus koneksi lama jika ada
     if (existingConns && existingConns.size > 0) {
       for (const oldWs of Array.from(existingConns)) {
         if (oldWs && oldWs !== ws && oldWs.readyState === 1) {
@@ -1084,7 +1081,6 @@ export class ChatServer {
     const username = ws.username;
     const oldRoom = ws.room;
     
-    // PERBAIKAN: Hapus dari room lama
     if (oldRoom && oldRoom !== roomName) {
       try {
         const oldMan = this.rooms.get(oldRoom);
@@ -1105,7 +1101,6 @@ export class ChatServer {
       ws.roomname = null;
     }
     
-    // PERBAIKAN: Cek dan hapus dari room lain jika ada
     const globalSeat = this._findUserSeatGlobal(username);
     if (globalSeat && globalSeat.room !== roomName) {
       const oldRoomMan = this.rooms.get(globalSeat.room);

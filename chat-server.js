@@ -958,82 +958,83 @@ export class ChatServer {
   
   // ==================== HANDLE MULTI JOIN ====================
   
-  async handleMultiJoin(ws, multiUsername, multiRoomname) {
-    if (!ws || !multiUsername || !multiRoomname || this.closing || this.isDestroyed) {
-      return;
-    }
-    
-    if (!ROOMS_SET.has(multiRoomname)) {
-      this.safeSend(ws, ["multiJoinError", "Invalid room"]);
-      return;
-    }
-    
-    // === STEP 1: CLEANUP USER DARI SEMUA ROOM ===
-    await this._cleanupUserFromAllRooms(multiUsername);
-    
-    // === STEP 2: CLEANUP KONEKSI LAMA ===
-    const existingConns = this.userConnections.get(multiUsername);
-    if (existingConns?.size > 0) {
-      for (const oldWs of Array.from(existingConns)) {
-        if (oldWs && oldWs !== ws && oldWs.readyState === 1) {
-          await this.cleanup(oldWs);
-        }
-      }
-      // Hapus koneksi lama
-      this.userConnections.delete(multiUsername);
-    }
-    
-    // === STEP 3: CEK ROOM ===
-    const roomMan = this.rooms.get(multiRoomname);
-    if (!roomMan || roomMan.getCount() >= C.MAX_SEATS) {
-      this.safeSend(ws, ["multiJoinError", "Room is full"]);
-      return;
-    }
-    
-    // === STEP 4: BUAT SEAT ===
-    const seat = roomMan.addSeat(multiUsername, "", "", 0, 0, 0, 0);
-    if (!seat) {
-      this.safeSend(ws, ["multiJoinError", "Cannot join room"]);
-      return;
-    }
-    
-    // === STEP 5: SETUP STATE MULTI ===
-    this.userSeat.set(multiUsername, { room: multiRoomname, seat, isMulti: true });
-    this.userRoom.set(multiUsername, multiRoomname);
-    ws.isMulti = true;
-    
-    if (!this.userCountry.has(multiUsername)) {
-      this.userCountry.set(multiUsername, ws.clientCountry || "Unknown");
-    }
-    
-    let connections = this.userConnections.get(multiUsername);
-    if (!connections) connections = new Set();
-    if (!connections.has(ws)) connections.add(ws);
-    this.userConnections.set(multiUsername, connections);
-    
-    // === STEP 6: SETUP MULTI ACTIVE ===
-    this.wsActiveMulti.set(ws, { username: multiUsername, room: multiRoomname });
-    const roomClients = this.roomClients.get(multiRoomname);
-    if (roomClients && !roomClients.has(ws)) roomClients.add(ws);
-    
-    // === STEP 7: SEND RESPONSE ===
-    this.safeSend(ws, ["rooMasukMulti", seat, multiRoomname]);
-    await this.broadcast(multiRoomname, ["roomUserCount", multiRoomname, roomMan.getCount()]);
-    
-    // === STEP 8: SEND STATE AFTER DELAY ===
-    const timeout = setTimeout(() => {
-      this._pendingTimeouts.delete(timeout);
-      try {
-        if (ws && ws.readyState === 1 && !this.closing && !this.isDestroyed) {
-          this.sendAllStateTo(ws, multiRoomname, true);
-        }
-      } catch(e) {
-        // Ignore
-      }
-    }, 1000);
-    
-    this._pendingTimeouts.add(timeout);
+ async handleMultiJoin(ws, multiUsername, multiRoomname) {
+  if (!ws || !multiUsername || !multiRoomname || this.closing || this.isDestroyed) {
+    return;
   }
+  
+  if (!ROOMS_SET.has(multiRoomname)) {
+    this.safeSend(ws, ["multiJoinError", "Invalid room"]);
+    return;
+  }
+  
+  // CLEANUP USER DARI SEMUA ROOM
+  await this._cleanupUserFromAllRooms(multiUsername);
+  
+  // CLEANUP KONEKSI LAMA
+  const existingConns = this.userConnections.get(multiUsername);
+  if (existingConns?.size > 0) {
+    for (const oldWs of Array.from(existingConns)) {
+      if (oldWs && oldWs !== ws && oldWs.readyState === 1) {
+        await this.cleanup(oldWs);
+      }
+    }
+    this.userConnections.delete(multiUsername);
+  }
+  
+  // CEK ROOM
+  const roomMan = this.rooms.get(multiRoomname);
+  if (!roomMan || roomMan.getCount() >= C.MAX_SEATS) {
+    this.safeSend(ws, ["multiJoinError", "Room is full"]);
+    return;
+  }
+  
+  // BUAT SEAT
+  const seat = roomMan.addSeat(multiUsername, "", "", 0, 0, 0, 0);
+  if (!seat) {
+    this.safeSend(ws, ["multiJoinError", "Cannot join room"]);
+    return;
+  }
+  
+  // SETUP STATE MULTI
+  this.userSeat.set(multiUsername, { room: multiRoomname, seat, isMulti: true });
+  this.userRoom.set(multiUsername, multiRoomname);
+  ws.isMulti = true;
+  
+  if (!this.userCountry.has(multiUsername)) {
+    this.userCountry.set(multiUsername, ws.clientCountry || "Unknown");
+  }
+  
+  let connections = this.userConnections.get(multiUsername);
+  if (!connections) connections = new Set();
+  if (!connections.has(ws)) connections.add(ws);
+  this.userConnections.set(multiUsername, connections);
+  
+  // SETUP MULTI ACTIVE
+  this.wsActiveMulti.set(ws, { username: multiUsername, room: multiRoomname });
+  const roomClients = this.roomClients.get(multiRoomname);
+  if (roomClients && !roomClients.has(ws)) roomClients.add(ws);
+  
+  // SEND RESPONSE
+  this.safeSend(ws, ["rooMasukMulti", seat, multiRoomname]);
+  await this.broadcast(multiRoomname, ["roomUserCount", multiRoomname, roomMan.getCount()]);
+  
+  // === LANGSUNG KIRIM STATE (TANPA DELAY) ===
+  try {
+    if (ws && ws.readyState === 1 && !this.closing && !this.isDestroyed) {
+      // Kirim data seat yang baru
+      const seatData = roomMan.getSeat(seat);
+      if (seatData) {
+        this.safeSend(ws, ["kursiData", multiRoomname, seat, seatData]);
+      }
+      
+      // Kirim state room tanpa self (langsung)
+      this.sendAllStateTo(ws, multiRoomname, true);
+    }
+  } catch(e) {
+    // Ignore
+  }
+}
   
   // ==================== HANDLE EXIT MULTI ====================
   

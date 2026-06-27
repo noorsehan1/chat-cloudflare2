@@ -1,6 +1,6 @@
 // ==================== CHAT SERVER - NO KICK INACTIVE USER ====================
 
- const C = {
+const C = {
   NUMBER_CHANGE_TICKS: 180,  // 180 ticks × 5 detik = 15 menit
   MAX_SEATS: 45,
   MAX_GLOBAL_CONNECTIONS: 500,
@@ -74,7 +74,9 @@ class RoomManager {
   }
 
   removeSeat(seat) {
+    // HAPUS POINT TERLEBIH DAHULU
     this.points.delete(seat);
+    // BARU HAPUS SEAT
     return this.seats.delete(seat);
   }
   
@@ -214,13 +216,8 @@ export class ChatServer {
         }
       }
       
-      // Update user count in all rooms
-      for (const room of ROOMS) {
-        const roomMan = this.rooms.get(room);
-        if (roomMan) {
-          this.broadcast(room, ["roomUserCount", room, roomMan.getCount()]).catch(() => {});
-        }
-      }
+      // TIDAK ADA broadcast roomUserCount DI SINI
+      
     } catch(e) {
       // Silent catch
     }
@@ -231,11 +228,9 @@ export class ChatServer {
     this._cleanupInProgress = true;
     
     try {
+      // Hapus koneksi yang sudah mati/terputus
       const toRemove = [];
-      
       for (const ws of this.wsSet) {
-        // HANYA hapus koneksi yang sudah mati/terputus
-        // TIDAK ADA KICK untuk user yang tidak aktif
         if (!ws || ws.readyState !== 1 || ws._closing) {
           toRemove.push(ws);
         }
@@ -244,13 +239,26 @@ export class ChatServer {
       for (const ws of toRemove) {
         try {
           await this.cleanup(ws);
-        } catch(e) {
-          // Ignore
+        } catch(e) {}
+      }
+      
+      // BERSIHKAN POINT ORPHAN (point tanpa seat)
+      for (const [roomName, roomMan] of this.rooms) {
+        if (roomMan) {
+          const pointsToRemove = [];
+          for (const [seat] of roomMan.points) {
+            if (!roomMan.seats.has(seat)) {
+              pointsToRemove.push(seat);
+            }
+          }
+          for (const seat of pointsToRemove) {
+            roomMan.points.delete(seat);
+          }
         }
       }
-    } catch(e) {
-      // Ignore
-    } finally {
+      
+    } catch(e) {}
+    finally {
       this._cleanupInProgress = false;
     }
   }
@@ -283,9 +291,7 @@ export class ChatServer {
       clients.delete(ws);
       try {
         await this.cleanup(ws);
-      } catch(e) {
-        // Ignore
-      }
+      } catch(e) {}
     }
     
     return count;
@@ -295,9 +301,7 @@ export class ChatServer {
     if (this.closing || this.isDestroyed || !room || !msg) return;
     try {
       await this._broadcastToRoom(room, JSON.stringify(msg));
-    } catch(e) {
-      // Ignore
-    }
+    } catch(e) {}
   }
   
   safeSend(ws, msg) {
@@ -353,9 +357,7 @@ export class ChatServer {
       if (allPoints?.length > 0) {
         this.safeSend(ws, ["allPointsList", room, allPoints]);
       }
-    } catch(e) {
-      // Ignore
-    }
+    } catch(e) {}
   }
   
   // ==================== CLEANUP ====================
@@ -417,9 +419,8 @@ export class ChatServer {
       
       this.wsSet.delete(ws);
       
-    } catch(e) {
-      // Silent catch
-    } finally {
+    } catch(e) {}
+    finally {
       ws._cleaning = false;
       this._cleaningUp.delete(ws);
       this._isCleaningUp = false;
@@ -428,9 +429,7 @@ export class ChatServer {
         if (ws && ws.readyState === 1) {
           ws.close(1000, "Cleanup");
         }
-      } catch(e) {
-        // Ignore
-      }
+      } catch(e) {}
     }
   }
   
@@ -485,7 +484,6 @@ export class ChatServer {
             const oldRoomMan = this.rooms.get(existingRoom);
             if (oldRoomMan) {
               oldRoomMan.removeSeat(existingSeat);
-              oldRoomMan.points.delete(existingSeat);
               await this.broadcast(existingRoom, ["removeKursi", existingRoom, existingSeat]);
               this.updateRoomCount(existingRoom);
             }
@@ -539,7 +537,6 @@ export class ChatServer {
           const roomMan = this.rooms.get(roomName);
           if (roomMan) {
             roomMan.removeSeat(seatNumber);
-            roomMan.points.delete(seatNumber);
             await this.broadcast(roomName, ["removeKursi", roomName, seatNumber]);
             await this.broadcast(roomName, ["roomUserCount", roomName, roomMan.getCount()]);
           }
@@ -621,8 +618,12 @@ export class ChatServer {
           const [pointRoom, pointSeat, pointX, pointY, pointFast] = args;
           if (pointRoom && typeof pointSeat === 'number' && pointSeat >= 1 && pointSeat <= C.MAX_SEATS) {
             const roomMan = this.rooms.get(pointRoom);
-            if (roomMan?.updatePoint(pointSeat, pointX, pointY, pointFast === 1)) {
-              await this.broadcast(pointRoom, ["pointUpdated", pointRoom, pointSeat, pointX, pointY, pointFast]);
+            // CEK APAKAH SEAT MASIH ADA
+            if (roomMan && roomMan.seats.has(pointSeat)) {
+              if (roomMan.updatePoint(pointSeat, pointX, pointY, pointFast === 1)) {
+                // HANYA broadcast pointUpdated, TIDAK ADA roomUserCount
+                await this.broadcast(pointRoom, ["pointUpdated", pointRoom, pointSeat, pointX, pointY, pointFast]);
+              }
             }
           }
           break;
@@ -631,9 +632,16 @@ export class ChatServer {
         case "removeKursiAndPoint": {
           const [removeRoom, removeSeat] = args;
           const roomMan = this.rooms.get(removeRoom);
-          if (roomMan?.getSeat(removeSeat)) {
+          if (roomMan && roomMan.seats.has(removeSeat)) {
+            // HAPUS DARI userSeat TERLEBIH DAHULU
+            for (const [username, info] of this.userSeat) {
+              if (info.seat === removeSeat && info.room === removeRoom) {
+                this.userSeat.delete(username);
+                this.userRoom.delete(username);
+                break;
+              }
+            }
             roomMan.removeSeat(removeSeat);
-            roomMan.points.delete(removeSeat);
             await this.broadcast(removeRoom, ["removeKursi", removeRoom, removeSeat]);
             this.updateRoomCount(removeRoom);
           }
@@ -778,9 +786,8 @@ export class ChatServer {
           await this.cleanup(ws);
           break;
       }
-    } catch(e) {
-      // Silent catch
-    } finally {
+    } catch(e) {}
+    finally {
       this._processingMessages.delete(ws);
     }
   }
@@ -831,9 +838,7 @@ export class ChatServer {
           if (pointData) this.safeSend(ws, ["pointData", existingSeatInfo.room, existingSeatInfo.seat, pointData.x, pointData.y, pointData.fast ? 1 : 0]);
           this.safeSend(ws, ["muteTypeResponse", roomMan.getMuted(), existingSeatInfo.room]);
           this.sendAllStateTo(ws, existingSeatInfo.room, true);
-        } catch(e) {
-          // Ignore
-        }
+        } catch(e) {}
       }
       return;
     }
@@ -888,9 +893,7 @@ export class ChatServer {
         if (oldClients) oldClients.delete(ws);
         this.userSeat.delete(username);
         this.userRoom.delete(username);
-      } catch(e) {
-        // Ignore
-      }
+      } catch(e) {}
       ws.room = null;
       ws.roomname = null;
     }
@@ -937,9 +940,7 @@ export class ChatServer {
         if (ws && ws.readyState === 1 && !this.closing && !this.isDestroyed) {
           this.sendAllStateTo(ws, roomName, true);
         }
-      } catch(e) {
-        // Ignore
-      }
+      } catch(e) {}
     }, 1000);
     
     return true;
@@ -1088,9 +1089,7 @@ export class ChatServer {
       }
       try {
         await this.cleanup(ws);
-      } catch(e) {
-        // Ignore
-      }
+      } catch(e) {}
     }
     
     this.wsSet.clear();

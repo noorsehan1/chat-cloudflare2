@@ -576,6 +576,12 @@ export class GameServer {
   _startRegistration(room, game) {
     if (!this._isGameRunning(game) || !game.registrationOpen) return;
     
+    // Bersihkan timer sebelumnya jika ada
+    if (game._registrationTimer) {
+      clearInterval(game._registrationTimer);
+      game._registrationTimer = null;
+    }
+    
     let timeLeft = 20;
     
     const timer = setInterval(() => {
@@ -685,6 +691,26 @@ export class GameServer {
     try {
       if (!this._isGameRunning(game)) return;
       
+      // Bersihkan timer draw sebelumnya jika ada
+      if (game._drawTimer) {
+        clearInterval(game._drawTimer);
+        game._drawTimer = null;
+      }
+      
+      // Bersihkan timer eval sebelumnya jika ada
+      if (game._evalTimer) {
+        clearTimeout(game._evalTimer);
+        game._evalTimer = null;
+      }
+      
+      // Bersihkan bot timeouts sebelumnya
+      if (game._botTimeouts) {
+        for (const id of game._botTimeouts) {
+          clearTimeout(id);
+        }
+        game._botTimeouts.clear();
+      }
+      
       const activePlayers = this._getActivePlayers(game);
       
       if (activePlayers.length < 2) {
@@ -734,6 +760,12 @@ export class GameServer {
   
   _startDrawCountdown(room, game) {
     if (!this._isGameRunning(game)) return;
+    
+    // Bersihkan timer sebelumnya jika ada
+    if (game._drawTimer) {
+      clearInterval(game._drawTimer);
+      game._drawTimer = null;
+    }
     
     let timeLeft = 20;
     
@@ -1074,6 +1106,7 @@ export class GameServer {
         "gameLowCardRoundResult", game.round, numbersArr, loserNames, remainingNames
       ]);
       
+      // Bersihkan semua data untuk ronde berikutnya
       numbers.clear();
       tanda.clear();
       game.round++;

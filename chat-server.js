@@ -1,6 +1,6 @@
 // ==================== CHAT SERVER - NO KICK INACTIVE USER ====================
 
-const C = {
+ const C = {
   NUMBER_CHANGE_TICKS: 180,  // 180 ticks × 5 detik = 15 menit
   MAX_SEATS: 45,
   MAX_GLOBAL_CONNECTIONS: 500,

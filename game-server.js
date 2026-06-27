@@ -94,50 +94,14 @@ export class GameServer {
   
   // ==================== ADD/REMOVE CLIENT ====================
   
-  _addClient(room, ws, username = null, isNewConnection = false) {
+  _addClient(room, ws, username = null) {
     const wsId = this._getWsId(ws);
     if (!wsId) {
       this._safeSend(ws, ["gameLowCardError", "Connection error, please reconnect"]);
       return;
     }
     
-    if (username && isNewConnection) {
-      if (!this._lockUserConnection(username)) {
-        setTimeout(() => {
-          this._addClient(room, ws, username, isNewConnection);
-        }, 100);
-        return;
-      }
-      
-      try {
-        this._forceCleanupUserConnections(username, wsId);
-        
-        this.userConnections.set(username, {
-          wsId: wsId,
-          ws: ws,
-          room: room,
-          timestamp: Date.now()
-        });
-      } finally {
-        this._unlockUserConnection(username);
-      }
-    }
-    
-    if (username && !isNewConnection) {
-      const conn = this.userConnections.get(username);
-      if (conn) {
-        conn.room = room;
-        conn.timestamp = Date.now();
-      } else {
-        this.userConnections.set(username, {
-          wsId: wsId,
-          ws: ws,
-          room: room,
-          timestamp: Date.now()
-        });
-      }
-    }
-    
+    // Hapus dari room lama jika ada
     if (this.clientRooms.has(wsId)) {
       const oldRoom = this.clientRooms.get(wsId);
       if (oldRoom !== room) {
@@ -145,6 +109,7 @@ export class GameServer {
       }
     }
     
+    // Tambahkan ke room baru
     const clients = this.wsClients.get(room);
     if (clients) {
       clients.delete(wsId);
@@ -159,7 +124,21 @@ export class GameServer {
     ws.room = room;
     ws.username = username;
     
+    // Update user connections
     if (username) {
+      const conn = this.userConnections.get(username);
+      if (conn) {
+        conn.room = room;
+        conn.timestamp = Date.now();
+      } else {
+        this.userConnections.set(username, {
+          wsId: wsId,
+          ws: ws,
+          room: room,
+          timestamp: Date.now()
+        });
+      }
+      
       if (!this.roomViewers.has(room)) {
         this.roomViewers.set(room, new Set());
       }
@@ -224,7 +203,7 @@ export class GameServer {
       try {
         this._forceCleanupUserConnections(username, newWsId);
         game.playerWsId.set(username, newWsId);
-        this._addClient(room, newWs, username, true);
+        this._addClient(room, newWs, username);
       } finally {
         this._unlockUserConnection(username);
       }
@@ -265,7 +244,7 @@ export class GameServer {
       this._removeClientFromRoom(oldRoom, wsId);
     }
     
-    this._addClient(roomName, ws, username, false);
+    this._addClient(roomName, ws, username);
     ws.username = username;
     
     if (username) {
@@ -1115,12 +1094,6 @@ export class GameServer {
       
       const usernameClean = username.trim();
       
-      const existingGames = this._findAllGamesByUsername(usernameClean);
-      if (existingGames.length > 0) {
-        const roomList = existingGames.map(g => g.room).join(', ');
-        this._safeSend(ws, ["gameLowCardInfo", `You are currently playing`]);
-      }
-      
       const room = this._getRoomForWs(ws);
       if (!room) {
         this._safeSend(ws, ["gameLowCardError", "Please switch to a room first!"]);
@@ -1132,9 +1105,6 @@ export class GameServer {
         if (existingRoomGame.players.has(usernameClean) && !existingRoomGame.eliminated?.has(usernameClean)) {
           this._safeSend(ws, ["gameLowCardInfo", `Game already running`]);
           this._safeSend(ws, ["gameLowCardStartSuccess", existingRoomGame.hostName, existingRoomGame.betAmount]);
-          return;
-        } else if (existingRoomGame.eliminated?.has(usernameClean)) {
-          this._safeSend(ws, ["gameLowCardError", `You are eliminated`]);
           return;
         } else {
           this._safeSend(ws, ["gameLowCardError", `Game already running`]);
@@ -1158,6 +1128,7 @@ export class GameServer {
           return;
         }
         
+        // Hapus game lama jika ada
         if (existingRoomGame) {
           const timers = ['_registrationTimer', '_drawTimer', '_evalTimer', '_safetyTimer'];
           for (const key of timers) {
@@ -1220,7 +1191,8 @@ export class GameServer {
         
         this.activeGames.set(room, game);
         
-        this._addClient(room, ws, usernameClean, false);
+        // Tambahkan client ke room
+        this._addClient(room, ws, usernameClean);
         
         this._broadcastToRoom(room, ["gameLowCardStart", game.betAmount, usernameClean]);
         this._safeSend(ws, ["gameLowCardStartSuccess", game.hostName, game.betAmount]);
@@ -1238,6 +1210,7 @@ export class GameServer {
         }, CONSTANTS.START_LOCK_DURATION_MS);
         
       } catch(e) {
+        console.error('Error starting game:', e);
         const game = this.activeGames.get(room);
         if (game) {
           const timers = ['_registrationTimer', '_drawTimer', '_evalTimer', '_safetyTimer'];
@@ -1256,11 +1229,12 @@ export class GameServer {
           }
           this.activeGames.delete(room);
         }
-        this._safeSend(ws, ["gameLowCardError", "Failed to start game"]);
+        this._safeSend(ws, ["gameLowCardError", "Failed to start game: " + e.message]);
         this._gameLocks.delete(room);
       }
     } catch(e) {
-      this._safeSend(ws, ["gameLowCardError", "Failed to start game"]);
+      console.error('Start game error:', e);
+      this._safeSend(ws, ["gameLowCardError", "Failed to start game: " + e.message]);
     }
   }
   
@@ -1293,12 +1267,6 @@ export class GameServer {
       this._joinLocks.set(lockKey, Date.now());
       
       try {
-        const existingGames = this._findAllGamesByUsername(usernameClean);
-        if (existingGames.length > 0) {
-          const roomList = existingGames.map(g => g.room).join(', ');
-          this._safeSend(ws, ["gameLowCardInfo", `You are currently playing`]);
-        }
-        
         const game = this.activeGames.get(room);
         
         if (!game || !game._isActive || game._gameEnded || !game.players) {
@@ -1346,7 +1314,7 @@ export class GameServer {
         }
         
         game.players.set(usernameClean, { id: usernameClean, name: usernameClean });
-        this._addClient(room, ws, usernameClean, false);
+        this._addClient(room, ws, usernameClean);
         game.playerWsId.set(usernameClean, wsId);
         
         this._broadcastToRoom(room, ["gameLowCardJoin", usernameClean, game.betAmount]);

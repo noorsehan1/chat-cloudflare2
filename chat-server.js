@@ -1,6 +1,6 @@
 // ==================== CHAT SERVER - NO KICK INACTIVE USER ====================
 
-const C = {
+ const C = {
   NUMBER_CHANGE_TICKS: 180,  // 180 ticks × 5 detik = 15 menit
   MAX_SEATS: 45,
   MAX_GLOBAL_CONNECTIONS: 500,
@@ -74,9 +74,7 @@ class RoomManager {
   }
 
   removeSeat(seat) {
-    // HAPUS POINT TERLEBIH DAHULU
     this.points.delete(seat);
-    // BARU HAPUS SEAT
     return this.seats.delete(seat);
   }
   
@@ -178,14 +176,12 @@ export class ChatServer {
       clearInterval(this._cleanupInterval);
     }
     
-    // Tick untuk update number (setiap 5 detik)
     this._tickInterval = setInterval(() => {
       if (!this.closing && !this.isDestroyed) {
         this._doTick();
       }
     }, C.TICK_INTERVAL);
     
-    // Cleanup untuk dead connections (setiap 30 detik)
     this._cleanupInterval = setInterval(() => {
       if (!this.closing && !this.isDestroyed) {
         this._doCleanup();
@@ -198,7 +194,6 @@ export class ChatServer {
       this._tickCount++;
       this._lastActivityTime = Date.now();
       
-      // Change number every N ticks (default 180 ticks = 15 menit)
       if (this._tickCount % C.NUMBER_CHANGE_TICKS === 0) {
         this.currentNumber = this.currentNumber < 6 ? this.currentNumber + 1 : 1;
         
@@ -216,8 +211,6 @@ export class ChatServer {
         }
       }
       
-      // TIDAK ADA broadcast roomUserCount DI SINI
-      
     } catch(e) {
       // Silent catch
     }
@@ -228,7 +221,6 @@ export class ChatServer {
     this._cleanupInProgress = true;
     
     try {
-      // Hapus koneksi yang sudah mati/terputus
       const toRemove = [];
       for (const ws of this.wsSet) {
         if (!ws || ws.readyState !== 1 || ws._closing) {
@@ -242,7 +234,6 @@ export class ChatServer {
         } catch(e) {}
       }
       
-      // BERSIHKAN POINT ORPHAN (point tanpa seat)
       for (const [roomName, roomMan] of this.rooms) {
         if (roomMan) {
           const pointsToRemove = [];
@@ -618,10 +609,8 @@ export class ChatServer {
           const [pointRoom, pointSeat, pointX, pointY, pointFast] = args;
           if (pointRoom && typeof pointSeat === 'number' && pointSeat >= 1 && pointSeat <= C.MAX_SEATS) {
             const roomMan = this.rooms.get(pointRoom);
-            // CEK APAKAH SEAT MASIH ADA
             if (roomMan && roomMan.seats.has(pointSeat)) {
               if (roomMan.updatePoint(pointSeat, pointX, pointY, pointFast === 1)) {
-                // HANYA broadcast pointUpdated, TIDAK ADA roomUserCount
                 await this.broadcast(pointRoom, ["pointUpdated", pointRoom, pointSeat, pointX, pointY, pointFast]);
               }
             }
@@ -633,7 +622,6 @@ export class ChatServer {
           const [removeRoom, removeSeat] = args;
           const roomMan = this.rooms.get(removeRoom);
           if (roomMan && roomMan.seats.has(removeSeat)) {
-            // HAPUS DARI userSeat TERLEBIH DAHULU
             for (const [username, info] of this.userSeat) {
               if (info.seat === removeSeat && info.room === removeRoom) {
                 this.userSeat.delete(username);
@@ -773,15 +761,15 @@ export class ChatServer {
           break;
         }
 
+        // ==================== MOD WARNING ====================
+        case "modwarning": {
+          const modRoom = args[0];
+          if (modRoom && ROOMS_SET.has(modRoom)) {
+            await this.broadcast(modRoom, ["modwarning", modRoom]);
+          }
+          break;
+        }
 
-         case "modwarning": {
-    const modRoom = args[0];
-    if (modRoom && ROOMS_SET.has(modRoom)) {
-        // Kirim ke SEMUA user di room (termasuk pengirim)
-        await this.broadcast(modRoom, ["modwarning", modRoom]);
-    }
-    break;
-}
         case "getMuteType": {
           const getMuteRoom = args[0];
           if (getMuteRoom && ROOMS_SET.has(getMuteRoom)) {

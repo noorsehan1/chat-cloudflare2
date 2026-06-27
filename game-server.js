@@ -46,7 +46,7 @@ export class GameServer {
     return ws ? ws._wsId : null;
   }
   
-  // ==================== CORE ====================
+  // ==================== CORE: MENCEGAH DUPLIKAT EVENT ====================
   
   _lockUserConnection(username) {
     if (this.connectionLocks.has(username)) {
@@ -402,14 +402,17 @@ export class GameServer {
         const winner = activePlayers[0]?.name || "Unknown";
         const totalCoin = (game.betAmount || 0) * (game.players?.size || 0);
         
-        this._cleanupGame(game);
+        game._gameEnded = true;
+        game._isActive = false;
+        
         this._broadcastToRoom(room, ["gameLowCardWinner", winner, totalCoin]);
         this._scheduleGameCleanup(room, game);
         return;
       }
       
       if (activePlayers.length === 0) {
-        this._cleanupGame(game);
+        game._gameEnded = true;
+        game._isActive = false;
         this._scheduleGameCleanup(room, game);
       }
     } catch(e) {
@@ -474,41 +477,13 @@ export class GameServer {
   
   // ==================== GAME CLEANUP ====================
   
-  _cleanupGame(game) {
+  _checkAndCleanupGame(room) {
+    const game = this.activeGames.get(room);
     if (!game) return;
     
-    // HAPUS SEMUA TIMER
-    const timers = ['_registrationTimer', '_drawTimer', '_evalTimer', '_safetyTimer'];
-    for (const key of timers) {
-      if (game[key]) {
-        clearTimeout(game[key]);
-        clearInterval(game[key]);
-        game[key] = null;
-      }
+    if (game._gameEnded || !game._isActive || !game.players || game.players.size === 0) {
+      this._scheduleGameCleanup(room, game);
     }
-    
-    // HAPUS SEMUA BOT TIMEOUTS
-    if (game._botTimeouts) {
-      for (const id of game._botTimeouts) {
-        clearTimeout(id);
-      }
-      game._botTimeouts.clear();
-      game._botTimeouts = null;
-    }
-    
-    // RESET SEMUA DATA
-    game.players = null;
-    game.botPlayers = null;
-    game.numbers = null;
-    game.tanda = null;
-    game.eliminated = null;
-    game.playerWsId = null;
-    game._isActive = false;
-    game._gameEnded = true;
-    game._isEvaluating = false;
-    game.registrationOpen = false;
-    game.drawTimeExpired = true;
-    game.evaluationLocked = true;
   }
   
   _scheduleGameCleanup(room, game) {
@@ -529,6 +504,36 @@ export class GameServer {
     this._cleanupTimers.set(room, timer);
   }
   
+  _cleanupGame(game) {
+    if (!game) return;
+    
+    const timers = ['_registrationTimer', '_drawTimer', '_evalTimer', '_safetyTimer'];
+    for (const key of timers) {
+      if (game[key]) {
+        clearTimeout(game[key]);
+        clearInterval(game[key]);
+        game[key] = null;
+      }
+    }
+    
+    if (game._botTimeouts) {
+      for (const id of game._botTimeouts) {
+        clearTimeout(id);
+      }
+      game._botTimeouts.clear();
+      game._botTimeouts = null;
+    }
+    
+    game.players = null;
+    game.botPlayers = null;
+    game.numbers = null;
+    game.tanda = null;
+    game.eliminated = null;
+    game._isActive = false;
+    game._gameEnded = true;
+    game._isEvaluating = false;
+  }
+  
   _deleteGame(room, game) {
     if (this._cleanupTimers.has(room)) {
       clearTimeout(this._cleanupTimers.get(room));
@@ -536,6 +541,7 @@ export class GameServer {
     }
     
     if (game) {
+      game.playerWsId = null;
       this._cleanupGame(game);
     }
     this.activeGames.delete(room);
@@ -550,12 +556,6 @@ export class GameServer {
   _startRegistration(room, game) {
     if (!this._isGameRunning(game) || !game.registrationOpen) return;
     
-    // HAPUS TIMER LAMA
-    if (game._registrationTimer) {
-      clearInterval(game._registrationTimer);
-      game._registrationTimer = null;
-    }
-    
     let timeLeft = 20;
     
     const timer = setInterval(() => {
@@ -566,13 +566,13 @@ export class GameServer {
           return;
         }
         
-        timeLeft--;
-        
-        if (timeLeft === 15 || timeLeft === 10 || timeLeft === 5) {
+        if ([15, 10, 5].includes(timeLeft)) {
           this._broadcastToRoom(room, ["gameLowCardTimeLeft", `${timeLeft}s`]);
         }
         
-        if (timeLeft <= 0) {
+        timeLeft--;
+        
+        if (timeLeft === 0) {
           clearInterval(timer);
           game._registrationTimer = null;
           this._broadcastToRoom(room, ["gameLowCardTimeLeft", "TIME UP!"]);
@@ -618,7 +618,8 @@ export class GameServer {
       if (this._isGameRunning(game) && game.players.size >= 2) {
         this._startDrawPhase(room, game);
       } else {
-        this._cleanupGame(game);
+        game._gameEnded = true;
+        game._isActive = false;
         this._broadcastToRoom(room, ["gameLowCardError", "Not enough players"]);
         this._scheduleGameCleanup(room, game);
       }
@@ -633,6 +634,7 @@ export class GameServer {
       if (!this._isGameRunning(game)) return;
       
       const botNames = ["moz1", "moz2", "moz3", "moz4"];
+      let added = 0;
       
       const existingBots = Array.from(game.players.keys()).filter(id => id.startsWith('BOT_'));
       const existingBotCount = existingBots.length;
@@ -646,6 +648,7 @@ export class GameServer {
         if (!game.players.has(botId)) {
           game.players.set(botId, { id: botId, name: botName });
           game.botPlayers.set(botId, botName);
+          added++;
         }
       }
       
@@ -675,11 +678,12 @@ export class GameServer {
           if (newActive.length === 1 && !game._gameEnded) {
             const winner = newActive[0]?.name || "Unknown";
             const totalCoin = (game.betAmount || 0) * (game.players?.size || 0);
-            this._cleanupGame(game);
+            game._gameEnded = true;
             this._broadcastToRoom(room, ["gameLowCardWinner", winner, totalCoin]);
             this._scheduleGameCleanup(room, game);
           } else {
-            this._cleanupGame(game);
+            game._gameEnded = true;
+            game._isActive = false;
             this._broadcastToRoom(room, ["gameLowCardError", "Not enough players"]);
             this._scheduleGameCleanup(room, game);
           }
@@ -687,51 +691,19 @@ export class GameServer {
         }
       }
       
-      // ============ CLEANUP ALL TIMERS & FLAGS ============
-      // HAPUS TIMER DRAW LAMA
-      if (game._drawTimer) {
-        clearInterval(game._drawTimer);
-        game._drawTimer = null;
-      }
-      
-      // HAPUS TIMER EVALUASI LAMA
-      if (game._evalTimer) {
-        clearTimeout(game._evalTimer);
-        game._evalTimer = null;
-      }
-      
-      // HAPUS SAFETY TIMER LAMA
-      if (game._safetyTimer) {
-        clearTimeout(game._safetyTimer);
-        game._safetyTimer = null;
-      }
-      
-      // HAPUS SEMUA BOT TIMEOUT
-      if (game._botTimeouts) {
-        for (const id of game._botTimeouts) {
-          clearTimeout(id);
-        }
-        game._botTimeouts.clear();
-      }
-      game._botTimeouts = new Set();
-      
-      // RESET FLAGS
       game._phase = 'draw';
       game.drawTimeExpired = false;
       game.evaluationLocked = false;
-      game._isEvaluating = false;
-      game.numbers = new Map();
-      game.tanda = new Map();
+      
+      if (!game._botTimeouts) game._botTimeouts = new Set();
       
       const playersList = this._getActivePlayers(game).map(p => p.name);
       
       this._broadcastToRoom(room, ["gameLowCardClosed", playersList]);
       this._broadcastToRoom(room, ["gameLowCardNextRound", game.round]);
       
-      // START COUNTDOWN BARU
       this._startDrawCountdown(room, game);
       
-      // START BOT DRAWS BARU
       if (game.botPlayers?.size > 0 && this._isGameRunning(game)) {
         this._startBotDraws(room, game);
       }
@@ -743,42 +715,27 @@ export class GameServer {
   _startDrawCountdown(room, game) {
     if (!this._isGameRunning(game)) return;
     
-    // HAPUS TIMER LAMA
-    if (game._drawTimer) {
-      clearInterval(game._drawTimer);
-      game._drawTimer = null;
-    }
-    
     let timeLeft = 20;
     
     const timer = setInterval(() => {
       try {
-        if (!this._isGameRunning(game)) {
+        if (!this._isGameRunning(game) || game.drawTimeExpired) {
           clearInterval(timer);
           game._drawTimer = null;
           return;
         }
         
-        if (game.drawTimeExpired || game.evaluationLocked) {
-          clearInterval(timer);
-          game._drawTimer = null;
-          return;
+        if ([15, 10, 5].includes(timeLeft)) {
+          this._broadcastToRoom(room, ["gameLowCardTimeLeft", `${timeLeft}s`]);
         }
         
         timeLeft--;
-        
-        if (timeLeft === 15 || timeLeft === 10 || timeLeft === 5) {
-          this._broadcastToRoom(room, ["gameLowCardTimeLeft", `${timeLeft}s`]);
-        }
         
         if (timeLeft === 0) {
           clearInterval(timer);
           game._drawTimer = null;
           this._broadcastToRoom(room, ["gameLowCardTimeLeft", "TIME UP!"]);
-          
-          if (!game.drawTimeExpired && !game.evaluationLocked) {
-            this._closeDrawPhase(room, game);
-          }
+          this._closeDrawPhase(room, game);
         }
       } catch(e) {
         clearInterval(timer);
@@ -791,9 +748,7 @@ export class GameServer {
   
   _closeDrawPhase(room, game) {
     try {
-      if (!this._isGameRunning(game)) return;
-      if (game.drawTimeExpired) return;
-      if (game.evaluationLocked) return;
+      if (!this._isGameRunning(game) || game.drawTimeExpired || game.evaluationLocked) return;
       
       game.drawTimeExpired = true;
       game.evaluationLocked = true;
@@ -806,7 +761,6 @@ export class GameServer {
       if (game.botPlayers?.size > 0 && this._isGameRunning(game)) {
         const activeBotIds = Array.from(game.botPlayers.keys())
           .filter(id => !game.eliminated?.has(id) && !game.numbers?.has(id));
-        
         for (const botId of activeBotIds) {
           this._forceBotDraw(room, botId, game);
         }
@@ -814,21 +768,13 @@ export class GameServer {
       
       this._broadcastToRoom(room, ["gameLowCardWait", "Please wait for results..."]);
       
-      if (game._evalTimer) {
-        clearTimeout(game._evalTimer);
-        game._evalTimer = null;
-      }
-      
       game._evalTimer = setTimeout(() => {
         try {
-          if (this._isGameRunning(game) && !game._gameEnded && !game._isEvaluating) {
-            this._evaluateRound(room, game);
-          }
+          this._evaluateRound(room, game);
         } catch(e) {
           // Silent error
         }
       }, CONSTANTS.EVALUATION_DELAY_MS);
-      
     } catch(e) {
       // Silent error
     }
@@ -872,9 +818,7 @@ export class GameServer {
   
   _handleBotDraw(room, botId, game) {
     try {
-      if (!this._isGameRunning(game)) return;
-      if (game.numbers?.has(botId)) return;
-      if (game.drawTimeExpired || game.evaluationLocked) return;
+      if (!this._isGameRunning(game) || game.numbers?.has(botId) || game.drawTimeExpired || game.evaluationLocked) return;
       if (game.eliminated?.has(botId)) return;
       
       const number = this._getBotNumberByRound(game.round);
@@ -891,16 +835,9 @@ export class GameServer {
       if (game.numbers.size === activeIds.length && !game.evaluationLocked && !game.drawTimeExpired && this._isGameRunning(game)) {
         game.evaluationLocked = true;
         this._broadcastToRoom(room, ["gameLowCardWait", "Please wait for results..."]);
-        
-        if (game._evalTimer) {
-          clearTimeout(game._evalTimer);
-        }
-        
         game._evalTimer = setTimeout(() => {
           try {
-            if (this._isGameRunning(game) && !game._gameEnded && !game._isEvaluating) {
-              this._evaluateRound(room, game);
-            }
+            this._evaluateRound(room, game);
           } catch(e) {
             // Silent error
           }
@@ -934,8 +871,7 @@ export class GameServer {
   
   _evaluateRound(room, game) {
     try {
-      if (this.isDestroyed || !game || game._gameEnded || !game._isActive) return;
-      if (game._isEvaluating) return;
+      if (this.isDestroyed || !game || game._gameEnded || !game._isActive || game._isEvaluating) return;
       if (!game.players) return;
       
       const currentGame = this.activeGames.get(room);
@@ -947,10 +883,6 @@ export class GameServer {
         try {
           if (game && game._isEvaluating) {
             game._isEvaluating = false;
-            if (game._safetyTimer) {
-              clearTimeout(game._safetyTimer);
-              game._safetyTimer = null;
-            }
             this._scheduleGameCleanup(room, game);
           }
         } catch(e) {
@@ -1002,7 +934,14 @@ export class GameServer {
         const winnerName = players.get(winnerId)?.name || winnerId;
         const totalCoin = (game.betAmount || 0) * players.size;
         
-        this._cleanupGame(game);
+        game._gameEnded = true;
+        game._isEvaluating = false;
+        
+        if (game._safetyTimer) {
+          clearTimeout(game._safetyTimer);
+          game._safetyTimer = null;
+        }
+        
         this._broadcastToRoom(room, ["gameLowCardWinner", winnerName, totalCoin]);
         this._scheduleGameCleanup(room, game);
         return;
@@ -1065,7 +1004,14 @@ export class GameServer {
         const winnerName = players.get(winnerId)?.name || winnerId;
         const totalCoin = (game.betAmount || 0) * players.size;
         
-        this._cleanupGame(game);
+        game._gameEnded = true;
+        game._isEvaluating = false;
+        
+        if (game._safetyTimer) {
+          clearTimeout(game._safetyTimer);
+          game._safetyTimer = null;
+        }
+        
         this._broadcastToRoom(room, ["gameLowCardWinner", winnerName, totalCoin]);
         this._scheduleGameCleanup(room, game);
         return;
@@ -1193,6 +1139,7 @@ export class GameServer {
       
       const existingGames = this._findAllGamesByUsername(usernameClean);
       if (existingGames.length > 0) {
+        const roomList = existingGames.map(g => g.room).join(', ');
         this._safeSend(ws, ["gameLowCardInfo", `You are currently playing`]);
       }
       
@@ -1339,6 +1286,7 @@ export class GameServer {
       try {
         const existingGames = this._findAllGamesByUsername(usernameClean);
         if (existingGames.length > 0) {
+          const roomList = existingGames.map(g => g.room).join(', ');
           this._safeSend(ws, ["gameLowCardInfo", `You are currently playing`]);
         }
         
@@ -1481,16 +1429,9 @@ export class GameServer {
       if (game.numbers.size === activeIds.length && !game.evaluationLocked && !game.drawTimeExpired && this._isGameRunning(game)) {
         game.evaluationLocked = true;
         this._broadcastToRoom(room, ["gameLowCardWait", "Please wait for results..."]);
-        
-        if (game._evalTimer) {
-          clearTimeout(game._evalTimer);
-        }
-        
         game._evalTimer = setTimeout(() => {
           try {
-            if (this._isGameRunning(game) && !game._gameEnded && !game._isEvaluating) {
-              this._evaluateRound(room, game);
-            }
+            this._evaluateRound(room, game);
           } catch(e) {
             // Silent error
           }
@@ -1546,7 +1487,6 @@ export class GameServer {
         if (players.length > 0) {
           this._broadcastToRoom(room, ["gameLowCardEnd", players]);
         }
-        this._cleanupGame(game);
         this._deleteGame(room, game);
       }
     } catch(e) {

@@ -33,14 +33,11 @@ class RoomManager {
     return null;
   }
 
-  // PERBAIKAN: addSeat selalu menggunakan data inputan
   addSeat(userId, noimageUrl, color, itembawah, itematas, vip, viptanda) {
     if (!userId) return null;
     
-    // Cek jika user sudah punya seat, update dengan data baru
     for (const [seat, data] of this.seats) {
       if (data && data.namauser === userId) {
-        // Update dengan data baru, TIDAK mempertahankan data lama
         this.seats.set(seat, {
           noimageUrl: noimageUrl || "",
           namauser: userId,
@@ -69,11 +66,9 @@ class RoomManager {
     return seat;
   }
 
-  // PERBAIKAN: updateSeat selalu menggunakan data inputan
   updateSeat(seat, data) {
     if (!this.seats.has(seat) || !data) return false;
     
-    // Update SEMUA data dengan inputan, TIDAK mempertahankan data lama
     this.seats.set(seat, {
       noimageUrl: data.noimageUrl !== undefined ? data.noimageUrl : "",
       namauser: data.namauser !== undefined ? data.namauser : "",
@@ -145,7 +140,6 @@ export class ChatServer {
     this.closing = false;
     this.isDestroyed = false;
     
-    // WebSocket management
     this.wsSet = new Set();
     this.userConnections = new Map();
     this.userSeat = new Map();
@@ -155,14 +149,12 @@ export class ChatServer {
     this.rooms = new Map();
     this.wsActiveMulti = new Map();
     
-    // Processing & cleanup
     this._processingMessages = new Set();
     this._cleaningUp = new Set();
     this._pendingTimeouts = new Set();
     this._isCleaningUp = false;
     this._cleanupInProgress = false;
     
-    // Alarm system
     this._alarmProcessing = false;
     this._tickCount = 0;
     this.currentNumber = 1;
@@ -174,17 +166,14 @@ export class ChatServer {
     this._alarmRescheduleAttempts = 0;
     this._maxAlarmRescheduleAttempts = 5;
     
-    // Heartbeat interval
     this._heartbeatInterval = null;
     this._lastHeartbeatTime = Date.now();
     
-    // Initialize rooms
     for (const room of ROOMS) {
       this.rooms.set(room, new RoomManager(room));
       this.roomClients.set(room, new Set());
     }
     
-    // Initialize state from storage
     this._initState();
   }
   
@@ -626,7 +615,6 @@ export class ChatServer {
           await this.handleJoin(ws, args[0]);
           break;
         
-        // PERBAIKAN: multiJoin dengan parameter VIP
         case "multiJoin": {
           const multiUsername = args[0];
           const multiRoomname = args[1];
@@ -665,7 +653,6 @@ export class ChatServer {
           const roomMan = this.rooms.get(multiRoomname);
           if (!roomMan || roomMan.getCount() >= C.MAX_SEATS) break;
           
-          // Hapus seat yang mungkin ada di room ini
           let existingSeatInRoom = null;
           for (const [seat, seatData] of roomMan.seats) {
             if (seatData?.namauser === multiUsername) {
@@ -680,7 +667,6 @@ export class ChatServer {
             roomMan.points.delete(existingSeatInRoom);
           }
           
-          // Buat seat baru dengan data inputan (VIP sesuai inputan)
           seat = roomMan.addSeat(
             multiUsername, 
             multiNoimage,
@@ -711,7 +697,6 @@ export class ChatServer {
           this.safeSend(ws, ["rooMasukMulti", seat, multiRoomname]);
           await this.broadcast(multiRoomname, ["roomUserCount", multiRoomname, roomMan.getCount()]);
           
-          // Kirim data kursi yang sudah diupdate
           const seatData = roomMan.getSeat(seat);
           if (seatData) {
             this.safeSend(ws, ["kursiData", multiRoomname, seat, seatData]);
@@ -794,19 +779,17 @@ export class ChatServer {
           break;
         }
         
-        // PERBAIKAN: updateKursi selalu menggunakan data inputan
         case "updateKursi": {
           const [kursiRoom, kursiSeat, kursiNoimg, kursiName, kursiColor, kursiBawah, kursiAtas, kursiVip, kursiVt] = args;
           const roomMan = this.rooms.get(kursiRoom);
           if (!roomMan) break;
           
-          // Update dengan data inputan, TIDAK mempertahankan data lama
           const updated = roomMan.updateSeat(kursiSeat, {
-            noimageUrl: kursiNoimg, 
-            namauser: kursiName, 
+            noimageUrl: kursiNoimg,
+            namauser: kursiName,
             color: kursiColor,
-            itembawah: kursiBawah, 
-            itematas: kursiAtas, 
+            itembawah: kursiBawah,
+            itematas: kursiAtas,
             vip: kursiVip,
             viptanda: kursiVt
           });
@@ -1048,7 +1031,6 @@ export class ChatServer {
       return;
     }
     
-    // Clean up existing connections for this user
     const existingConns = this.userConnections.get(username);
     if (existingConns?.size > 0) {
       for (const oldWs of Array.from(existingConns)) {

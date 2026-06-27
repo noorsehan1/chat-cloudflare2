@@ -33,11 +33,25 @@ class RoomManager {
     return null;
   }
 
+  // PERBAIKAN: addSeat selalu menggunakan data inputan
   addSeat(userId, noimageUrl, color, itembawah, itematas, vip, viptanda) {
     if (!userId) return null;
     
+    // Cek jika user sudah punya seat, update dengan data baru
     for (const [seat, data] of this.seats) {
-      if (data && data.namauser === userId) return seat;
+      if (data && data.namauser === userId) {
+        // Update dengan data baru, TIDAK mempertahankan data lama
+        this.seats.set(seat, {
+          noimageUrl: noimageUrl || "",
+          namauser: userId,
+          color: color || "",
+          itembawah: itembawah || 0,
+          itematas: itematas || 0,
+          vip: vip || 0,
+          viptanda: viptanda || 0,
+        });
+        return seat;
+      }
     }
     
     const seat = this.getAvailableSeat();
@@ -55,19 +69,19 @@ class RoomManager {
     return seat;
   }
 
+  // PERBAIKAN: updateSeat selalu menggunakan data inputan
   updateSeat(seat, data) {
     if (!this.seats.has(seat) || !data) return false;
-    const old = this.seats.get(seat);
-    if (!old) return false;
     
+    // Update SEMUA data dengan inputan, TIDAK mempertahankan data lama
     this.seats.set(seat, {
-      noimageUrl: data.noimageUrl !== undefined ? data.noimageUrl : old.noimageUrl,
-      namauser: data.namauser !== undefined ? data.namauser : old.namauser,
-      color: data.color !== undefined ? data.color : old.color,
-      itembawah: data.itembawah !== undefined ? data.itembawah : old.itembawah,
-      itematas: data.itematas !== undefined ? data.itematas : old.itematas,
-      vip: data.vip !== undefined ? data.vip : old.vip,
-      viptanda: data.viptanda !== undefined ? data.viptanda : old.viptanda,
+      noimageUrl: data.noimageUrl !== undefined ? data.noimageUrl : "",
+      namauser: data.namauser !== undefined ? data.namauser : "",
+      color: data.color !== undefined ? data.color : "",
+      itembawah: data.itembawah !== undefined ? data.itembawah : 0,
+      itematas: data.itematas !== undefined ? data.itematas : 0,
+      vip: data.vip !== undefined ? data.vip : 0,
+      viptanda: data.viptanda !== undefined ? data.viptanda : 0,
     });
     return true;
   }
@@ -612,9 +626,15 @@ export class ChatServer {
           await this.handleJoin(ws, args[0]);
           break;
         
+        // PERBAIKAN: multiJoin dengan parameter VIP
         case "multiJoin": {
           const multiUsername = args[0];
           const multiRoomname = args[1];
+          const multiVip = args[2] !== undefined ? args[2] : 0;
+          const multiViptanda = args[3] !== undefined ? args[3] : 0;
+          const multiNoimage = args[4] || "";
+          const multiColor = args[5] || "";
+          
           if (!multiUsername || !multiRoomname || this.closing || this.isDestroyed) break;
           
           let existingSeat = null, existingRoom = null;
@@ -645,11 +665,35 @@ export class ChatServer {
           const roomMan = this.rooms.get(multiRoomname);
           if (!roomMan || roomMan.getCount() >= C.MAX_SEATS) break;
           
-          const seat = roomMan.addSeat(multiUsername, "", "", 0, 0, 0, 0);
+          // Hapus seat yang mungkin ada di room ini
+          let existingSeatInRoom = null;
+          for (const [seat, seatData] of roomMan.seats) {
+            if (seatData?.namauser === multiUsername) {
+              existingSeatInRoom = seat;
+              break;
+            }
+          }
+          
+          let seat;
+          if (existingSeatInRoom) {
+            roomMan.removeSeat(existingSeatInRoom);
+            roomMan.points.delete(existingSeatInRoom);
+          }
+          
+          // Buat seat baru dengan data inputan (VIP sesuai inputan)
+          seat = roomMan.addSeat(
+            multiUsername, 
+            multiNoimage,
+            multiColor,
+            0,
+            0,
+            multiVip,
+            multiViptanda
+          );
+          
           if (!seat) break;
           
-          // PERBAIKAN: Set isMulti = false agar bisa update kursi seperti user normal
-          this.userSeat.set(multiUsername, { room: multiRoomname, seat, isMulti: false });
+          this.userSeat.set(multiUsername, { room: multiRoomname, seat, isMulti: true });
           this.userRoom.set(multiUsername, multiRoomname);
           if (!this.userCountry.has(multiUsername)) {
             this.userCountry.set(multiUsername, ws.clientCountry || "Unknown");
@@ -667,21 +711,12 @@ export class ChatServer {
           this.safeSend(ws, ["rooMasukMulti", seat, multiRoomname]);
           await this.broadcast(multiRoomname, ["roomUserCount", multiRoomname, roomMan.getCount()]);
           
-          // PERBAIKAN: Kirim state lengkap agar multi user bisa update kursi
-          this.safeSend(ws, ["numberKursiSaya", seat]);
-          this.safeSend(ws, ["muteTypeResponse", roomMan.getMuted(), multiRoomname]);
-          
+          // Kirim data kursi yang sudah diupdate
           const seatData = roomMan.getSeat(seat);
           if (seatData) {
             this.safeSend(ws, ["kursiData", multiRoomname, seat, seatData]);
+            await this.broadcast(multiRoomname, ["kursiBatchUpdate", multiRoomname, [[seat, seatData]]]);
           }
-          
-          const pointData = roomMan.getPoint(seat);
-          if (pointData) {
-            this.safeSend(ws, ["pointData", multiRoomname, seat, pointData.x, pointData.y, pointData.fast ? 1 : 0]);
-          }
-          
-          this.sendAllStateTo(ws, multiRoomname, true);
           
           break;
         }
@@ -759,93 +794,27 @@ export class ChatServer {
           break;
         }
         
-        // PERBAIKAN: Handler updateKursi untuk semua user (termasuk multi)
+        // PERBAIKAN: updateKursi selalu menggunakan data inputan
         case "updateKursi": {
           const [kursiRoom, kursiSeat, kursiNoimg, kursiName, kursiColor, kursiBawah, kursiAtas, kursiVip, kursiVt] = args;
           const roomMan = this.rooms.get(kursiRoom);
           if (!roomMan) break;
           
-          // PERBAIKAN: Cek apakah user ini memiliki akses ke kursi tersebut
-          const seatInfo = this.userSeat.get(ws.username);
-          if (seatInfo && seatInfo.seat === kursiSeat && seatInfo.room === kursiRoom) {
-            // User memiliki akses, update kursi
-            const updated = roomMan.updateSeat(kursiSeat, {
-              noimageUrl: kursiNoimg, namauser: kursiName, color: kursiColor,
-              itembawah: kursiBawah, itematas: kursiAtas, vip: kursiVip, viptanda: kursiVt
-            });
-            
-            if (updated) {
-              const updatedSeat = roomMan.getSeat(kursiSeat);
-              await this.broadcast(kursiRoom, ["kursiBatchUpdate", kursiRoom, [[kursiSeat, updatedSeat]]]);
-              this.safeSend(ws, ["updateKursiSuccess", kursiSeat]);
-            }
-          } else {
-            // PERBAIKAN: Cek apakah ini multi user
-            const activeData = this.wsActiveMulti.get(ws);
-            if (activeData) {
-              // Multi user, update kursi
-              const updated = roomMan.updateSeat(kursiSeat, {
-                noimageUrl: kursiNoimg, namauser: kursiName, color: kursiColor,
-                itembawah: kursiBawah, itematas: kursiAtas, vip: kursiVip, viptanda: kursiVt
-              });
-              
-              if (updated) {
-                const updatedSeat = roomMan.getSeat(kursiSeat);
-                await this.broadcast(kursiRoom, ["kursiBatchUpdate", kursiRoom, [[kursiSeat, updatedSeat]]]);
-                this.safeSend(ws, ["updateKursiSuccess", kursiSeat]);
-              }
-            }
-          }
-          break;
-        }
-        
-        // PERBAIKAN: Handler updateMySeat untuk update kursi sendiri
-        case "updateMySeat": {
-          const [seat, noimg, color, itembawah, itematas, vip, viptanda] = args;
-          const roomName = ws.room || ws.roomname;
-          if (!roomName || !seat) break;
+          // Update dengan data inputan, TIDAK mempertahankan data lama
+          const updated = roomMan.updateSeat(kursiSeat, {
+            noimageUrl: kursiNoimg, 
+            namauser: kursiName, 
+            color: kursiColor,
+            itembawah: kursiBawah, 
+            itematas: kursiAtas, 
+            vip: kursiVip,
+            viptanda: kursiVt
+          });
           
-          const roomMan = this.rooms.get(roomName);
-          if (!roomMan) break;
-          
-          // Cek apakah user ini memiliki kursi tersebut
-          const seatInfo = this.userSeat.get(ws.username);
-          if (seatInfo && seatInfo.seat === seat && seatInfo.room === roomName) {
-            const updated = roomMan.updateSeat(seat, {
-              noimageUrl: noimg, 
-              namauser: ws.username, 
-              color: color || "", 
-              itembawah: itembawah || 0, 
-              itematas: itematas || 0, 
-              vip: vip || 0, 
-              viptanda: viptanda || 0
-            });
-            
-            if (updated) {
-              const updatedSeat = roomMan.getSeat(seat);
-              await this.broadcast(roomName, ["kursiBatchUpdate", roomName, [[seat, updatedSeat]]]);
-              this.safeSend(ws, ["updateMySeatSuccess", seat]);
-            }
-          } else {
-            // Cek multi user
-            const activeData = this.wsActiveMulti.get(ws);
-            if (activeData && activeData.username === ws.username) {
-              const updated = roomMan.updateSeat(seat, {
-                noimageUrl: noimg, 
-                namauser: ws.username, 
-                color: color || "", 
-                itembawah: itembawah || 0, 
-                itematas: itematas || 0, 
-                vip: vip || 0, 
-                viptanda: viptanda || 0
-              });
-              
-              if (updated) {
-                const updatedSeat = roomMan.getSeat(seat);
-                await this.broadcast(roomName, ["kursiBatchUpdate", roomName, [[seat, updatedSeat]]]);
-                this.safeSend(ws, ["updateMySeatSuccess", seat]);
-              }
-            }
+          if (updated) {
+            const updatedSeat = roomMan.getSeat(kursiSeat);
+            await this.broadcast(kursiRoom, ["kursiBatchUpdate", kursiRoom, [[kursiSeat, updatedSeat]]]);
+            this.safeSend(ws, ["updateKursiSuccess", kursiSeat]);
           }
           break;
         }
@@ -1041,8 +1010,7 @@ export class ChatServer {
     const existingSeatInfo = this.userSeat.get(username);
     const isMultiUser = existingSeatInfo?.isMulti === true;
     
-    // PERBAIKAN: Multi user tetap bisa handleSetId
-    if (isMultiUser) {
+    if (isMultiUser && isNewUser === false) {
       ws.username = username;
       ws.idtarget = username;
       ws.room = existingSeatInfo.room;
@@ -1156,17 +1124,6 @@ export class ChatServer {
         this.safeSend(ws, ["roomFull", roomName]);
         return false;
       }
-      
-      const existingSeatInfo = this.userSeat.get(username);
-      if (existingSeatInfo && existingSeatInfo.room !== roomName) {
-        const oldRoomMan = this.rooms.get(existingSeatInfo.room);
-        if (oldRoomMan) {
-          oldRoomMan.removeSeat(existingSeatInfo.seat);
-          await this.broadcast(existingSeatInfo.room, ["removeKursi", existingSeatInfo.room, existingSeatInfo.seat]);
-          this.updateRoomCount(existingSeatInfo.room);
-        }
-      }
-      
       roomMan.addSeat(username, "", "", 0, 0, 0, 0);
     }
     

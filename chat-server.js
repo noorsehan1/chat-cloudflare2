@@ -772,7 +772,16 @@ export class ChatServer {
           this.safeSend(ws, ["muteTypeSet", !!muteVal, true, muteRoom]);
           break;
         }
-        
+
+
+         case "modwarning": {
+    const modRoom = args[0];
+    if (modRoom && ROOMS_SET.has(modRoom)) {
+        // Kirim ke SEMUA user di room (termasuk pengirim)
+        await this.broadcast(modRoom, ["modwarning", modRoom]);
+    }
+    break;
+}
         case "getMuteType": {
           const getMuteRoom = args[0];
           if (getMuteRoom && ROOMS_SET.has(getMuteRoom)) {

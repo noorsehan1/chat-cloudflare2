@@ -647,6 +647,9 @@ export class GameServer {
     try {
       if (!this._isGameRunning(game)) return;
       
+      // CLEANUP SEMUA TIMER LAMA
+      this._cleanupGameTimers(game);
+      
       const activePlayers = this._getActivePlayers(game);
       
       if (activePlayers.length < 2) {
@@ -691,7 +694,7 @@ export class GameServer {
       this._broadcastToRoom(room, ["gameLowCardClosed", playersList]);
       this._broadcastToRoom(room, ["gameLowCardNextRound", game.round]);
       
-      // Mulai countdown
+      // Mulai countdown baru
       this._startDrawCountdown(room, game);
       
       // Mulai bot draws
@@ -703,8 +706,51 @@ export class GameServer {
     }
   }
   
+  _cleanupGameTimers(game) {
+    if (!game) return;
+    
+    // Bersihkan draw timer
+    if (game._drawTimer) {
+      clearInterval(game._drawTimer);
+      game._drawTimer = null;
+    }
+    
+    // Bersihkan eval timer
+    if (game._evalTimer) {
+      clearTimeout(game._evalTimer);
+      game._evalTimer = null;
+    }
+    
+    // Bersihkan safety timer
+    if (game._safetyTimer) {
+      clearTimeout(game._safetyTimer);
+      game._safetyTimer = null;
+    }
+    
+    // Bersihkan registration timer
+    if (game._registrationTimer) {
+      clearInterval(game._registrationTimer);
+      game._registrationTimer = null;
+    }
+    
+    // Bersihkan bot timeouts
+    if (game._botTimeouts) {
+      for (const id of game._botTimeouts) {
+        clearTimeout(id);
+      }
+      game._botTimeouts.clear();
+      game._botTimeouts = new Set();
+    }
+  }
+  
   _startDrawCountdown(room, game) {
     if (!this._isGameRunning(game)) return;
+    
+    // Pastikan timer lama dibersihkan
+    if (game._drawTimer) {
+      clearInterval(game._drawTimer);
+      game._drawTimer = null;
+    }
     
     let timeLeft = 20;
     let lastBroadcasted = -1;
@@ -797,6 +843,11 @@ export class GameServer {
       // Proceed ke evaluasi
       this._broadcastToRoom(room, ["gameLowCardWait", "Please wait for results..."]);
       
+      if (game._evalTimer) {
+        clearTimeout(game._evalTimer);
+        game._evalTimer = null;
+      }
+      
       game._evalTimer = setTimeout(() => {
         try {
           this._evaluateRound(room, game);
@@ -865,6 +916,9 @@ export class GameServer {
       if (game.numbers.size === activeIds.length && !game.evaluationLocked && !game.drawTimeExpired && this._isGameRunning(game)) {
         game.evaluationLocked = true;
         this._broadcastToRoom(room, ["gameLowCardWait", "Please wait for results..."]);
+        if (game._evalTimer) {
+          clearTimeout(game._evalTimer);
+        }
         game._evalTimer = setTimeout(() => {
           try {
             this._evaluateRound(room, game);
@@ -1015,8 +1069,10 @@ export class GameServer {
           game._safetyTimer = null;
         }
         
-        numbers.clear();
-        tanda.clear();
+        // Bersihkan timers sebelum lanjut ke round berikutnya
+        this._cleanupGameTimers(game);
+        
+        // Reset untuk round berikutnya
         game.round++;
         game.evaluationLocked = false;
         game.drawTimeExpired = false;
@@ -1024,6 +1080,7 @@ export class GameServer {
         game.numbers = new Map();
         game.tanda = new Map();
         game._botTimeouts = new Set();
+        game._isEvaluating = false;
         
         const remainingNames = remaining.map(id => players.get(id)?.name || id);
         this._broadcastToRoom(room, [
@@ -1091,8 +1148,10 @@ export class GameServer {
         "gameLowCardRoundResult", game.round, numbersArr, loserNames, remainingNames
       ]);
       
-      numbers.clear();
-      tanda.clear();
+      // Bersihkan timers sebelum lanjut ke round berikutnya
+      this._cleanupGameTimers(game);
+      
+      // Reset untuk round berikutnya
       game.round++;
       game.evaluationLocked = false;
       game.drawTimeExpired = false;
@@ -1222,6 +1281,7 @@ export class GameServer {
           return;
         }
         
+        // Force cleanup game lama jika ada (termasuk yang sudah selesai)
         if (existingRoomGame) {
           this._deleteGame(room, existingRoomGame);
           await new Promise(r => setTimeout(r, 300));

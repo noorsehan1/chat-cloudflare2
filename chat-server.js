@@ -404,16 +404,20 @@ export class ChatServer {
     try {
       const allSeats = roomMan.getAllSeats();
       const allPoints = roomMan.getAllPoints();
-      const selfSeat = this.userSeat.get(ws.username)?.seat;
       
       this.safeSend(ws, ["roomUserCount", room, roomMan.getCount()]);
       
       if (allSeats && Object.keys(allSeats).length > 0) {
-        if (excludeSelf && selfSeat && allSeats[selfSeat]) {
-          const filtered = { ...allSeats };
-          delete filtered[selfSeat];
-          if (Object.keys(filtered).length > 0) {
-            this.safeSend(ws, ["allUpdateKursiList", room, filtered]);
+        if (excludeSelf) {
+          const selfSeat = this.userSeat.get(ws.username)?.seat;
+          if (selfSeat && allSeats[selfSeat]) {
+            const filtered = { ...allSeats };
+            delete filtered[selfSeat];
+            if (Object.keys(filtered).length > 0) {
+              this.safeSend(ws, ["allUpdateKursiList", room, filtered]);
+            }
+          } else {
+            this.safeSend(ws, ["allUpdateKursiList", room, allSeats]);
           }
         } else {
           this.safeSend(ws, ["allUpdateKursiList", room, allSeats]);
@@ -507,6 +511,15 @@ export class ChatServer {
           
           this.safeSend(ws, ["rooMasukMulti", seat, multiRoomname]);
           await this.broadcast(multiRoomname, ["roomUserCount", multiRoomname, roomMan.getCount()]);
+          
+          setTimeout(() => {
+            try {
+              if (ws && ws.readyState === 1 && !this.closing && !this.isDestroyed) {
+                this.sendAllStateTo(ws, multiRoomname, true);
+              }
+            } catch(e) {}
+          }, 1000);
+          
           break;
         }
         
@@ -828,11 +841,9 @@ export class ChatServer {
       const roomMan = this.rooms.get(existingSeatInfo.room);
       if (roomMan && !this.isDestroyed) {
         try {
-          const seatData = roomMan.getSeat(existingSeatInfo.seat);
           const pointData = roomMan.getPoint(existingSeatInfo.seat);
           
           this.safeSend(ws, ["numberKursiSaya", existingSeatInfo.seat]);
-          if (seatData) this.safeSend(ws, ["kursiData", existingSeatInfo.room, existingSeatInfo.seat, seatData]);
           if (pointData) this.safeSend(ws, ["pointData", existingSeatInfo.room, existingSeatInfo.seat, pointData.x, pointData.y, pointData.fast ? 1 : 0]);
           this.safeSend(ws, ["muteTypeResponse", roomMan.getMuted(), existingSeatInfo.room]);
           this.sendAllStateTo(ws, existingSeatInfo.room, true);
@@ -936,7 +947,7 @@ export class ChatServer {
     setTimeout(() => {
       try {
         if (ws && ws.readyState === 1 && !this.closing && !this.isDestroyed) {
-          this.sendAllStateTo(ws, roomName, true);
+          this.sendAllStateTo(ws, roomName, false);
         }
       } catch(e) {}
     }, 1000);

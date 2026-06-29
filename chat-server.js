@@ -264,6 +264,7 @@ export class ChatServer {
       // Ignore
     } finally {
       this._cleanupInProgress = false;
+      this._cleaningUp.clear(); // ✅ TAMBAHKAN: bersihkan setelah cleanup
     }
   }
   
@@ -279,14 +280,15 @@ export class ChatServer {
     try {
       const username = ws.username;
       const room = ws.room;
+      const isReconnecting = ws._reconnecting === true; // ✅ CEK FLAG RECONNECT
       
-      if (room) {
+      if (room && !isReconnecting) { // ✅ JIKA RECONNECT, JANGAN HAPUS DARI ROOM
         const clients = this.roomClients.get(room);
         if (clients) clients.delete(ws);
       }
       
       const activeData = this.wsActiveMulti.get(ws);
-      if (activeData?.room) {
+      if (activeData?.room && !isReconnecting) { // ✅ JIKA RECONNECT, JANGAN HAPUS
         const clients = this.roomClients.get(activeData.room);
         if (clients) clients.delete(ws);
       }
@@ -304,14 +306,17 @@ export class ChatServer {
             this.userConnections.delete(username);
             this.userCountry.delete(username);
             
-            if (seatInfo?.room) {
+            if (seatInfo?.room && !isReconnecting) { // ✅ JIKA RECONNECT, JANGAN BROADCAST
               const roomMan = this.rooms.get(seatInfo.room);
               if (roomMan) {
                 const seatData = roomMan.getSeat(seatInfo.seat);
                 if (seatData?.namauser === username) {
                   roomMan.removeSeat(seatInfo.seat);
-                  await this.broadcast(seatInfo.room, ["removeKursi", seatInfo.room, seatInfo.seat]);
-                  this.updateRoomCount(seatInfo.room);
+                  // ✅ JANGAN BROADCAST JIKA RECONNECTING
+                  if (!isReconnecting) {
+                    await this.broadcast(seatInfo.room, ["removeKursi", seatInfo.room, seatInfo.seat]);
+                    this.updateRoomCount(seatInfo.room);
+                  }
                 }
               }
             }
@@ -808,7 +813,7 @@ export class ChatServer {
     }
   }
   
-  // ==================== HANDLE SET ID ====================
+  // ==================== HANDLE SET ID (PERBAIKAN) ====================
   
   async handleSetId(ws, username, isNewUser) {
     if (!ws || !username || typeof username !== 'string' || username.length === 0 || this.closing || this.isDestroyed) {
@@ -823,6 +828,7 @@ export class ChatServer {
     const existingSeatInfo = this.userSeat.get(username);
     const isMultiUser = existingSeatInfo?.isMulti === true;
     
+    // ========== MULTI USER ==========
     if (isMultiUser && isNewUser === false) {
       ws.username = username;
       ws.idtarget = username;
@@ -861,17 +867,47 @@ export class ChatServer {
       return;
     }
     
+    // ========== NORMAL USER ==========
+    
+    // ✅ STEP 1: Tandai semua koneksi lama sebagai reconnecting
     const existingConns = this.userConnections.get(username);
     if (existingConns?.size > 0) {
       for (const oldWs of Array.from(existingConns)) {
         if (oldWs && oldWs !== ws && oldWs.readyState === 1) {
+          oldWs._reconnecting = true; // ✅ FLAG: jangan broadcast
+        }
+      }
+    }
+    
+    // ✅ STEP 2: Cleanup semua koneksi lama (WAIT)
+    if (existingConns?.size > 0) {
+      const cleanupPromises = [];
+      for (const oldWs of Array.from(existingConns)) {
+        if (oldWs && oldWs !== ws && oldWs.readyState === 1) {
+          cleanupPromises.push(this.cleanup(oldWs));
+        }
+      }
+      if (cleanupPromises.length > 0) {
+        await Promise.allSettled(cleanupPromises);
+      }
+    }
+    
+    // ✅ STEP 3: DOUBLE CHECK - masih ada koneksi?
+    const remainingConns = this.userConnections.get(username);
+    if (remainingConns?.size > 0) {
+      for (const oldWs of Array.from(remainingConns)) {
+        if (oldWs && oldWs !== ws && oldWs.readyState === 1) {
+          oldWs._reconnecting = true;
           await this.cleanup(oldWs);
         }
       }
     }
     
+    // ✅ STEP 4: Setup koneksi baru
     ws.username = username;
     ws.idtarget = username;
+    ws._reconnecting = false; // Reset flag
+    
     if (!this.userCountry.has(username)) {
       this.userCountry.set(username, userCountry);
     }
@@ -1007,6 +1043,7 @@ export class ChatServer {
       server.roomname = null;
       server.idtarget = null;
       server._closing = false;
+      server._reconnecting = false; // ✅ TAMBAHKAN: flag reconnect
       server.clientCountry = clientCountry;
       server._wsId = Date.now() + Math.random();
       

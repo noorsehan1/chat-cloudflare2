@@ -8,16 +8,23 @@ export default {
     const url = new URL(request.url);
     const path = url.pathname;
     
-    // 🔥 CEK WEBSOCKET DULU (SEBELUM ROUTING KE GAME)
+    // 🔥 CEK WEBSOCKET DULU - SELALU KE CHAT SERVER
     const upgrade = request.headers.get("Upgrade");
     if (upgrade === "websocket") {
-      // WebSocket selalu ke CHAT SERVER
+      // CEK APAKAH WEBSOCKET UNTUK GAME?
+      if (path === "/game/ws") {
+        const id = env.GAME_SERVER.idFromName("main");
+        const obj = env.GAME_SERVER.get(id);
+        return obj.fetch(request);
+      }
+      
+      // SELAIN ITU KE CHAT SERVER
       const id = env.CHAT_SERVER.idFromName("main");
       const obj = env.CHAT_SERVER.get(id);
       return obj.fetch(request);
     }
     
-    // 🔥 GAME SERVER - handle /game/* (HANYA HTTP, BUKAN WEBSOCKET)
+    // 🔥 GAME SERVER - handle /game/* (HTTP)
     if (path.startsWith("/game")) {
       const id = env.GAME_SERVER.idFromName("main");
       const obj = env.GAME_SERVER.get(id);

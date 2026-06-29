@@ -953,6 +953,13 @@ export class ChatServer {
     this.safeSend(ws, ["muteTypeResponse", roomMan.getMuted(), roomName]);
     this.safeSend(ws, ["roomUserCount", roomName, roomMan.getCount()]);
     
+    // ========== KIRIM DATA KURSI SENDIRI ==========
+    const mySeatData = roomMan.getSeat(seat);
+    if (mySeatData) {
+      this.safeSend(ws, ["kursiData", roomName, seat, mySeatData]);
+    }
+    // ==============================================
+    
     this.updateRoomCount(roomName);
     
     setTimeout(() => {

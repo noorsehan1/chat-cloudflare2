@@ -176,21 +176,18 @@ export class ChatServer {
   // ==================== INTERVALS ====================
   
   _startIntervals() {
-    // Cleanup SETIAP 30 MENIT
     this._cleanupInterval = setInterval(() => {
       if (!this.closing && !this.isDestroyed) {
         this._doCleanup();
       }
     }, C.CLEANUP_INTERVAL);
     
-    // Update number SETIAP 15 MENIT
     this._numberUpdateInterval = setInterval(() => {
       if (!this.closing && !this.isDestroyed) {
         this._updateNumber();
       }
     }, C.NUMBER_UPDATE_INTERVAL);
     
-    // Broadcast number pertama kali
     setTimeout(() => {
       this._broadcastNumberToAll();
     }, 1000);
@@ -234,7 +231,6 @@ export class ChatServer {
           toRemove.push(ws);
           continue;
         }
-        // TIDAK ADA KICK USER INACTIVE - TETAP DI SINI
       }
       
       for (const ws of toRemove) {
@@ -245,7 +241,6 @@ export class ChatServer {
         }
       }
       
-      // Bersihkan point yang tidak ada seat-nya
       for (const [roomName, roomMan] of this.rooms) {
         if (roomMan) {
           const pointsToRemove = [];
@@ -408,7 +403,7 @@ export class ChatServer {
     return count;
   }
   
-  sendAllStateTo(ws, room, excludeSelf = false) {
+  sendAllStateTo(ws, room) {
     if (!ws || !ws.username || ws.readyState !== 1 || ws._closing || this._cleaningUp.has(ws) || this.closing || this.isDestroyed) {
       return;
     }
@@ -419,20 +414,11 @@ export class ChatServer {
     try {
       const allSeats = roomMan.getAllSeats();
       const allPoints = roomMan.getAllPoints();
-      const selfSeat = this.userSeat.get(ws.username)?.seat;
       
       this.safeSend(ws, ["roomUserCount", room, roomMan.getCount()]);
       
       if (allSeats && Object.keys(allSeats).length > 0) {
-        if (excludeSelf && selfSeat && allSeats[selfSeat]) {
-          const filtered = { ...allSeats };
-          delete filtered[selfSeat];
-          if (Object.keys(filtered).length > 0) {
-            this.safeSend(ws, ["allUpdateKursiList", room, filtered]);
-          }
-        } else {
-          this.safeSend(ws, ["allUpdateKursiList", room, allSeats]);
-        }
+        this.safeSend(ws, ["allUpdateKursiList", room, allSeats]);
       }
       
       if (allPoints?.length > 0) {
@@ -523,7 +509,19 @@ export class ChatServer {
           if (roomClients && !roomClients.has(ws)) roomClients.add(ws);
           
           this.safeSend(ws, ["rooMasukMulti", seat, multiRoomname]);
+          
           await this.broadcast(multiRoomname, ["roomUserCount", multiRoomname, roomMan.getCount()]);
+          
+          setTimeout(() => {
+            try {
+              if (ws && ws.readyState === 1 && !this.closing && !this.isDestroyed) {
+                this.sendAllStateTo(ws, multiRoomname);
+              }
+            } catch(e) {
+              // Ignore
+            }
+          }, 1000);
+          
           break;
         }
         
@@ -846,14 +844,12 @@ export class ChatServer {
       const roomMan = this.rooms.get(existingSeatInfo.room);
       if (roomMan && !this.isDestroyed) {
         try {
-          const seatData = roomMan.getSeat(existingSeatInfo.seat);
           const pointData = roomMan.getPoint(existingSeatInfo.seat);
           
           this.safeSend(ws, ["numberKursiSaya", existingSeatInfo.seat]);
-          if (seatData) this.safeSend(ws, ["kursiData", existingSeatInfo.room, existingSeatInfo.seat, seatData]);
           if (pointData) this.safeSend(ws, ["pointData", existingSeatInfo.room, existingSeatInfo.seat, pointData.x, pointData.y, pointData.fast ? 1 : 0]);
           this.safeSend(ws, ["muteTypeResponse", roomMan.getMuted(), existingSeatInfo.room]);
-          this.sendAllStateTo(ws, existingSeatInfo.room, true);
+          this.sendAllStateTo(ws, existingSeatInfo.room);
         } catch(e) {
           // Ignore
         }
@@ -861,13 +857,27 @@ export class ChatServer {
       return;
     }
     
+    // Hapus semua koneksi lama untuk username ini
     const existingConns = this.userConnections.get(username);
-    if (existingConns?.size > 0) {
+    if (existingConns && existingConns.size > 0) {
       for (const oldWs of Array.from(existingConns)) {
         if (oldWs && oldWs !== ws && oldWs.readyState === 1) {
           await this.cleanup(oldWs);
         }
       }
+    }
+    
+    // Hapus seat lama jika ada
+    const oldSeatInfo = this.userSeat.get(username);
+    if (oldSeatInfo && !oldSeatInfo.isMulti) {
+      const oldRoomMan = this.rooms.get(oldSeatInfo.room);
+      if (oldRoomMan) {
+        oldRoomMan.removeSeat(oldSeatInfo.seat);
+        await this.broadcast(oldSeatInfo.room, ["removeKursi", oldSeatInfo.room, oldSeatInfo.seat]);
+        this.updateRoomCount(oldSeatInfo.room);
+      }
+      this.userSeat.delete(username);
+      this.userRoom.delete(username);
     }
     
     ws.username = username;
@@ -896,6 +906,7 @@ export class ChatServer {
     const username = ws.username;
     const oldRoom = ws.room;
     
+    // Hapus dari room lama jika berbeda
     if (oldRoom && oldRoom !== roomName) {
       try {
         const oldMan = this.rooms.get(oldRoom);
@@ -916,6 +927,19 @@ export class ChatServer {
       }
       ws.room = null;
       ws.roomname = null;
+    }
+    
+    // Jika user sudah ada di room lain, hapus dulu
+    const existingSeatInfo = this.userSeat.get(username);
+    if (existingSeatInfo && existingSeatInfo.room !== roomName && !existingSeatInfo.isMulti) {
+      const oldRoomMan = this.rooms.get(existingSeatInfo.room);
+      if (oldRoomMan) {
+        oldRoomMan.removeSeat(existingSeatInfo.seat);
+        await this.broadcast(existingSeatInfo.room, ["removeKursi", existingSeatInfo.room, existingSeatInfo.seat]);
+        this.updateRoomCount(existingSeatInfo.room);
+      }
+      this.userSeat.delete(username);
+      this.userRoom.delete(username);
     }
     
     const roomMan = this.rooms.get(roomName);
@@ -953,19 +977,12 @@ export class ChatServer {
     this.safeSend(ws, ["muteTypeResponse", roomMan.getMuted(), roomName]);
     this.safeSend(ws, ["roomUserCount", roomName, roomMan.getCount()]);
     
-    // ========== KIRIM DATA KURSI SENDIRI ==========
-    const mySeatData = roomMan.getSeat(seat);
-    if (mySeatData) {
-      this.safeSend(ws, ["kursiData", roomName, seat, mySeatData]);
-    }
-    // ==============================================
-    
     this.updateRoomCount(roomName);
     
     setTimeout(() => {
       try {
         if (ws && ws.readyState === 1 && !this.closing && !this.isDestroyed) {
-          this.sendAllStateTo(ws, roomName, true);
+          this.sendAllStateTo(ws, roomName);
         }
       } catch(e) {
         // Ignore

@@ -608,6 +608,19 @@ export class ChatServer {
           if (updated) {
             const updatedSeat = roomMan.getSeat(kursiSeat);
             await this.broadcast(kursiRoom, ["kursiBatchUpdate", kursiRoom, [[kursiSeat, updatedSeat]]]);
+            
+            // ========== KIRIM ULANG SEMUA KURSI KE SEMUA USER ==========
+            const allSeats = roomMan.getAllSeats();
+            for (const [roomName, clients] of this.roomClients) {
+              if (roomName === kursiRoom && clients && clients.size > 0) {
+                for (const clientWs of clients) {
+                  if (clientWs && clientWs.readyState === 1 && !clientWs._closing) {
+                    this.safeSend(clientWs, ["allUpdateKursiList", kursiRoom, allSeats]);
+                  }
+                }
+              }
+            }
+            // ===========================================================
           }
           break;
         }

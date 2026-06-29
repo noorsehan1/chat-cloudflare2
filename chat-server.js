@@ -857,7 +857,6 @@ export class ChatServer {
       return;
     }
     
-    // Hapus semua koneksi lama untuk username ini
     const existingConns = this.userConnections.get(username);
     if (existingConns && existingConns.size > 0) {
       for (const oldWs of Array.from(existingConns)) {
@@ -867,7 +866,6 @@ export class ChatServer {
       }
     }
     
-    // Hapus seat lama jika ada
     const oldSeatInfo = this.userSeat.get(username);
     if (oldSeatInfo && !oldSeatInfo.isMulti) {
       const oldRoomMan = this.rooms.get(oldSeatInfo.room);
@@ -906,7 +904,6 @@ export class ChatServer {
     const username = ws.username;
     const oldRoom = ws.room;
     
-    // Hapus dari room lama jika berbeda
     if (oldRoom && oldRoom !== roomName) {
       try {
         const oldMan = this.rooms.get(oldRoom);
@@ -929,7 +926,6 @@ export class ChatServer {
       ws.roomname = null;
     }
     
-    // Jika user sudah ada di room lain, hapus dulu
     const existingSeatInfo = this.userSeat.get(username);
     if (existingSeatInfo && existingSeatInfo.room !== roomName && !existingSeatInfo.isMulti) {
       const oldRoomMan = this.rooms.get(existingSeatInfo.room);

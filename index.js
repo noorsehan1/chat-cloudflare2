@@ -3,14 +3,12 @@ import { GameServer } from "./game-server.js";
 
 export { ChatServer, GameServer };
 
-// ✅ BARU: Rate limiter untuk mencegah spam
+// ✅ RATE LIMITER (tanpa setInterval global)
 const RATE_LIMIT = {
-  windowMs: 60000, // 1 menit
-  maxRequests: 60, // 60 request per menit per IP
+  windowMs: 60000,
+  maxRequests: 60,
 };
 
-// ✅ BARU: Simple in-memory rate limiter (hanya untuk preview)
-// Untuk production, gunakan KV atau Durable Object
 const rateLimiter = new Map();
 
 function checkRateLimit(ip) {
@@ -30,17 +28,16 @@ function checkRateLimit(ip) {
   return true;
 }
 
-// ✅ BARU: Cleanup rate limiter setiap 5 menit
-setInterval(() => {
+// ✅ CLEANUP DI DALAM scheduled handler (BUKAN global)
+function cleanupRateLimiter() {
   const now = Date.now();
   for (const [ip, record] of rateLimiter) {
     if ((now - record.timestamp) > RATE_LIMIT.windowMs) {
       rateLimiter.delete(ip);
     }
   }
-}, 300000);
+}
 
-// ✅ BARU: Get client IP dengan aman
 function getClientIP(request) {
   try {
     return request.headers.get("CF-Connecting-IP") ||
@@ -52,23 +49,26 @@ function getClientIP(request) {
   }
 }
 
-// ✅ BARU: Cek apakah path valid
 function isValidPath(path) {
-  const validPaths = ["/game/ws", "/chat/ws", "/"];
+  const validPaths = ["/game/ws", "/chat/ws", "/", "/health", "/ping"];
   return validPaths.includes(path);
 }
 
+// ✅ CORS HEADERS
+const CORS_HEADERS = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+  "Access-Control-Allow-Headers": "Content-Type, Upgrade, Connection, Sec-WebSocket-Key, Sec-WebSocket-Version",
+  "Access-Control-Allow-Credentials": "true",
+};
+
 export default {
   async fetch(request, env) {
-    // ✅ CEK METHOD
+    // ✅ OPTIONS (CORS preflight)
     if (request.method === "OPTIONS") {
       return new Response(null, {
         status: 204,
-        headers: {
-          "Access-Control-Allow-Origin": "*",
-          "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-          "Access-Control-Allow-Headers": "Content-Type, Upgrade",
-        },
+        headers: CORS_HEADERS,
       });
     }
 
@@ -81,7 +81,22 @@ export default {
         return new Response("Not Found", { status: 404 });
       }
       
-      // ✅ RATE LIMITING (kecuali untuk WebSocket upgrade)
+      // ✅ HEALTH CHECK
+      if (path === "/health" || path === "/ping") {
+        return new Response(JSON.stringify({
+          status: "healthy",
+          timestamp: Date.now(),
+          rateLimiterSize: rateLimiter.size,
+        }), {
+          headers: {
+            "Content-Type": "application/json",
+            ...CORS_HEADERS,
+            "Cache-Control": "no-cache",
+          }
+        });
+      }
+      
+      // ✅ RATE LIMITING (kecuali WebSocket)
       const upgrade = request.headers.get("Upgrade");
       if (upgrade !== "websocket") {
         const ip = getClientIP(request);
@@ -90,18 +105,18 @@ export default {
             status: 429,
             headers: {
               "Retry-After": "60",
-              "Access-Control-Allow-Origin": "*",
+              ...CORS_HEADERS,
             }
           });
         }
         
-        // ✅ RESPONSE CACHE untuk root path
+        // ✅ ROOT PATH
         if (path === "/") {
-          return new Response("Chat & Game Server", {
+          return new Response("Chat & Game Server Running ✅", {
             status: 200,
             headers: {
               "Cache-Control": "public, max-age=300",
-              "Access-Control-Allow-Origin": "*",
+              ...CORS_HEADERS,
             }
           });
         }
@@ -111,50 +126,37 @@ export default {
       if (upgrade !== "websocket") {
         return new Response("WebSocket only", { 
           status: 400,
-          headers: {
-            "Access-Control-Allow-Origin": "*",
-          }
+          headers: CORS_HEADERS,
         });
       }
       
       // ✅ ROUTING KE DO
+      const room = url.searchParams.get("room") || "main";
+      
       if (path === "/game/ws") {
-        // ✅ Gunakan room name dari query parameter untuk load balancing
-        const room = url.searchParams.get("room") || "main";
         const id = env.GAME_SERVER.idFromName(room);
         const obj = env.GAME_SERVER.get(id);
         return obj.fetch(request);
       }
       
-      // ✅ DEFAULT: CHAT SERVER
-      // ✅ Gunakan room name dari query parameter untuk load balancing
-      const room = url.searchParams.get("room") || "main";
+      // ✅ CHAT SERVER (DEFAULT)
       const id = env.CHAT_SERVER.idFromName(room);
       const obj = env.CHAT_SERVER.get(id);
       return obj.fetch(request);
       
     } catch(error) {
-      // ✅ ERROR HANDLING
       console.error("Server error:", error);
-      return new Response("Internal Server Error", { 
+      return new Response("Internal Server Error: " + error.message, { 
         status: 500,
-        headers: {
-          "Access-Control-Allow-Origin": "*",
-        }
+        headers: CORS_HEADERS,
       });
     }
   },
   
-  // ✅ BARU: Scheduled cleanup
+  // ✅ SCHEDULED CLEANUP (BUKAN global setInterval)
   async scheduled(event, env, ctx) {
     try {
-      // Cleanup rate limiter
-      const now = Date.now();
-      for (const [ip, record] of rateLimiter) {
-        if ((now - record.timestamp) > RATE_LIMIT.windowMs) {
-          rateLimiter.delete(ip);
-        }
-      }
+      cleanupRateLimiter();
     } catch(e) {
       console.error("Scheduled cleanup error:", e);
     }

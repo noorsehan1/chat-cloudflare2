@@ -8,19 +8,25 @@ export default {
     const url = new URL(request.url);
     const path = url.pathname;
     
-    // ✅ HANYA WEBSOCKET
+    // 🔥 CEK APAKAH WEBSOCKET?
     const upgrade = request.headers.get("Upgrade");
     if (upgrade !== "websocket") {
-      return new Response("WebSocket only", { status: 400 });
+      // BUKAN WEBSOCKET -> TOLAK
+      return new Response("WebSocket only", { 
+        status: 400,
+        headers: { "Content-Type": "text/plain" }
+      });
     }
     
-    // ✅ ROUTING KE DO (semua di memory)
+    // 🔥 CEK PATH UNTUK GAME ATAU CHAT
     if (path === "/game/ws") {
+      // GAME - WSS
       const id = env.GAME_SERVER.idFromName("main");
       const obj = env.GAME_SERVER.get(id);
       return obj.fetch(request);
     }
     
+    // CHAT - WSS (DEFAULT)
     const id = env.CHAT_SERVER.idFromName("main");
     const obj = env.CHAT_SERVER.get(id);
     return obj.fetch(request);

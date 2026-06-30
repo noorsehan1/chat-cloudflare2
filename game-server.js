@@ -45,7 +45,6 @@ export class GameServer {
     this._errorCount = 0;
     this._lastErrorReset = Date.now();
     
-    // ✅ HANYA cleanup koneksi mati dan game stale
     this._cleanupInterval = setInterval(() => {
       try {
         this._cleanupStaleGames();
@@ -56,7 +55,6 @@ export class GameServer {
       }
     }, CONSTANTS.CLEANUP_INTERVAL_MS);
     
-    // ✅ KEEP-ALIVE (30 MENIT) - HANYA untuk room yang ada game aktif
     this._mainInterval = null;
     this._lastActivityTime = Date.now();
     this._startMainInterval();
@@ -82,7 +80,6 @@ export class GameServer {
     try {
       this._lastActivityTime = Date.now();
       
-      // ✅ HANYA kirim keep-alive ke room yang ada game aktif
       for (const [room, game] of this.activeGames) {
         if (game && game._isActive && !game._gameEnded && game.players?.size > 0) {
           try {
@@ -96,7 +93,6 @@ export class GameServer {
         }
       }
       
-      // ✅ HANYA cleanup, BUKAN cek status game
       this._cleanupStaleGames();
       this._cleanupDeadConnections();
       
@@ -407,8 +403,6 @@ export class GameServer {
       
       if (oldRoom === roomName) {
         this._safeSend(ws, ["switchRoomSuccess", roomName]);
-        // ✅ HANYA kirim status jika ada game aktif (tapi TIDAK otomatis cek)
-        this._sendGameStatusToWs(ws, roomName);
         return;
       }
       
@@ -426,48 +420,11 @@ export class GameServer {
         }
       }
       
-      this._sendGameStatusToWs(ws, roomName);
       this._broadcastToRoom(roomName, ["roomUserJoined", username || "Anonymous"]);
       this._safeSend(ws, ["switchRoomSuccess", roomName]);
+      
     } catch(e) {
       this._safeSend(ws, ["gameLowCardError", "Switch room failed"]);
-      this._errorCount++;
-    }
-  }
-  
-  _sendGameStatusToWs(ws, room) {
-    try {
-      const roomGame = this.activeGames.get(room);
-      if (roomGame && roomGame._isActive && !roomGame._gameEnded) {
-        this._safeSend(ws, ["gameLowCardStatus", {
-          room: room,
-          running: true,
-          phase: roomGame._phase || 'idle',
-          round: roomGame.round || 0,
-          betAmount: roomGame.betAmount || 0,
-          registrationOpen: roomGame.registrationOpen || false,
-          players: Array.from(roomGame.players?.values() || []).map(p => p.name),
-          eliminated: Array.from(roomGame.eliminated || []),
-          numbers: Array.from(roomGame.numbers?.entries() || []).map(([name, num]) => ({ name, num })),
-          totalPlayers: roomGame.players?.size || 0,
-          activePlayers: this._getActivePlayers(roomGame).length
-        }]);
-      } else {
-        this._safeSend(ws, ["gameLowCardStatus", {
-          room: room,
-          running: false,
-          phase: 'idle',
-          round: 0,
-          betAmount: 0,
-          registrationOpen: false,
-          players: [],
-          eliminated: [],
-          numbers: [],
-          totalPlayers: 0,
-          activePlayers: 0
-        }]);
-      }
-    } catch(e) {
       this._errorCount++;
     }
   }
@@ -640,11 +597,6 @@ export class GameServer {
     }
   }
   
-  // ✅ HANYA untuk internal cleanup, BUKAN untuk cek status
-  _isGameRunningInternal(game) {
-    return game && game._isActive === true && !game._gameEnded && !this.isDestroyed && game.players && game.players.size > 0;
-  }
-  
   _safeGetGame(room) {
     if (this.isDestroyed || !room) return null;
     const game = this.activeGames.get(room);
@@ -738,7 +690,6 @@ export class GameServer {
   // ==================== REGISTRATION ====================
   
   _startRegistration(room, game) {
-    // ✅ HANYA jika game aktif dan registration open
     if (!game || !game._isActive || game._gameEnded || !game.registrationOpen) return;
     
     if (game._registrationTimer) {
@@ -805,7 +756,6 @@ export class GameServer {
         }
       }
       
-      // ✅ HANYA jika game masih aktif dan cukup pemain
       if (game && game._isActive && !game._gameEnded && game.players && game.players.size >= 2) {
         this._startDrawPhase(room, game);
       } else if (game) {

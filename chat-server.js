@@ -1294,7 +1294,7 @@ export class ChatServer {
           this.sendAllStateTo(ws, roomName, true);
         }
       } catch(e) {}
-    }, 1000);
+    }, 2000);
     
     return true;
   }

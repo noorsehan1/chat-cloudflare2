@@ -5,46 +5,52 @@ export { ChatServer, GameServer };
 
 // ✅ RATE LIMITER & DDOS PROTECTION
 const RATE_LIMIT = {
-  windowMs: 60000,
-  maxRequests: 60,
-  burstLimit: 10,
-  burstWindowMs: 1000,
+  windowMs: 60000,        // 1 menit
+  maxRequests: 60,        // max 60 request per menit
+  burstLimit: 10,         // max 10 request per detik
+  burstWindowMs: 1000,    // 1 detik
 };
 
-const burstTracker = new Map();
-const rateLimiter = new Map();
+// ✅ INI BOLEH DI GLOBAL SCOPE (hanya deklarasi Map)
+const rateLimitTracker = new Map();
 
-function checkBurstLimit(ip) {
-  const now = Date.now();
-  const record = burstTracker.get(ip);
-  
-  if (!record || (now - record.timestamp) > RATE_LIMIT.burstWindowMs) {
-    burstTracker.set(ip, { count: 1, timestamp: now });
-    return true;
-  }
-  
-  if (record.count >= RATE_LIMIT.burstLimit) {
-    return false;
-  }
-  
-  record.count++;
-  return true;
-}
-
+// ✅ FUNGSI INI BOLEH DI GLOBAL SCOPE
 function checkRateLimit(ip) {
   const now = Date.now();
-  const record = rateLimiter.get(ip);
+  const record = rateLimitTracker.get(ip);
   
-  if (!record || (now - record.timestamp) > RATE_LIMIT.windowMs) {
-    rateLimiter.set(ip, { count: 1, timestamp: now });
+  if (!record) {
+    rateLimitTracker.set(ip, {
+      count: 1,
+      burstCount: 1,
+      windowStart: now,
+      burstStart: now,
+    });
     return true;
   }
   
-  if (record.count >= RATE_LIMIT.maxRequests) {
-    return false;
+  // CEK BURST (1 DETIK)
+  if ((now - record.burstStart) <= RATE_LIMIT.burstWindowMs) {
+    if (record.burstCount >= RATE_LIMIT.burstLimit) {
+      return false;
+    }
+    record.burstCount++;
+  } else {
+    record.burstCount = 1;
+    record.burstStart = now;
   }
   
-  record.count++;
+  // CEK RATE LIMIT (1 MENIT)
+  if ((now - record.windowStart) <= RATE_LIMIT.windowMs) {
+    if (record.count >= RATE_LIMIT.maxRequests) {
+      return false;
+    }
+    record.count++;
+  } else {
+    record.count = 1;
+    record.windowStart = now;
+  }
+  
   return true;
 }
 
@@ -59,30 +65,40 @@ function getClientIP(request) {
   }
 }
 
+// ✅ CLEANUP DILAKUKAN DI DALAM REQUEST (BUKAN SETINTERVAL)
+function cleanupRateLimiter() {
+  const now = Date.now();
+  for (const [ip, record] of rateLimitTracker) {
+    if ((now - record.windowStart) > RATE_LIMIT.windowMs) {
+      rateLimitTracker.delete(ip);
+    }
+  }
+}
+
 export default {
   async fetch(request, env) {
     try {
+      // ✅ CLEANUP DI SETIAP REQUEST (10% CHANCE)
+      if (Math.random() < 0.1) {
+        cleanupRateLimiter();
+      }
+      
       const url = new URL(request.url);
       const path = url.pathname;
       
-      // ✅ DDOS PROTECTION - CEK BURST
+      // DDOS PROTECTION - CEK RATE LIMIT
       const ip = getClientIP(request);
-      if (!checkBurstLimit(ip)) {
-        return new Response("Too many requests. Please slow down.", { 
-          status: 429,
-          headers: { "Retry-After": "10" }
-        });
-      }
-      
-      // ✅ RATE LIMITING
       if (!checkRateLimit(ip)) {
-        return new Response("Rate limit exceeded. Please wait.", { 
+        return new Response("Too many requests. Please wait.", { 
           status: 429,
-          headers: { "Retry-After": "60" }
+          headers: { 
+            "Retry-After": "60",
+            "Content-Type": "text/plain"
+          }
         });
       }
       
-      // 🔥 CEK APAKAH WEBSOCKET?
+      // CEK APAKAH WEBSOCKET?
       const upgrade = request.headers.get("Upgrade");
       if (upgrade !== "websocket") {
         return new Response("WebSocket only", { 
@@ -91,14 +107,14 @@ export default {
         });
       }
       
-      // 🔥 CEK PATH UNTUK GAME ATAU CHAT
+      // ROUTE: GAME SERVER
       if (path === "/game/ws") {
         const id = env.GAME_SERVER.idFromName("main");
         const obj = env.GAME_SERVER.get(id);
         return obj.fetch(request);
       }
       
-      // CHAT - WSS (DEFAULT)
+      // DEFAULT: CHAT SERVER
       const id = env.CHAT_SERVER.idFromName("main");
       const obj = env.CHAT_SERVER.get(id);
       return obj.fetch(request);

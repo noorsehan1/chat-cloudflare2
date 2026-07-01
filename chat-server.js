@@ -931,78 +931,115 @@ export class ChatServer {
     try {
       const userCountry = ws.clientCountry || "Unknown";
       
-      const existingSeatInfo = this.userSeat.get(username);
-      const isMultiUser = existingSeatInfo?.isMulti === true;
+      // ========== 1. CEK APAKAH USER SUDAH ADA ==========
+      let existingSeatInfo = this.userSeat.get(username);
       
-      if (isMultiUser && isNewUser === false) {
-        try {
-          ws.username = username;
-          ws.idtarget = username;
-          ws.room = existingSeatInfo.room;
-          ws.roomname = existingSeatInfo.room;
-          
-          if (!this.userCountry.has(username)) {
-            this.userCountry.set(username, userCountry);
-          }
-          
-          let connections = this.userConnections.get(username);
-          if (!connections) connections = new Set();
-          if (!connections.has(ws)) connections.add(ws);
-          this.userConnections.set(username, connections);
-          
-          if (!this.wsSet.has(ws)) this.wsSet.add(ws);
-          
-          const roomClients = this.roomClients.get(existingSeatInfo.room);
-          if (roomClients && !roomClients.has(ws)) roomClients.add(ws);
-          
-          const roomMan = this.rooms.get(existingSeatInfo.room);
-          if (roomMan && !this.isDestroyed) {
-            try {
-              const seatData = roomMan.getSeat(existingSeatInfo.seat);
-              const pointData = roomMan.getPoint(existingSeatInfo.seat);
-              
-              this.safeSend(ws, ["numberKursiSaya", existingSeatInfo.seat]);
-              if (seatData) this.safeSend(ws, ["kursiData", existingSeatInfo.room, existingSeatInfo.seat, seatData]);
-              if (pointData) this.safeSend(ws, ["pointData", existingSeatInfo.room, existingSeatInfo.seat, pointData.x, pointData.y, pointData.fast ? 1 : 0]);
-              this.safeSend(ws, ["muteTypeResponse", roomMan.getMuted(), existingSeatInfo.room]);
-              this.sendAllStateTo(ws, existingSeatInfo.room, true);
-            } catch(e) {}
-          }
-        } catch(e) {}
-        return;
-      }
-      
-      try {
-        const existingConns = this.userConnections.get(username);
-        if (existingConns?.size > 0) {
-          for (const oldWs of Array.from(existingConns)) {
-            if (oldWs && oldWs !== ws && oldWs.readyState === 1) {
-              await this.cleanup(oldWs);
+      // CEK DI SEMUA ROOM JIKA TIDAK ADA DI userSeat
+      if (!existingSeatInfo) {
+        for (const [roomName, roomMan] of this.rooms) {
+          if (!roomMan) continue;
+          for (const [seat, seatData] of roomMan.seats) {
+            if (seatData?.namauser === username) {
+              existingSeatInfo = { 
+                room: roomName, 
+                seat: seat, 
+                isMulti: false 
+              };
+              this.userSeat.set(username, existingSeatInfo);
+              this.userRoom.set(username, roomName);
+              break;
             }
           }
+          if (existingSeatInfo) break;
+        }
+      }
+      
+      // ========== 2. HAPUS KURSI LAMA (APAPUN STATUSNYA) ==========
+      if (existingSeatInfo) {
+        try {
+          const oldRoom = existingSeatInfo.room;
+          const oldSeat = existingSeatInfo.seat;
+          
+          // Hapus dari room
+          const oldRoomMan = this.rooms.get(oldRoom);
+          if (oldRoomMan) {
+            const seatData = oldRoomMan.getSeat(oldSeat);
+            if (seatData?.namauser === username) {
+              oldRoomMan.removeSeat(oldSeat);
+              await this.broadcast(oldRoom, ["removeKursi", oldRoom, oldSeat]);
+              this.updateRoomCount(oldRoom);
+            }
+          }
+          
+          // Hapus dari userSeat dan userRoom
+          this.userSeat.delete(username);
+          this.userRoom.delete(username);
+          
+        } catch(e) {}
+      }
+      
+      // ========== 3. HAPUS DARI SEMUA ROOM (JAGA-JAGA) ==========
+      try {
+        for (const [roomName, roomMan] of this.rooms) {
+          if (!roomMan) continue;
+          let found = false;
+          for (const [seat, seatData] of roomMan.seats) {
+            if (seatData?.namauser === username) {
+              roomMan.removeSeat(seat);
+              await this.broadcast(roomName, ["removeKursi", roomName, seat]);
+              this.updateRoomCount(roomName);
+              found = true;
+              break;
+            }
+          }
+          if (found) break;
         }
       } catch(e) {}
       
+      // ========== 4. HAPUS DARI ALL MAPS ==========
+      try {
+        this.userSeat.delete(username);
+        this.userRoom.delete(username);
+      } catch(e) {}
+      
+      // ========== 5. SET WS PROPERTIES ==========
       try {
         ws.username = username;
         ws.idtarget = username;
+        ws.room = null;
+        ws.roomname = null;
+        
         if (!this.userCountry.has(username)) {
           this.userCountry.set(username, userCountry);
         }
         
+        // Tambahkan ke connections (CEK DUPLIKAT)
         let connections = this.userConnections.get(username);
-        if (!connections) connections = new Set();
-        if (!connections.has(ws)) connections.add(ws);
-        this.userConnections.set(username, connections);
+        if (!connections) {
+          connections = new Set();
+          this.userConnections.set(username, connections);
+        }
+        if (!connections.has(ws)) {
+          connections.add(ws);
+        }
         
-        if (!this.wsSet.has(ws)) this.wsSet.add(ws);
+        // Tambahkan ke wsSet (CEK DUPLIKAT)
+        if (!this.wsSet.has(ws)) {
+          this.wsSet.add(ws);
+        }
         
-        this.safeSend(ws, isNewUser ? ["joinroomawal"] : ["needJoinRoom"]);
       } catch(e) {}
       
-    } catch(e) {
-      // Silent error
-    }
+      // ========== 6. KIRIM RESPONSE ==========
+      try {
+        if (isNewUser) {
+          this.safeSend(ws, ["joinroomawal"]);
+        } else {
+          this.safeSend(ws, ["needJoinRoom"]);
+        }
+      } catch(e) {}
+      
+    } catch(e) {}
   }
   
   // ==================== HANDLE JOIN ====================

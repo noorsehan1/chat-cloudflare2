@@ -199,45 +199,187 @@ export class GameServer {
     this.connectionLocks.delete(username);
   }
   
+  // ==================== FORCE CLEANUP - HANYA 1 WS PER USER ====================
+  
   _forceCleanupUserConnections(username, excludeWsId = null) {
     try {
-      const conn = this.userConnections.get(username);
-      if (!conn) return;
-      
-      if (excludeWsId !== null && conn.wsId === excludeWsId) {
-        conn.timestamp = Date.now();
-        return;
-      }
-      
-      const oldWs = this.wsMap.get(conn.wsId);
-      if (oldWs && oldWs.readyState === 1) {
-        try {
-          this._safeSend(oldWs, ["gameLowCardReplaced", "New connection established"]);
-          oldWs.close(1000, "Replaced by new connection");
-        } catch(e) {}
-      }
-      
-      if (conn.room) {
-        const game = this.activeGames.get(conn.room);
-        if (game && game.playerWsId) {
-          game.playerWsId.delete(username);
-        }
-        this._removeClientFromRoom(conn.room, conn.wsId);
-      }
-      
-      this.wsMap.delete(conn.wsId);
-      this.clientRooms.delete(conn.wsId);
-      
-      if (conn.room && this.roomViewers.has(conn.room)) {
-        this.roomViewers.get(conn.room).delete(username);
-        if (this.roomViewers.get(conn.room).size === 0) {
-          this.roomViewers.delete(conn.room);
+      // Cari semua WebSocket ID untuk user ini
+      const toRemove = [];
+      for (const [wsId, ws] of this.wsMap) {
+        if (ws && ws.username === username) {
+          if (excludeWsId === null || wsId !== excludeWsId) {
+            toRemove.push(wsId);
+          }
         }
       }
       
-      this.userConnections.delete(username);
+      // Hapus WebSocket lama
+      for (const wsId of toRemove) {
+        const ws = this.wsMap.get(wsId);
+        if (ws) {
+          try {
+            // Kirim pesan bahwa koneksi diganti
+            if (ws.readyState === 1) {
+              this._safeSend(ws, ["gameLowCardReplaced", "New connection established"]);
+              ws.close(1000, "Replaced by new connection");
+            }
+          } catch(e) {}
+          
+          // Hapus dari room
+          const room = this.clientRooms.get(wsId);
+          if (room) {
+            this._removeClientFromRoom(room, wsId);
+          }
+          
+          // Hapus dari game
+          if (room) {
+            const game = this.activeGames.get(room);
+            if (game && game.playerWsId) {
+              game.playerWsId.delete(username);
+            }
+          }
+          
+          // Hapus dari semua map
+          this.clientRooms.delete(wsId);
+          this.wsMap.delete(wsId);
+          
+          // Hapus dari room viewers
+          if (room && this.roomViewers.has(room)) {
+            this.roomViewers.get(room).delete(username);
+            if (this.roomViewers.get(room).size === 0) {
+              this.roomViewers.delete(room);
+            }
+          }
+        }
+      }
+      
+      // Update atau hapus user connection
+      if (excludeWsId !== null) {
+        // Pertahankan koneksi baru
+        const newConn = this.userConnections.get(username);
+        if (newConn) {
+          newConn.timestamp = Date.now();
+          // Hapus koneksi lama dari userConnections jika masih ada
+          for (const [key, value] of this.userConnections) {
+            if (key === username && value.wsId !== excludeWsId) {
+              this.userConnections.delete(key);
+            }
+          }
+        }
+      } else {
+        // Hapus semua koneksi user
+        this.userConnections.delete(username);
+      }
+      
+      // Hapus connection lock
+      this.connectionLocks.delete(username);
+      
     } catch(e) {
       this._errorCount++;
+    }
+  }
+  
+  // ==================== ENSURE SINGLE CONNECTION ====================
+  
+  _ensureSingleConnection(room, username, newWs, newWsId) {
+    try {
+      const game = this.activeGames.get(room);
+      if (!game) return newWsId;
+      
+      // Pertama: Hapus koneksi LAMA dari user ini di room yang sama
+      const oldConnections = [];
+      for (const [wsId, ws] of this.wsMap) {
+        if (ws && ws.username === username && ws.room === room && wsId !== newWsId) {
+          oldConnections.push(wsId);
+        }
+      }
+      
+      // Hapus koneksi lama
+      for (const oldWsId of oldConnections) {
+        const oldWs = this.wsMap.get(oldWsId);
+        if (oldWs) {
+          try {
+            if (oldWs.readyState === 1) {
+              this._safeSend(oldWs, ["gameLowCardReplaced", "New connection established"]);
+              oldWs.close(1000, "Replaced by new connection");
+            }
+          } catch(e) {}
+          
+          // Hapus dari semua struktur data
+          const oldRoom = this.clientRooms.get(oldWsId);
+          if (oldRoom) {
+            this._removeClientFromRoom(oldRoom, oldWsId);
+            const oldGame = this.activeGames.get(oldRoom);
+            if (oldGame && oldGame.playerWsId) {
+              oldGame.playerWsId.delete(username);
+            }
+          }
+          this.clientRooms.delete(oldWsId);
+          this.wsMap.delete(oldWsId);
+          
+          if (oldRoom && this.roomViewers.has(oldRoom)) {
+            this.roomViewers.get(oldRoom).delete(username);
+            if (this.roomViewers.get(oldRoom).size === 0) {
+              this.roomViewers.delete(oldRoom);
+            }
+          }
+        }
+      }
+      
+      // Hapus dari userConnections yang lama
+      for (const [key, value] of this.userConnections) {
+        if (key === username && value.wsId !== newWsId) {
+          this.userConnections.delete(key);
+        }
+      }
+      
+      // Sekarang tambahkan koneksi baru dengan lock
+      let attempts = 0;
+      const maxAttempts = 5;
+      
+      const tryLock = () => {
+        if (this._lockUserConnection(username)) {
+          try {
+            // Hapus semua koneksi lama (termasuk yang mungkin terlewat)
+            this._forceCleanupUserConnections(username, newWsId);
+            
+            // Tambahkan koneksi baru
+            game.playerWsId.set(username, newWsId);
+            this._addClient(room, newWs, username, true);
+            
+            // Update user connection
+            this.userConnections.set(username, {
+              wsId: newWsId,
+              ws: newWs,
+              room: room,
+              timestamp: Date.now()
+            });
+            
+            // Pastikan hanya 1 connection di userConnections
+            for (const [key, value] of this.userConnections) {
+              if (key === username && value.wsId !== newWsId) {
+                this.userConnections.delete(key);
+              }
+            }
+            
+          } finally {
+            this._unlockUserConnection(username);
+          }
+          return newWsId;
+        } else {
+          attempts++;
+          if (attempts < maxAttempts) {
+            setTimeout(tryLock, 100 * attempts);
+          } else {
+            this._safeSend(newWs, ["gameLowCardError", "Connection busy, please retry"]);
+            return null;
+          }
+        }
+      };
+      
+      return tryLock();
+    } catch(e) {
+      return newWsId;
     }
   }
   
@@ -345,18 +487,14 @@ export class GameServer {
         if (game && game.playerWsId) {
           game.playerWsId.delete(username);
         }
-      }
-      
-      this._removeClientFromRoom(room, wsId);
-      this.clientRooms.delete(wsId);
-      this.wsMap.delete(wsId);
-      
-      if (username) {
+        
+        // Hapus dari userConnections jika wsId sama
         const conn = this.userConnections.get(username);
         if (conn && conn.wsId === wsId) {
           this.userConnections.delete(username);
         }
         
+        // Hapus dari room viewers
         if (this.roomViewers.has(room)) {
           this.roomViewers.get(room).delete(username);
           if (this.roomViewers.get(room).size === 0) {
@@ -364,6 +502,10 @@ export class GameServer {
           }
         }
       }
+      
+      this._removeClientFromRoom(room, wsId);
+      this.clientRooms.delete(wsId);
+      this.wsMap.delete(wsId);
       
       if (ws) {
         ws.room = null;
@@ -380,43 +522,6 @@ export class GameServer {
       return this.clientRooms.get(wsId) || null;
     } catch(e) {
       return null;
-    }
-  }
-  
-  // ==================== SINGLE CONNECTION ====================
-  
-  _ensureSingleConnection(room, username, newWs, newWsId) {
-    try {
-      const game = this.activeGames.get(room);
-      if (!game) return newWsId;
-      
-      let attempts = 0;
-      const maxAttempts = 5;
-      
-      const tryLock = () => {
-        if (this._lockUserConnection(username)) {
-          try {
-            this._forceCleanupUserConnections(username, newWsId);
-            game.playerWsId.set(username, newWsId);
-            this._addClient(room, newWs, username, true);
-          } finally {
-            this._unlockUserConnection(username);
-          }
-          return newWsId;
-        } else {
-          attempts++;
-          if (attempts < maxAttempts) {
-            setTimeout(tryLock, 100 * attempts);
-          } else {
-            this._safeSend(newWs, ["gameLowCardError", "Connection busy, please retry"]);
-            return null;
-          }
-        }
-      };
-      
-      return tryLock();
-    } catch(e) {
-      return newWsId;
     }
   }
   
@@ -441,7 +546,6 @@ export class GameServer {
       
       if (oldRoom === roomName) {
         this._safeSend(ws, ["switchRoomSuccess", roomName]);
-        // ✅ TIDAK kirim status game otomatis
         return;
       }
       
@@ -1249,7 +1353,7 @@ export class GameServer {
     }
   }
   
-  // ==================== CHECK GAME RUNNING - HANYA DARI CLIENT ====================
+  // ==================== CHECK GAME RUNNING - OPTIMIZED ====================
   
   async checkGameRunning(ws, roomname) {
     try {
@@ -1260,6 +1364,7 @@ export class GameServer {
       
       let room = roomname;
       
+      // ✅ Jika room tidak diberikan, ambil dari WebSocket
       if (!room) {
         const wsId = this._getWsId(ws);
         if (wsId && this.clientRooms.has(wsId)) {
@@ -1268,30 +1373,42 @@ export class GameServer {
       }
       
       if (!room) {
-        this._safeSend(ws, ["gameLowCardError", "Room name is required"]);
+        // ✅ FALSE - kirim angka random
+        const randomNumber = Math.floor(Math.random() * 1000000);
+        this._safeSend(ws, ["gameStatus", { 
+          running: randomNumber, // ✅ Kirim angka random sebagai running
+          error: "Room name is required"
+        }]);
         return;
       }
       
+      // ✅ Cek apakah ada game di room
       const game = this.activeGames.get(room);
       
       if (!game || !game._isActive || game._gameEnded || !game.players) {
-        this._safeSend(ws, ["gameStatus", { running: false }]);
+        // ✅ FALSE - kirim angka random
+        const randomNumber = Math.floor(Math.random() * 1000000);
+        this._safeSend(ws, ["gameStatus", { 
+          running: randomNumber, // ✅ Kirim angka random sebagai running
+          room: room
+        }]);
         return;
       }
       
+      // ✅ TRUE - kirim hanya running: true dan room
       this._safeSend(ws, ["gameStatus", { 
-        running: true,
-        phase: game._phase || 'idle',
-        round: game.round || 0,
-        players: Array.from(game.players?.values() || []).map(p => p.name),
-        betAmount: game.betAmount || 0,
-        registrationOpen: game.registrationOpen || false,
-        eliminated: Array.from(game.eliminated || []),
-        totalPlayers: game.players?.size || 0,
-        activePlayers: this._getActivePlayers(game).length
+        running: true, // ✅ Boolean true
+        room: room
       }]);
+      
     } catch(e) {
-      this._safeSend(ws, ["gameLowCardError", "Error checking game"]);
+      // ✅ ERROR - kirim angka random
+      const randomNumber = Math.floor(Math.random() * 1000000);
+      this._safeSend(ws, ["gameStatus", { 
+        running: randomNumber, // ✅ Kirim angka random sebagai running
+        error: "Error checking game"
+      }]);
+      this._errorCount++;
     }
   }
   

@@ -1,13 +1,12 @@
 // ==================== CHAT SERVER - WALL TIME 0 ====================
 
-  const C = {
+const C = {
   MAX_SEATS: 45,
   MAX_GLOBAL_CONNECTIONS: 500,
   MAX_MESSAGE_SIZE: 5000,
   INTERVAL_15_MENIT: 900000,   // 15 MENIT
   MAX_NUMBER: 6,
   BATCH_SIZE: 20,              // ✅ BATCH SIZE
-  BATCH_DELAY_MS: 10,          // ✅ JEDA PER BATCH
 };
 
 const ROOMS = [
@@ -153,8 +152,8 @@ export class ChatServer {
     this._cleanupInProgress = false;
     
     // ✅ LOCKS UNTUK RACE CONDITION
-    this._joinLocks = new Map();      // Lock untuk join room
-    this._kursiLocks = new Map();     // Lock untuk update kursi
+    this._joinLocks = new Map();
+    this._kursiLocks = new Map();
     
     // Number system
     this.currentNumber = 1;
@@ -185,19 +184,16 @@ export class ChatServer {
       if (!this.closing && !this.isDestroyed) {
         try {
           this._doMainTask();
-        } catch(e) {
-          // Silent error
-        }
+        } catch(e) {}
       }
     }, C.INTERVAL_15_MENIT);
   }
   
-  // ✅ PERBAIKAN: _doMainTask - FIRE AND FORGET
+  // ✅ PERBAIKAN: _doMainTask - FIRE AND FORGET (TANPA AWAIT)
   _doMainTask() {
     try {
       this._lastActivityTime = Date.now();
       
-      // ===== UPDATE NUMBER - CYCLE 1-6 =====
       this.currentNumber = this.currentNumber < C.MAX_NUMBER ? this.currentNumber + 1 : 1;
       
       for (const room of this.rooms.values()) {
@@ -211,21 +207,19 @@ export class ChatServer {
       // ✅ FIRE AND FORGET - TANPA AWAIT
       for (const [room, clients] of this.roomClients) {
         if (clients && clients.size > 0) {
-          this._broadcastToRoom(room, numberMsg).catch(() => {});
+          this._broadcastToRoom(room, numberMsg);
         }
       }
       
       // ✅ FIRE AND FORGET - TANPA AWAIT
-      this._doCleanup().catch(() => {});
+      this._doCleanup();
       
-    } catch(e) {
-      // Silent error
-    }
+    } catch(e) {}
   }
   
   // ==================== CLEANUP ====================
   
-  async _doCleanup() {
+  _doCleanup() {
     if (this._cleanupInProgress) return;
     this._cleanupInProgress = true;
     
@@ -243,7 +237,7 @@ export class ChatServer {
       
       for (const ws of toRemove) {
         try {
-          await this.cleanup(ws);
+          this.cleanup(ws);
         } catch(e) {}
       }
       
@@ -261,26 +255,23 @@ export class ChatServer {
         }
       }
       
-    } catch(e) {
-      // Silent error
-    } finally {
+    } catch(e) {} finally {
       this._cleanupInProgress = false;
     }
   }
   
-  // ==================== ✅ PERBAIKAN UTAMA: _broadcastToRoom PAKAI BATCH ====================
-  async _broadcastToRoom(room, msgStr) {
-    if (this.closing || this.isDestroyed || !room) return 0;
+  // ==================== ✅ PERBAIKAN: _broadcastToRoom TANPA ASYNC/AWAIT ====================
+  _broadcastToRoom(room, msgStr) {
+    if (this.closing || this.isDestroyed || !room) return;
     
     const clients = this.roomClients.get(room);
-    if (!clients?.size) return 0;
+    if (!clients?.size) return;
     
     const BATCH_SIZE = C.BATCH_SIZE || 20;
     const clientArray = Array.from(clients);
-    let successCount = 0;
     const toRemove = [];
     
-    // ✅ PROSES 20 CLIENT PER BATCH
+    // ✅ PROSES BATCH TANPA AWAIT
     for (let i = 0; i < clientArray.length; i += BATCH_SIZE) {
       const batch = clientArray.slice(i, i + BATCH_SIZE);
       
@@ -305,15 +296,9 @@ export class ChatServer {
         
         try {
           ws.send(msgStr);
-          successCount++;
         } catch(e) {
           toRemove.push(ws);
         }
-      }
-      
-      // ✅ JEDA 10ms AGAR TIDAK OVERLOAD
-      if (i + BATCH_SIZE < clientArray.length) {
-        await new Promise(r => setTimeout(r, C.BATCH_DELAY_MS || 10));
       }
     }
     
@@ -324,25 +309,20 @@ export class ChatServer {
           try {
             clients.delete(ws);
             if (ws && !this._cleaningUp.has(ws)) {
-              this.cleanup(ws).catch(() => {});
+              this.cleanup(ws);
             }
           } catch(e) {}
         }
       }, 100);
     }
-    
-    return successCount;
   }
   
-  // ✅ PERBAIKAN: broadcast - FIRE AND FORGET (TANPA AWAIT)
+  // ✅ broadcast - TANPA AWAIT
   broadcast(room, msg) {
     if (this.closing || this.isDestroyed || !room || !msg) return;
     try {
-      // ✅ FIRE AND FORGET - TANPA MENUNGGU
-      this._broadcastToRoom(room, JSON.stringify(msg)).catch(() => {});
-    } catch(e) {
-      // Silent error
-    }
+      this._broadcastToRoom(room, JSON.stringify(msg));
+    } catch(e) {}
   }
   
   safeSend(ws, msg) {
@@ -356,19 +336,18 @@ export class ChatServer {
       ws.send(JSON.stringify(msg));
       return true;
     } catch(e) {
-      this.cleanup(ws).catch(() => {});
+      this.cleanup(ws);
       return false;
     }
   }
   
-  // ✅ PERBAIKAN: updateRoomCount - FIRE AND FORGET
+  // ✅ updateRoomCount - TANPA AWAIT
   updateRoomCount(room) {
     if (this.closing || this.isDestroyed || !room) return 0;
     try {
       const roomMan = this.rooms.get(room);
       if (!roomMan) return 0;
       const count = roomMan.getCount();
-      // ✅ FIRE AND FORGET - TANPA AWAIT
       this.broadcast(room, ["roomUserCount", room, count]);
       return count;
     } catch(e) {
@@ -418,14 +397,12 @@ export class ChatServer {
           this.safeSend(ws, ["allPointsList", room, filteredPoints]);
         }
       }
-    } catch(e) {
-      // Silent error
-    }
+    } catch(e) {}
   }
   
   // ==================== CLEANUP ====================
   
-  async cleanup(ws) {
+  cleanup(ws) {
     if (!ws || ws._cleaning || this._cleaningUp.has(ws) || this._isCleaningUp) {
       return;
     }
@@ -474,7 +451,6 @@ export class ChatServer {
                     const seatData = roomMan.getSeat(seatInfo.seat);
                     if (seatData?.namauser === username) {
                       roomMan.removeSeat(seatInfo.seat);
-                      // ✅ FIRE AND FORGET - TANPA AWAIT
                       this.broadcast(seatInfo.room, ["removeKursi", seatInfo.room, seatInfo.seat]);
                       this.updateRoomCount(seatInfo.room);
                     }
@@ -493,9 +469,7 @@ export class ChatServer {
         this.wsSet.delete(ws);
       } catch(e) {}
       
-    } catch(e) {
-      // Silent error
-    } finally {
+    } catch(e) {} finally {
       ws._cleaning = false;
       this._cleaningUp.delete(ws);
       this._isCleaningUp = false;
@@ -576,7 +550,6 @@ export class ChatServer {
                 const oldRoomMan = this.rooms.get(existingRoom);
                 if (oldRoomMan) {
                   oldRoomMan.removeSeat(existingSeat);
-                  // ✅ FIRE AND FORGET - TANPA AWAIT
                   this.broadcast(existingRoom, ["removeKursi", existingRoom, existingSeat]);
                   this.updateRoomCount(existingRoom);
                 }
@@ -608,7 +581,6 @@ export class ChatServer {
               if (roomClients && !roomClients.has(ws)) roomClients.add(ws);
               
               this.safeSend(ws, ["rooMasukMulti", seat, multiRoomname]);
-              // ✅ FIRE AND FORGET - TANPA AWAIT
               this.broadcast(multiRoomname, ["roomUserCount", multiRoomname, roomMan.getCount()]);
             } catch(e) {}
             break;
@@ -635,7 +607,6 @@ export class ChatServer {
               const roomMan = this.rooms.get(roomName);
               if (roomMan) {
                 roomMan.removeSeat(seatNumber);
-                // ✅ FIRE AND FORGET - TANPA AWAIT
                 this.broadcast(roomName, ["removeKursi", roomName, seatNumber]);
                 this.broadcast(roomName, ["roomUserCount", roomName, roomMan.getCount()]);
               }
@@ -685,13 +656,12 @@ export class ChatServer {
               ws.roomname = roomName;
               
               this.safeSend(ws, ["activeChangedMulti", targetUsername, seatNumber, roomName]);
-              // ✅ FIRE AND FORGET - TANPA AWAIT
               this.broadcast(roomName, ["userActiveChanged", targetUsername, seatNumber]);
             } catch(e) {}
             break;
           }
           
-          // ✅ PERBAIKAN: updateKursi - DENGAN LOCK
+          // ✅ updateKursi - DENGAN LOCK
           case "updateKursi": {
             try {
               const [kursiRoom, kursiSeat, kursiNoimg, kursiName, kursiColor, kursiBawah, kursiAtas, kursiVip, kursiVt] = args;
@@ -700,12 +670,10 @@ export class ChatServer {
               
               const lockKey = `kursi_${kursiRoom}_${kursiSeat}`;
               
-              // ✅ CEK LOCK - CEGAH RACE CONDITION
               if (this._kursiLocks.has(lockKey)) {
                 break;
               }
               
-              // ✅ SET LOCK
               this._kursiLocks.set(lockKey, Date.now());
               
               try {
@@ -721,33 +689,29 @@ export class ChatServer {
                 
                 if (updated) {
                   const updatedSeat = roomMan.getSeat(kursiSeat);
-                  // ✅ FIRE AND FORGET - TANPA AWAIT
                   this.broadcast(kursiRoom, ["kursiBatchUpdate", kursiRoom, [[kursiSeat, updatedSeat]]]);
                 }
               } finally {
-                // ✅ RELEASE LOCK
                 this._kursiLocks.delete(lockKey);
               }
             } catch(e) {}
             break;
           }
           
-          // ✅ PERBAIKAN: chat - FIRE AND FORGET
+          // ✅ chat - FIRE AND FORGET
           case "chat": {
             try {
               const [chatRoom, chatNoimg, chatUser, chatMsg, chatColor, chatTextColor] = args;
               if (chatMsg && ROOMS_SET.has(chatRoom)) {
                 const clients = this.roomClients.get(chatRoom);
                 if (!clients || clients.size === 0) break;
-                // ✅ FIRE AND FORGET - TANPA AWAIT
-                this._broadcastToRoom(chatRoom, JSON.stringify(["chat", chatRoom, chatNoimg, chatUser, chatMsg, chatColor, chatTextColor]))
-                  .catch(() => {});
+                this._broadcastToRoom(chatRoom, JSON.stringify(["chat", chatRoom, chatNoimg, chatUser, chatMsg, chatColor, chatTextColor]));
               }
             } catch(e) {}
             break;
           }
           
-          // ✅ PERBAIKAN: updatePoint - FIRE AND FORGET
+          // ✅ updatePoint - FIRE AND FORGET
           case "updatePoint": {
             try {
               const [pointRoom, pointSeat, pointX, pointY, pointFast] = args;
@@ -755,9 +719,7 @@ export class ChatServer {
                 const roomMan = this.rooms.get(pointRoom);
                 if (roomMan && roomMan.seats.has(pointSeat)) {
                   if (roomMan.updatePoint(pointSeat, pointX, pointY, pointFast === 1)) {
-                    // ✅ FIRE AND FORGET - TANPA AWAIT
-                    this._broadcastToRoom(pointRoom, JSON.stringify(["pointUpdated", pointRoom, pointSeat, pointX, pointY, pointFast]))
-                      .catch(() => {});
+                    this._broadcastToRoom(pointRoom, JSON.stringify(["pointUpdated", pointRoom, pointSeat, pointX, pointY, pointFast]));
                   }
                 }
               }
@@ -778,7 +740,6 @@ export class ChatServer {
                   }
                 }
                 roomMan.removeSeat(removeSeat);
-                // ✅ FIRE AND FORGET - TANPA AWAIT
                 this.broadcast(removeRoom, ["removeKursi", removeRoom, removeSeat]);
                 this.updateRoomCount(removeRoom);
               }
@@ -805,31 +766,27 @@ export class ChatServer {
             break;
           }
           
-          // ✅ PERBAIKAN: gift - FIRE AND FORGET
+          // ✅ gift - FIRE AND FORGET
           case "gift": {
             try {
               const [giftRoom, giftSender, giftReceiver, giftGiftName] = args;
               if (giftRoom && ROOMS_SET.has(giftRoom)) {
                 const clients = this.roomClients.get(giftRoom);
                 if (!clients || clients.size === 0) break;
-                // ✅ FIRE AND FORGET - TANPA AWAIT
-                this._broadcastToRoom(giftRoom, JSON.stringify(["gift", giftRoom, giftSender, giftReceiver, giftGiftName, Date.now()]))
-                  .catch(() => {});
+                this._broadcastToRoom(giftRoom, JSON.stringify(["gift", giftRoom, giftSender, giftReceiver, giftGiftName, Date.now()]));
               }
             } catch(e) {}
             break;
           }
           
-          // ✅ PERBAIKAN: rollangak - FIRE AND FORGET
+          // ✅ rollangak - FIRE AND FORGET
           case "rollangak": {
             try {
               const [rollRoom, rollUser, rollAngka] = args;
               if (rollRoom && ROOMS_SET.has(rollRoom)) {
                 const clients = this.roomClients.get(rollRoom);
                 if (!clients || clients.size === 0) break;
-                // ✅ FIRE AND FORGET - TANPA AWAIT
-                this._broadcastToRoom(rollRoom, JSON.stringify(["rollangakBroadcast", rollRoom, rollUser, rollAngka]))
-                  .catch(() => {});
+                this._broadcastToRoom(rollRoom, JSON.stringify(["rollangakBroadcast", rollRoom, rollUser, rollAngka]));
               }
             } catch(e) {}
             break;
@@ -933,7 +890,6 @@ export class ChatServer {
               if (!rm) break;
               
               rm.setMuted(muteVal);
-              // ✅ FIRE AND FORGET - TANPA AWAIT
               this.broadcast(muteRoom, ["muteStatusChanged", !!muteVal, muteRoom]);
               this.safeSend(ws, ["muteTypeSet", !!muteVal, true, muteRoom]);
             } catch(e) {}
@@ -944,7 +900,6 @@ export class ChatServer {
             try {
               const modRoom = args[0];
               if (modRoom && ROOMS_SET.has(modRoom)) {
-                // ✅ FIRE AND FORGET - TANPA AWAIT
                 this.broadcast(modRoom, ["modwarning", modRoom]);
               }
             } catch(e) {}
@@ -1031,7 +986,6 @@ export class ChatServer {
             const seatData = oldRoomMan.getSeat(oldSeat);
             if (seatData?.namauser === username) {
               oldRoomMan.removeSeat(oldSeat);
-              // ✅ FIRE AND FORGET - TANPA AWAIT
               this.broadcast(oldRoom, ["removeKursi", oldRoom, oldSeat]);
               this.updateRoomCount(oldRoom);
             }
@@ -1050,7 +1004,6 @@ export class ChatServer {
           for (const [seat, seatData] of roomMan.seats) {
             if (seatData?.namauser === username) {
               roomMan.removeSeat(seat);
-              // ✅ FIRE AND FORGET - TANPA AWAIT
               this.broadcast(roomName, ["removeKursi", roomName, seat]);
               this.updateRoomCount(roomName);
               found = true;
@@ -1112,24 +1065,20 @@ export class ChatServer {
     const username = ws.username;
     const lockKey = `join_${roomName}_${username}`;
     
-    // ✅ CEK LOCK - CEGAH RACE CONDITION
     if (this._joinLocks.has(lockKey)) {
       this.safeSend(ws, ["roomFull", roomName]);
       return false;
     }
     
-    // ✅ SET LOCK
     this._joinLocks.set(lockKey, Date.now());
     
     try {
       return await this._handleJoinInternal(ws, roomName, username);
     } finally {
-      // ✅ RELEASE LOCK
       this._joinLocks.delete(lockKey);
     }
   }
   
-  // ✅ FUNGSI INTERNAL JOIN
   async _handleJoinInternal(ws, roomName, username) {
     const oldRoom = ws.room;
     
@@ -1140,7 +1089,6 @@ export class ChatServer {
           const oldSeat = this.userSeat.get(username)?.seat;
           if (oldSeat) {
             oldMan.removeSeat(oldSeat);
-            // ✅ FIRE AND FORGET - TANPA AWAIT
             this.broadcast(oldRoom, ["removeKursi", oldRoom, oldSeat]);
             this.updateRoomCount(oldRoom);
           }
@@ -1157,7 +1105,6 @@ export class ChatServer {
     const roomMan = this.rooms.get(roomName);
     if (!roomMan) return false;
     
-    // ✅ CEK APAKAH USER SUDAH ADA
     let seat = null;
     for (const [s, data] of roomMan.seats) {
       if (data?.namauser === username) { 
@@ -1176,7 +1123,6 @@ export class ChatServer {
         this.safeSend(ws, ["roomFull", roomName]);
         return false;
       }
-      // ✅ addSeat SUDAH AMAN (ada pengecekan internal)
       roomMan.addSeat(username, "", "", 0, 0, 0, 0);
     }
     
@@ -1272,14 +1218,14 @@ export class ChatServer {
   async webSocketClose(ws) { 
     if (!ws) return;
     try {
-      await this.cleanup(ws);
+      this.cleanup(ws);
     } catch(e) {}
   }
   
   async webSocketError(ws) { 
     if (!ws) return;
     try {
-      await this.cleanup(ws);
+      this.cleanup(ws);
     } catch(e) {}
   }
   
@@ -1295,7 +1241,6 @@ export class ChatServer {
       this._mainInterval = null;
     }
     
-    // ✅ BERSIHKAN LOCK
     this._joinLocks.clear();
     this._kursiLocks.clear();
     
@@ -1315,7 +1260,7 @@ export class ChatServer {
         } catch(e) {}
       }
       try {
-        await this.cleanup(ws);
+        this.cleanup(ws);
       } catch(e) {}
     }
     

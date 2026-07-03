@@ -1,4 +1,4 @@
-// ==================== GAME SERVER - WALL TIME 0 ====================
+// ==================== GAME SERVER - DENGAN HIBERNASI ====================
 
 const CONSTANTS = {
   MAX_LOWCARD_GAMES: 10,
@@ -40,35 +40,32 @@ export class GameServer {
     
     this._cleanupTimers = new Map();
     
-    this._mainInterval = setInterval(() => {
+    // ✅ RATE LIMIT BROADCAST (TETAP UNTUK HEMAT DO)
+    this._roomBroadcastCount = new Map();
+    this._roomBroadcastReset = new Map();
+    
+    // ❌ HAPUS RATE LIMIT GAME ACTION
+    
+    this._cleanupInterval = setInterval(() => {
       if (!this.closing && !this.isDestroyed) {
         try {
-          this._doMainTask();
           this._cleanupStaleGames();
           this._cleanupDeadConnections();
         } catch(e) {}
       }
-    }, 300000);
+    }, 1800000);
     
     this._lastActivityTime = Date.now();
   }
   
-  _doMainTask() {
-    try {
-      this._lastActivityTime = Date.now();
-      
-      for (const [room, game] of this.activeGames) {
-        if (game && game._isActive && !game._gameEnded) {
-          this._broadcastToRoom(room, ["_keepAlive", Date.now()]);
-        }
-      }
-    } catch(e) {}
-  }
+  // ❌ TIDAK ADA _doMainTask
   
   _cleanupDeadConnections() {
     try {
       const toRemove = [];
       for (const [wsId, ws] of this.wsMap) {
+        // ✅ HANYA HAPUS KONEKSI MATI (BUKAN IDLE)
+        // HIBERNASI SUDAH HANDLE IDLE
         if (!ws || ws.readyState !== 1 || ws._closing) {
           toRemove.push(wsId);
         }
@@ -343,9 +340,25 @@ export class GameServer {
     const wsIds = this.wsClients.get(room);
     if (!wsIds || wsIds.size === 0) return;
     
+    // ✅ RATE LIMIT BROADCAST PER ROOM (TETAP UNTUK HEMAT DO)
+    const now = Date.now();
+    const reset = this._roomBroadcastReset.get(room) || 0;
+    const count = this._roomBroadcastCount.get(room) || 0;
+    
+    if (now > reset) {
+      this._roomBroadcastReset.set(room, now + 1000);
+      this._roomBroadcastCount.set(room, 1);
+    } else {
+      if (count > 50) {
+        return;
+      }
+      this._roomBroadcastCount.set(room, count + 1);
+    }
+    
     const msgStr = JSON.stringify(message);
     const disconnected = new Set();
     
+    // ✅ KIRIM KE SEMUA CLIENT
     for (const wsId of wsIds) {
       const ws = this.wsMap.get(wsId);
       if (ws && ws.readyState === 1) {
@@ -1101,6 +1114,7 @@ export class GameServer {
     }
   }
   
+  // ✅ startGame - TANPA RATE LIMIT
   async startGame(ws, bet, username) {
     try {
       if (this.isDestroyed) {
@@ -1230,6 +1244,7 @@ export class GameServer {
     }
   }
   
+  // ✅ joinGame - TANPA RATE LIMIT
   async joinGame(ws, username) {
     try {
       if (this.isDestroyed) {
@@ -1325,6 +1340,7 @@ export class GameServer {
     }
   }
   
+  // ✅ submitNumber - TANPA RATE LIMIT
   async submitNumber(ws, number, tanda, username) {
     try {
       if (this.isDestroyed) {
@@ -1574,8 +1590,10 @@ export class GameServer {
         
         server._timeoutId = timeoutId;
         
+        // ✅ HIBERNASI: WebSocket bisa tidur saat tidak aktif
+        // DO tidak aktif saat WS diam → Wall Time TIDAK BERJALAN!
         try { 
-          this.state.acceptWebSocket(server); 
+          this.state.acceptWebSocket(server);
         } catch(e) { 
           clearTimeout(timeoutId);
           return new Response("WebSocket acceptance failed", { status: 500 }); 
@@ -1647,6 +1665,8 @@ export class GameServer {
   }
   
   async webSocketMessage(ws, msg) {
+    // ✅ DO AKTIF OTOMATIS SAAT ADA PESAN
+    // Setelah selesai, DO hibernasi lagi
     try {
       if (!ws || ws._closing || this.closing || this.isDestroyed) return;
       if (!ws._wsId) return;
@@ -1721,9 +1741,9 @@ export class GameServer {
       this.closing = true;
       this.isDestroyed = true;
       
-      if (this._mainInterval) {
-        clearInterval(this._mainInterval);
-        this._mainInterval = null;
+      if (this._cleanupInterval) {
+        clearInterval(this._cleanupInterval);
+        this._cleanupInterval = null;
       }
       
       for (const [room, game] of this.activeGames) {
@@ -1754,6 +1774,8 @@ export class GameServer {
       this.connectionLocks.clear();
       this._gameLocks.clear();
       this._joinLocks.clear();
+      this._roomBroadcastCount.clear();
+      this._roomBroadcastReset.clear();
       
       for (const [room, game] of this.activeGames) {
         this._deleteGame(room, game);

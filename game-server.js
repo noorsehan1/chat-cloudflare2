@@ -1,4 +1,4 @@
-// ==================== GAME SERVER - DENGAN HIBERNASI ====================
+// ==================== GAME SERVER - FULL CODE ====================
 
 const CONSTANTS = {
   MAX_LOWCARD_GAMES: 10,
@@ -15,6 +15,8 @@ const CONSTANTS = {
   MAX_PLAYERS_PER_GAME: 45,
   GAME_CLEANUP_DELAY_MS: 5000,
   BATCH_SIZE: 20,
+  ALARM_10_DETIK: 10000,
+  CLEANUP_TIK: 90,  // ✅ 90 TIK = 15 MENIT
 };
 
 export class GameServer {
@@ -40,32 +42,41 @@ export class GameServer {
     
     this._cleanupTimers = new Map();
     
-    // ✅ RATE LIMIT BROADCAST (TETAP UNTUK HEMAT DO)
+    // ✅ RATE LIMIT BROADCAST
     this._roomBroadcastCount = new Map();
     this._roomBroadcastReset = new Map();
     
-    // ❌ HAPUS RATE LIMIT GAME ACTION
-    
-    this._cleanupInterval = setInterval(() => {
-      if (!this.closing && !this.isDestroyed) {
-        try {
-          this._cleanupStaleGames();
-          this._cleanupDeadConnections();
-        } catch(e) {}
-      }
-    }, 1800000);
+    // ✅ COUNTER UNTUK CLEANUP 15 MENIT (90 TIK)
+    this._tikCounter = 0;
     
     this._lastActivityTime = Date.now();
+    
+    // ✅ SET ALARM PERTAMA (10 DETIK)
+    this.state.storage.setAlarm(Date.now() + CONSTANTS.ALARM_10_DETIK);
   }
   
-  // ❌ TIDAK ADA _doMainTask
+  // ✅ ALARM 10 DETIK, CLEANUP 15 MENIT (90 TIK)
+  async alarm() {
+    if (this.closing || this.isDestroyed) return;
+    
+    try {
+      this._tikCounter++;
+      
+      if (this._tikCounter >= CONSTANTS.CLEANUP_TIK) {
+        this._cleanupStaleGames();
+        this._cleanupDeadConnections();
+        this._tikCounter = 0;
+      }
+      
+    } catch(e) {}
+    
+    this.state.storage.setAlarm(Date.now() + CONSTANTS.ALARM_10_DETIK);
+  }
   
   _cleanupDeadConnections() {
     try {
       const toRemove = [];
       for (const [wsId, ws] of this.wsMap) {
-        // ✅ HANYA HAPUS KONEKSI MATI (BUKAN IDLE)
-        // HIBERNASI SUDAH HANDLE IDLE
         if (!ws || ws.readyState !== 1 || ws._closing) {
           toRemove.push(wsId);
         }
@@ -191,6 +202,8 @@ export class GameServer {
     this.wsClients.get(room).add(wsId);
     this.clientRooms.set(wsId, room);
     this.wsMap.set(wsId, ws);
+    
+    // ✅ PASTIKAN ws.room DI-SET
     ws.room = room;
     ws.username = username;
     
@@ -243,10 +256,9 @@ export class GameServer {
     }
   }
   
+  // ✅ FIX: PAKAI ws.room LANGSUNG
   _getRoomForWs(ws) {
-    const wsId = this._getWsId(ws);
-    if (!wsId) return null;
-    return this.clientRooms.get(wsId) || null;
+    return ws ? ws.room : null;
   }
   
   _ensureSingleConnection(room, username, newWs, newWsId) {
@@ -287,6 +299,10 @@ export class GameServer {
     }
     
     this._addClient(roomName, ws, username, false);
+    
+    // ✅ PASTIKAN ws.room DI-SET
+    ws.room = roomName;
+    ws.roomname = roomName;
     ws.username = username;
     
     if (username) {
@@ -334,13 +350,13 @@ export class GameServer {
     }
   }
   
+  // ✅ BROADCAST DENGAN BATCH (10 CLIENT PER BATCH)
   _broadcastToRoom(room, message) {
     if (this.closing || this.isDestroyed || !room || !message) return;
     
     const wsIds = this.wsClients.get(room);
     if (!wsIds || wsIds.size === 0) return;
     
-    // ✅ RATE LIMIT BROADCAST PER ROOM (TETAP UNTUK HEMAT DO)
     const now = Date.now();
     const reset = this._roomBroadcastReset.get(room) || 0;
     const count = this._roomBroadcastCount.get(room) || 0;
@@ -358,17 +374,23 @@ export class GameServer {
     const msgStr = JSON.stringify(message);
     const disconnected = new Set();
     
-    // ✅ KIRIM KE SEMUA CLIENT
-    for (const wsId of wsIds) {
-      const ws = this.wsMap.get(wsId);
-      if (ws && ws.readyState === 1) {
-        try {
-          ws.send(msgStr);
-        } catch(e) {
+    const wsIdArray = Array.from(wsIds);
+    const BATCH_SIZE = 10;
+    
+    for (let i = 0; i < wsIdArray.length; i += BATCH_SIZE) {
+      const batch = wsIdArray.slice(i, i + BATCH_SIZE);
+      
+      for (const wsId of batch) {
+        const ws = this.wsMap.get(wsId);
+        if (ws && ws.readyState === 1) {
+          try {
+            ws.send(msgStr);
+          } catch(e) {
+            disconnected.add(wsId);
+          }
+        } else {
           disconnected.add(wsId);
         }
-      } else {
-        disconnected.add(wsId);
       }
     }
     
@@ -1092,10 +1114,7 @@ export class GameServer {
       let room = roomname;
       
       if (!room) {
-        const wsId = this._getWsId(ws);
-        if (wsId && this.clientRooms.has(wsId)) {
-          room = this.clientRooms.get(wsId);
-        }
+        room = ws.room;  // ✅ PAKAI ws.room LANGSUNG
       }
       
       if (!room) {
@@ -1114,7 +1133,7 @@ export class GameServer {
     }
   }
   
-  // ✅ startGame - TANPA RATE LIMIT
+  // ✅ FIX: startGame - PAKAI ws.room LANGSUNG
   async startGame(ws, bet, username) {
     try {
       if (this.isDestroyed) {
@@ -1129,15 +1148,22 @@ export class GameServer {
       
       const usernameClean = username.trim();
       
-      const existingGames = this._findAllGamesByUsername(usernameClean);
-      if (existingGames.length > 0) {
-        this._safeSend(ws, ["gameLowCardInfo", `You are currently playing`]);
-      }
-      
-      const room = this._getRoomForWs(ws);
+      // ✅ PAKAI ws.room LANGSUNG
+      const room = ws.room;
       if (!room) {
         this._safeSend(ws, ["gameLowCardError", "Please switch to a room first!"]);
         return;
+      }
+      
+      // ✅ CEK APAKAH ROOM VALID?
+      if (!this.wsClients.has(room)) {
+        this._safeSend(ws, ["gameLowCardError", "Invalid room, please switch room"]);
+        return;
+      }
+      
+      const existingGames = this._findAllGamesByUsername(usernameClean);
+      if (existingGames.length > 0) {
+        this._safeSend(ws, ["gameLowCardInfo", `You are currently playing`]);
       }
       
       const existingRoomGame = this.activeGames.get(room);
@@ -1244,7 +1270,7 @@ export class GameServer {
     }
   }
   
-  // ✅ joinGame - TANPA RATE LIMIT
+  // ✅ FIX: joinGame - PAKAI ws.room LANGSUNG
   async joinGame(ws, username) {
     try {
       if (this.isDestroyed) {
@@ -1260,7 +1286,8 @@ export class GameServer {
       const usernameClean = username.trim();
       const wsId = this._getWsId(ws);
       
-      const room = this._getRoomForWs(ws);
+      // ✅ PAKAI ws.room LANGSUNG
+      const room = ws.room;
       if (!room) {
         this._safeSend(ws, ["gameLowCardError", "Please switch to a room first!"]);
         return;
@@ -1340,7 +1367,7 @@ export class GameServer {
     }
   }
   
-  // ✅ submitNumber - TANPA RATE LIMIT
+  // ✅ FIX: submitNumber - PAKAI ws.room LANGSUNG
   async submitNumber(ws, number, tanda, username) {
     try {
       if (this.isDestroyed) {
@@ -1356,7 +1383,8 @@ export class GameServer {
       const usernameClean = username.trim();
       const wsId = this._getWsId(ws);
       
-      const room = this._getRoomForWs(ws);
+      // ✅ PAKAI ws.room LANGSUNG
+      const room = ws.room;
       if (!room) {
         this._safeSend(ws, ["gameLowCardError", "Please switch to a room first!"]);
         return;
@@ -1430,6 +1458,7 @@ export class GameServer {
     }
   }
   
+  // ✅ FIX: leaveGame - PAKAI ws.room LANGSUNG
   async leaveGame(ws, username) {
     try {
       if (this.isDestroyed) {
@@ -1443,7 +1472,9 @@ export class GameServer {
       }
       
       const usernameClean = username.trim();
-      const room = this._getRoomForWs(ws);
+      
+      // ✅ PAKAI ws.room LANGSUNG
+      const room = ws.room;
       if (!room) {
         this._safeSend(ws, ["gameLowCardError", "Please switch to a room first!"]);
         return;
@@ -1525,7 +1556,8 @@ export class GameServer {
         return;
       }
       
-      const room = this._getRoomForWs(ws);
+      // ✅ PAKAI ws.room LANGSUNG
+      const room = ws.room;
       if (!room) {
         this._safeSend(ws, ["gameLowCardError", "Please switch to a room first!"]);
         return;
@@ -1590,8 +1622,6 @@ export class GameServer {
         
         server._timeoutId = timeoutId;
         
-        // ✅ HIBERNASI: WebSocket bisa tidur saat tidak aktif
-        // DO tidak aktif saat WS diam → Wall Time TIDAK BERJALAN!
         try { 
           this.state.acceptWebSocket(server);
         } catch(e) { 
@@ -1665,8 +1695,6 @@ export class GameServer {
   }
   
   async webSocketMessage(ws, msg) {
-    // ✅ DO AKTIF OTOMATIS SAAT ADA PESAN
-    // Setelah selesai, DO hibernasi lagi
     try {
       if (!ws || ws._closing || this.closing || this.isDestroyed) return;
       if (!ws._wsId) return;
@@ -1740,11 +1768,6 @@ export class GameServer {
       if (this.isDestroyed) return;
       this.closing = true;
       this.isDestroyed = true;
-      
-      if (this._cleanupInterval) {
-        clearInterval(this._cleanupInterval);
-        this._cleanupInterval = null;
-      }
       
       for (const [room, game] of this.activeGames) {
         this._cleanupGame(game);

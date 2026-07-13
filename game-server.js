@@ -33,7 +33,7 @@ export class GameServer {
     this._maxGames = CONSTANTS.MAX_LOWCARD_GAMES;
     this._gameLocks = new Map();
     this._joinLocks = new Map();
-    this._switchLocks = new Map(); // ✅ TAMBAHKAN UNTUK SWITCH LOCK
+    this._switchLocks = new Map();
     
     this._wsIdCounter = 0;
     this.wsClients = new Map();
@@ -71,7 +71,7 @@ export class GameServer {
         this._cleanupStaleGames();
         this._cleanupDeadConnections();
         this._cleanupStaleBroadcastCounters();
-        this._cleanupStaleSwitchLocks(); // ✅ TAMBAHKAN
+        this._cleanupStaleSwitchLocks();
         this._tikCounter = 0;
       }
       
@@ -158,7 +158,7 @@ export class GameServer {
     } catch(e) {}
   }
   
-  _cleanupStaleSwitchLocks() { // ✅ TAMBAHKAN
+  _cleanupStaleSwitchLocks() {
     try {
       const now = Date.now();
       for (const [key, time] of this._switchLocks) {
@@ -210,11 +210,11 @@ export class GameServer {
     return ws.room || ws.roomname || null;
   }
   
-  _ensureRoomConsistency(ws) { // ✅ TAMBAHKAN
+  _ensureRoomConsistency(ws) {
     const wsId = this._getWsId(ws);
     if (!wsId) return null;
     
-    const room = this._getRoomForWs(ws);
+    let room = this._getRoomForWs(ws); // ✅ PAKAI LET
     if (!room) return null;
     
     const clientRoom = this.clientRooms.get(wsId);
@@ -420,7 +420,6 @@ export class GameServer {
       return;
     }
     
-    // ✅ LOCK UNTUK CEGAH RACE CONDITION
     const lockKey = `switch_${wsId}`;
     if (this._switchLocks.has(lockKey)) {
       this._safeSend(ws, ["switchRoomBusy", "Please wait..."]);
@@ -431,22 +430,18 @@ export class GameServer {
     try {
       const oldRoom = this.clientRooms.get(wsId);
       
-      // JIKA SUDAH DI ROOM YANG SAMA, LANGSUNG SUKSES
       if (oldRoom === roomName) {
         this._safeSend(ws, ["switchRoomSuccess", roomName]);
         this._sendGameStatusToWs(ws, roomName);
         return;
       }
       
-      // HAPUS DARI ROOM LAMA
       if (oldRoom) {
         this._removeClientFromRoom(oldRoom, wsId);
       }
       
-      // TAMBAHKAN KE ROOM BARU
       this._addClient(roomName, ws, username, false);
       
-      // SIMPAN DI BANYAK TEMPAT
       ws.room = roomName;
       ws.roomname = roomName;
       ws.username = username;
@@ -463,7 +458,6 @@ export class GameServer {
       this._sendGameStatusToWs(ws, roomName);
       
     } finally {
-      // ✅ UNLOCK
       this._switchLocks.delete(lockKey);
     }
   }
@@ -1374,7 +1368,7 @@ export class GameServer {
       }
       
       const usernameClean = username.trim();
-      const room = this._ensureRoomConsistency(ws); // ✅ PAKAI YANG SUDAH DI-FIX
+      const room = this._ensureRoomConsistency(ws);
       
       if (!room) {
         this._safeSend(ws, ["gameLowCardError", "Please switch to a room first!"]);
@@ -1511,7 +1505,7 @@ export class GameServer {
       
       const usernameClean = username.trim();
       const wsId = this._getWsId(ws);
-      const room = this._ensureRoomConsistency(ws); // ✅ PAKAI YANG SUDAH DI-FIX
+      const room = this._ensureRoomConsistency(ws);
       
       if (!room) {
         this._safeSend(ws, ["gameLowCardError", "Please switch to a room first!"]);
@@ -1606,7 +1600,7 @@ export class GameServer {
       
       const usernameClean = username.trim();
       const wsId = this._getWsId(ws);
-      const room = this._ensureRoomConsistency(ws); // ✅ PAKAI YANG SUDAH DI-FIX
+      const room = this._ensureRoomConsistency(ws);
       
       if (!room) {
         this._safeSend(ws, ["gameLowCardError", "Please switch to a room first!"]);
@@ -1694,7 +1688,7 @@ export class GameServer {
       }
       
       const usernameClean = username.trim();
-      const room = this._ensureRoomConsistency(ws); // ✅ PAKAI YANG SUDAH DI-FIX
+      const room = this._ensureRoomConsistency(ws);
       
       if (!room) {
         this._safeSend(ws, ["gameLowCardError", "Please switch to a room first!"]);
@@ -1742,7 +1736,7 @@ export class GameServer {
       let room = roomname;
       
       if (!room) {
-        room = this._ensureRoomConsistency(ws); // ✅ PAKAI YANG SUDAH DI-FIX
+        room = this._ensureRoomConsistency(ws);
       }
       
       if (!room) {
@@ -1802,23 +1796,19 @@ export class GameServer {
       
       const evt = data[0];
       
-      // SWITCH ROOM - TIDAK PERLU VALIDASI ROOM
       if (evt === "switchRoom") {
         const [_, room, username] = data;
         await this.switchRoom(ws, room, username);
         return;
       }
       
-      // ✅ AMBIL ROOM DENGAN ENSURANCE CONSISTENCY
       const room = this._ensureRoomConsistency(ws);
       
-      // Jika tidak ada room, beri tahu untuk switch dulu
       if (!room) {
         this._safeSend(ws, ["gameLowCardError", "Please switch to a room first!"]);
         return;
       }
       
-      // Handle events
       switch (evt) {
         case "gameLowCardStart":
           await this.startGame(ws, data[1], data[2]);
@@ -2060,7 +2050,7 @@ export class GameServer {
       this.connectionLocks.clear();
       this._gameLocks.clear();
       this._joinLocks.clear();
-      this._switchLocks.clear(); // ✅ BERSIHKAN SWITCH LOCKS
+      this._switchLocks.clear();
       this._roomBroadcastCount.clear();
       this._roomBroadcastReset.clear();
       

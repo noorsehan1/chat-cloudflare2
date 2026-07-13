@@ -205,6 +205,12 @@ export class GameServer {
     return ws ? ws._wsId : null;
   }
   
+  _getRoomForWs(ws) {
+    if (!ws) return null;
+    // AMBIL DARI BEBERAPA SUMBER UNTUK REDUNDANCY
+    return ws.room || ws.roomname || null;
+  }
+  
   _lockUserConnection(username) {
     if (this.connectionLocks.has(username)) {
       return false;
@@ -282,6 +288,7 @@ export class GameServer {
       }
     }
     
+    // HAPUS DARI ROOM LAMA JIKA ADA
     if (this.clientRooms.has(wsId)) {
       const oldRoom = this.clientRooms.get(wsId);
       if (oldRoom !== room) {
@@ -301,7 +308,9 @@ export class GameServer {
     this.clientRooms.set(wsId, room);
     this.wsMap.set(wsId, ws);
     
+    // SIMPAN DI WS UNTUK REDUNDANCY
     ws.room = room;
+    ws.roomname = room;
     ws.username = username;
     
     if (username) {
@@ -346,15 +355,13 @@ export class GameServer {
       }
     }
     
+    // HAPUS SEMUA REFERENSI ROOM
     if (ws) {
       ws.room = null;
+      ws.roomname = null;
       ws._wsId = null;
       ws.username = null;
     }
-  }
-  
-  _getRoomForWs(ws) {
-    return ws ? ws.room : null;
   }
   
   _ensureSingleConnection(room, username, newWs, newWsId) {
@@ -384,20 +391,29 @@ export class GameServer {
     const roomName = room.trim();
     const wsId = this._getWsId(ws);
     
+    if (!wsId) {
+      this._safeSend(ws, ["gameLowCardError", "Connection error"]);
+      return;
+    }
+    
     const oldRoom = this.clientRooms.get(wsId);
     
+    // JIKA SUDAH DI ROOM YANG SAMA, LANGSUNG SUKSES
     if (oldRoom === roomName) {
       this._safeSend(ws, ["switchRoomSuccess", roomName]);
       this._sendGameStatusToWs(ws, roomName);
       return;
     }
     
+    // HAPUS DARI ROOM LAMA
     if (oldRoom) {
       this._removeClientFromRoom(oldRoom, wsId);
     }
     
+    // TAMBAHKAN KE ROOM BARU
     this._addClient(roomName, ws, username, false);
     
+    // SIMPAN DI BANYAK TEMPAT UNTUK REDUNDANCY
     ws.room = roomName;
     ws.roomname = roomName;
     ws.username = username;
@@ -575,7 +591,6 @@ export class GameServer {
   _safeGetGame(room) {
     if (this.isDestroyed || !room) return null;
     const game = this.activeGames.get(room);
-    // HAPUS pengecekan players.size > 0
     if (game && game._isActive === true && !game._gameEnded && game.players) {
       return game;
     }
@@ -784,7 +799,7 @@ export class GameServer {
   
   _addBots(room, count) {
     try {
-      const game = this.activeGames.get(room); // Langsung ambil
+      const game = this.activeGames.get(room);
       if (!this._isGameActuallyRunning(game)) return;
       
       const botNames = ["moz1", "moz2", "moz3", "moz4"];
@@ -1021,7 +1036,7 @@ export class GameServer {
       game._phase = 'draw';
       game.drawTimeExpired = false;
       game.evaluationLocked = false;
-      game._drawPhaseStart = Date.now(); // ✅ TAMBAHKAN TIMESTAMP
+      game._drawPhaseStart = Date.now();
       
       if (!game._botTimeouts) game._botTimeouts = new Set();
       
@@ -1344,7 +1359,7 @@ export class GameServer {
       }
       
       const usernameClean = username.trim();
-      const room = ws.room;
+      const room = this._getRoomForWs(ws);
       
       if (!room) {
         this._safeSend(ws, ["gameLowCardError", "Please switch to a room first!"]);
@@ -1481,7 +1496,7 @@ export class GameServer {
       
       const usernameClean = username.trim();
       const wsId = this._getWsId(ws);
-      const room = ws.room;
+      const room = this._getRoomForWs(ws);
       
       if (!room) {
         this._safeSend(ws, ["gameLowCardError", "Please switch to a room first!"]);
@@ -1576,7 +1591,7 @@ export class GameServer {
       
       const usernameClean = username.trim();
       const wsId = this._getWsId(ws);
-      const room = ws.room;
+      const room = this._getRoomForWs(ws);
       
       if (!room) {
         this._safeSend(ws, ["gameLowCardError", "Please switch to a room first!"]);
@@ -1664,7 +1679,7 @@ export class GameServer {
       }
       
       const usernameClean = username.trim();
-      const room = ws.room;
+      const room = this._getRoomForWs(ws);
       
       if (!room) {
         this._safeSend(ws, ["gameLowCardError", "Please switch to a room first!"]);
@@ -1712,7 +1727,7 @@ export class GameServer {
       let room = roomname;
       
       if (!room) {
-        room = ws.room;
+        room = this._getRoomForWs(ws);
       }
       
       if (!room) {
@@ -1772,20 +1787,27 @@ export class GameServer {
       
       const evt = data[0];
       
+      // SWITCH ROOM - TIDAK PERLU VALIDASI ROOM
       if (evt === "switchRoom") {
         const [_, room, username] = data;
         await this.switchRoom(ws, room, username);
         return;
       }
       
-      const room = ws.room;
+      // AMBIL ROOM DENGAN AMAN
+      let room = this._getRoomForWs(ws);
+      
+      // Jika tidak ada room, beri tahu untuk switch dulu
       if (!room) {
         this._safeSend(ws, ["gameLowCardError", "Please switch to a room first!"]);
         return;
       }
       
+      // PASTIKAN room tersimpan di ws
       if (ws.room !== room) ws.room = room;
+      if (ws.roomname !== room) ws.roomname = room;
       
+      // Handle events
       switch (evt) {
         case "gameLowCardStart":
           await this.startGame(ws, data[1], data[2]);
@@ -1856,6 +1878,7 @@ export class GameServer {
         server._wsId = wsId;
         server._closing = false;
         server.room = null;
+        server.roomname = null;
         server._createdAt = Date.now();
         server.username = null;
         
@@ -1871,12 +1894,12 @@ export class GameServer {
         
         server.addEventListener("close", () => {
           try {
-            if (server.room) {
-              const room = server.room;
+            if (server.room || server.roomname) {
+              const room = server.room || server.roomname;
               const wsId = this._getWsId(server);
               const username = server.username;
               
-              this._removeClient(server.room, server);
+              this._removeClient(room, server);
               
               if (username) {
                 const conn = this.userConnections.get(username);
@@ -1890,12 +1913,12 @@ export class GameServer {
         
         server.addEventListener("error", () => {
           try {
-            if (server.room) {
-              const room = server.room;
+            if (server.room || server.roomname) {
+              const room = server.room || server.roomname;
               const wsId = this._getWsId(server);
               const username = server.username;
               
-              this._removeClient(server.room, server);
+              this._removeClient(room, server);
               
               if (username) {
                 const conn = this.userConnections.get(username);
@@ -1936,10 +1959,13 @@ export class GameServer {
       const wsId = this._getWsId(ws);
       const username = ws.username;
       
-      if (ws.room) {
-        this._removeClient(ws.room, ws);
+      // HAPUS DARI ROOM
+      if (ws.room || ws.roomname) {
+        const room = ws.room || ws.roomname;
+        this._removeClient(room, ws);
       }
       
+      // HAPUS DARI USER CONNECTIONS
       if (username) {
         const conn = this.userConnections.get(username);
         if (conn && conn.wsId === wsId) {
@@ -1947,12 +1973,15 @@ export class GameServer {
         }
       }
       
+      // BERSIHKAN MAPS
       if (wsId) {
         this.clientRooms.delete(wsId);
         this.wsMap.delete(wsId);
       }
       
+      // HAPUS SEMUA REFERENSI
       ws.room = null;
+      ws.roomname = null;
       ws._wsId = null;
       ws.username = null;
     } catch(e) {}
@@ -1964,8 +1993,9 @@ export class GameServer {
       const wsId = this._getWsId(ws);
       const username = ws.username;
       
-      if (ws.room) {
-        this._removeClient(ws.room, ws);
+      if (ws.room || ws.roomname) {
+        const room = ws.room || ws.roomname;
+        this._removeClient(room, ws);
       }
       
       if (username) {
@@ -1981,6 +2011,7 @@ export class GameServer {
       }
       
       ws.room = null;
+      ws.roomname = null;
       ws._wsId = null;
       ws.username = null;
     } catch(e) {}

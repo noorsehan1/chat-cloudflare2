@@ -1,4 +1,4 @@
-// ==================== GAME SERVER - FULL CODE (FINAL - 100% AMAN) ====================
+// ==================== GAME SERVER - FULL CODE (TANPA DOUBLE START) ====================
 
 const CONSTANTS = {
   MAX_LOWCARD_GAMES: 10,
@@ -52,6 +52,9 @@ export class GameServer {
     this._tikCounter = 0;
     this._lastActivityTime = Date.now();
     
+    // ✅ FLAG UNTUK MENCEGAH DOUBLE START
+    this._gameStartFlags = new Map();
+    
     this.state.storage.setAlarm(Date.now() + CONSTANTS.ALARM_10_DETIK);
   }
   
@@ -77,7 +80,9 @@ export class GameServer {
       
     } catch(e) {}
     
-    this.state.storage.setAlarm(Date.now() + CONSTANTS.ALARM_10_DETIK);
+    try {
+      this.state.storage.setAlarm(Date.now() + CONSTANTS.ALARM_10_DETIK);
+    } catch(e) {}
   }
   
   _checkStuckGames() {
@@ -88,7 +93,6 @@ export class GameServer {
         
         if (game._phase === 'draw' && game._drawPhaseStart) {
           if ((now - game._drawPhaseStart) > CONSTANTS.STUCK_DRAW_TIMEOUT_MS) {
-            console.log(`[STUCK] Game ${room} stuck in draw phase, forcing evaluation`);
             this._broadcastToRoom(room, ["gameLowCardError", "Game stuck, forcing evaluation..."]);
             this._closeDrawPhase(room, game);
           }
@@ -96,7 +100,6 @@ export class GameServer {
         
         if (game._phase === 'registration' && game.registrationOpen) {
           if (game._createdAt && (now - game._createdAt) > CONSTANTS.STUCK_REGISTRATION_TIMEOUT_MS) {
-            console.log(`[STUCK] Game ${room} stuck in registration, forcing close`);
             this._broadcastToRoom(room, ["gameLowCardError", "Registration timeout"]);
             this._closeRegistration(room, game);
           }
@@ -105,7 +108,6 @@ export class GameServer {
         if (game._phase !== 'registration' && !game.registrationOpen) {
           const activePlayers = this._getActivePlayers(game);
           if (activePlayers.length === 0 && !game._gameEnded) {
-            console.log(`[STUCK] Game ${room} has no active players, ending`);
             game._gameEnded = true;
             game._isActive = false;
             game._endTime = Date.now();
@@ -128,7 +130,6 @@ export class GameServer {
         if (game._gameEnded === true) {
           const endTime = game._endTime || game._createdAt || now;
           if ((now - endTime) > CONSTANTS.STALE_GAME_TIMEOUT_MS) {
-            console.log(`[CLEANUP] Removing stale game: ${room}`);
             this._scheduleGameCleanup(room, game);
           }
           continue;
@@ -136,7 +137,6 @@ export class GameServer {
         
         if (game._isActive === false && !game._gameEnded) {
           if (game._createdAt && (now - game._createdAt) > 300000) {
-            console.log(`[CLEANUP] Removing orphaned game: ${room}`);
             game._gameEnded = true;
             game._endTime = now;
             this._scheduleGameCleanup(room, game);
@@ -214,19 +214,17 @@ export class GameServer {
     const wsId = this._getWsId(ws);
     if (!wsId) return null;
     
-    let room = this._getRoomForWs(ws); // ✅ PAKAI LET
+    let room = this._getRoomForWs(ws);
     if (!room) return null;
     
     const clientRoom = this.clientRooms.get(wsId);
     
-    // FIX INCONSISTENCY
     if (clientRoom && clientRoom !== room) {
       room = clientRoom;
       ws.room = room;
       ws.roomname = room;
     }
     
-    // PASTIKAN ADA DI wsClients
     if (!this.wsClients.has(room)) {
       this.wsClients.set(room, new Set());
     }
@@ -712,6 +710,7 @@ export class GameServer {
     this.activeGames.delete(room);
     this._gameLocks.delete(room);
     this._joinLocks.delete(room);
+    this._gameStartFlags.delete(room);
     
     this._broadcastToRoom(room, ["gameLowCardEnd", []]);
   }
@@ -826,8 +825,10 @@ export class GameServer {
       
       const maxBotsToAdd = Math.min(count, CONSTANTS.MAX_BOTS_PER_GAME - existingBotCount);
       
+      if (maxBotsToAdd <= 0) return;
+      
       for (let i = 0; i < maxBotsToAdd; i++) {
-        const botId = `BOT_${room}_${i}_${Date.now()}`;
+        const botId = `BOT_${room}_${i}_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
         const botName = botNames[(existingBotCount + i) % botNames.length];
         
         if (!game.players.has(botId)) {
@@ -969,21 +970,24 @@ export class GameServer {
         game._registrationTimer = null;
       }
       
+      // ✅ HITUNG ULANG HUMAN PLAYERS
       const humanPlayers = Array.from(game.players.keys()).filter(id => !id.startsWith('BOT_'));
       const humanCount = humanPlayers.length;
       
-      if (humanCount === 1 && !game._botsAdded) {
-        this._addBots(room, 4);
-      }
-      
-      if (humanCount === 0) {
-        this._addBots(room, 4);
-      }
-      
-      if (game.players.size < 2) {
-        const needed = Math.min(4 - game.players.size, CONSTANTS.MAX_BOTS_PER_GAME);
-        if (needed > 0) {
-          this._addBots(room, needed);
+      // ✅ TAMBAH BOT HANYA JIKA BELUM PERNAH DITAMBAH
+      if (!game._botsAdded) {
+        if (humanCount === 1) {
+          this._addBots(room, 4);
+          game._botsAdded = true;
+        } else if (humanCount === 0) {
+          this._addBots(room, 4);
+          game._botsAdded = true;
+        } else if (game.players.size < 2) {
+          const needed = Math.min(4 - game.players.size, CONSTANTS.MAX_BOTS_PER_GAME);
+          if (needed > 0) {
+            this._addBots(room, needed);
+            game._botsAdded = true;
+          }
         }
       }
       
@@ -1022,10 +1026,14 @@ export class GameServer {
       
       const activePlayers = this._getActivePlayers(game);
       
+      // ✅ CEK JUMLAH PLAYER, JANGAN TAMBAH BOT LAGI
       if (activePlayers.length < 2) {
-        const needed = Math.min(4 - activePlayers.length, CONSTANTS.MAX_BOTS_PER_GAME);
-        if (needed > 0) {
-          this._addBots(room, needed);
+        if (!game._botsAdded) {
+          const needed = Math.min(4 - activePlayers.length, CONSTANTS.MAX_BOTS_PER_GAME);
+          if (needed > 0) {
+            this._addBots(room, needed);
+            game._botsAdded = true;
+          }
         }
         
         const newActive = this._getActivePlayers(game);
@@ -1375,35 +1383,33 @@ export class GameServer {
         return;
       }
       
-      if (!this.wsClients.has(room)) {
-        this._safeSend(ws, ["gameLowCardError", "Invalid room, please switch room"]);
+      // ✅ CEK DOUBLE START FLAG
+      const startKey = `start_${room}`;
+      if (this._gameStartFlags.has(startKey)) {
+        this._safeSend(ws, ["gameLowCardError", "Game is already starting..."]);
         return;
       }
       
-      const existingGames = this._findAllGamesByUsername(usernameClean);
-      if (existingGames.length > 0) {
-        this._safeSend(ws, ["gameLowCardInfo", `You are currently playing`]);
+      // ✅ CEK GAME SUDAH BERJALAN
+      const existingGame = this.activeGames.get(room);
+      if (existingGame && existingGame._isActive && !existingGame._gameEnded) {
+        this._safeSend(ws, ["gameLowCardInfo", "Game is already running"]);
+        return;
       }
       
-      const existingRoomGame = this.activeGames.get(room);
-      if (existingRoomGame && existingRoomGame._isActive && !existingRoomGame._gameEnded && existingRoomGame.players) {
-        if (existingRoomGame.players.has(usernameClean) && !existingRoomGame.eliminated?.has(usernameClean)) {
-          this._safeSend(ws, ["gameLowCardInfo", `Game already running`]);
-          this._safeSend(ws, ["gameLowCardStartSuccess", existingRoomGame.hostName, existingRoomGame.betAmount]);
-          return;
-        } else if (existingRoomGame.eliminated?.has(usernameClean)) {
-          this._safeSend(ws, ["gameLowCardError", `You are eliminated`]);
-          return;
-        } else {
-          this._safeSend(ws, ["gameLowCardError", `Game already running`]);
-          return;
-        }
+      // ✅ SET FLAG START
+      this._gameStartFlags.set(startKey, Date.now());
+      
+      // ✅ HAPUS GAME LAMA
+      if (existingGame) {
+        await this._forceCleanupGame(room, existingGame);
       }
       
       const now = Date.now();
       const lockTime = this._gameLocks.get(room);
       if (lockTime && (now - lockTime) < CONSTANTS.START_LOCK_DURATION_MS) {
         this._safeSend(ws, ["gameLowCardError", "Game is starting, please wait"]);
+        this._gameStartFlags.delete(startKey);
         return;
       }
       
@@ -1413,23 +1419,21 @@ export class GameServer {
         if (this.activeGames.size >= this._maxGames) {
           this._safeSend(ws, ["gameLowCardError", "Server is busy"]);
           this._gameLocks.delete(room);
+          this._gameStartFlags.delete(startKey);
           return;
-        }
-        
-        if (existingRoomGame) {
-          await this.forceEndGame(room);
-          await new Promise(r => setTimeout(r, 300));
         }
         
         const betAmount = parseInt(bet, 10) || 0;
         if (betAmount < 0 || (betAmount !== 0 && betAmount < 100) || betAmount > CONSTANTS.MAX_BET) {
           this._safeSend(ws, ["gameLowCardError", `Invalid bet (0 or 100-${CONSTANTS.MAX_BET})`]);
           this._gameLocks.delete(room);
+          this._gameStartFlags.delete(startKey);
           return;
         }
         
         const wsId = this._getWsId(ws);
         
+        // ✅ BUAT GAME BARU
         const game = {
           room,
           players: new Map(),
@@ -1473,22 +1477,71 @@ export class GameServer {
         
         this._startRegistration(room, game);
         
+        // ✅ HAPUS FLAG SETELAH SELESAI
         setTimeout(() => {
           try {
+            this._gameStartFlags.delete(startKey);
             if (this._gameLocks.get(room) === now) {
               this._gameLocks.delete(room);
             }
           } catch(e) {}
-        }, CONSTANTS.START_LOCK_DURATION_MS);
+        }, CONSTANTS.START_LOCK_DURATION_MS + 1000);
         
       } catch(e) {
         this._deleteGame(room, this.activeGames.get(room));
         this._safeSend(ws, ["gameLowCardError", "Failed to start game"]);
         this._gameLocks.delete(room);
+        this._gameStartFlags.delete(startKey);
       }
     } catch(e) {
       this._safeSend(ws, ["gameLowCardError", "Failed to start game"]);
     }
+  }
+  
+  // ✅ METHOD UNTUK FORCE CLEANUP
+  async _forceCleanupGame(room, game) {
+    if (!game) return;
+    
+    try {
+      // HENTIKAN SEMUA TIMER
+      const timers = ['_registrationTimer', '_drawTimer', '_evalTimer', '_safetyTimer'];
+      for (const key of timers) {
+        if (game[key]) {
+          clearTimeout(game[key]);
+          clearInterval(game[key]);
+          game[key] = null;
+        }
+      }
+      
+      if (game._botTimeouts) {
+        for (const id of game._botTimeouts) {
+          clearTimeout(id);
+        }
+        game._botTimeouts.clear();
+      }
+      
+      // TANDAI GAME END
+      game._gameEnded = true;
+      game._isActive = false;
+      game._endTime = Date.now();
+      
+      // BROADCAST END
+      this._broadcastToRoom(room, ["gameLowCardEnd", []]);
+      
+      // HAPUS DARI ACTIVE GAMES
+      this.activeGames.delete(room);
+      
+      // CLEANUP TIMER
+      if (this._cleanupTimers.has(room)) {
+        clearTimeout(this._cleanupTimers.get(room));
+        this._cleanupTimers.delete(room);
+      }
+      
+      this._gameLocks.delete(room);
+      this._joinLocks.delete(room);
+      this._gameStartFlags.delete(`start_${room}`);
+      
+    } catch(e) {}
   }
   
   async joinGame(ws, username) {
@@ -1520,11 +1573,6 @@ export class GameServer {
       this._joinLocks.set(lockKey, Date.now());
       
       try {
-        const existingGames = this._findAllGamesByUsername(usernameClean);
-        if (existingGames.length > 0) {
-          this._safeSend(ws, ["gameLowCardInfo", `You are currently playing`]);
-        }
-        
         const game = this.activeGames.get(room);
         
         if (!game || !game._isActive || game._gameEnded || !game.players) {
@@ -1717,11 +1765,7 @@ export class GameServer {
     try {
       const game = this.activeGames.get(room);
       if (game) {
-        const players = Array.from(game.players?.values() || []).map(p => p.name);
-        if (players.length > 0) {
-          this._broadcastToRoom(room, ["gameLowCardEnd", players]);
-        }
-        this._deleteGame(room, game);
+        await this._forceCleanupGame(room, game);
       }
     } catch(e) {}
   }
@@ -2051,6 +2095,7 @@ export class GameServer {
       this._gameLocks.clear();
       this._joinLocks.clear();
       this._switchLocks.clear();
+      this._gameStartFlags.clear();
       this._roomBroadcastCount.clear();
       this._roomBroadcastReset.clear();
       

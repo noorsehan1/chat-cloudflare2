@@ -22,10 +22,11 @@ export default {
           }
           isInitialized = true;
         } catch(e) {
-          // Gagal init, akan dicoba lagi nanti
+          // Silent
         }
       }
       
+      // ✅ CHAT ROUTES
       if (pathname === "/ws" || pathname === "/chat" || pathname === "/") {
         if (!chatServer || chatServer.isDestroyed) {
           chatServer = new ChatServer(env);
@@ -33,6 +34,7 @@ export default {
         return chatServer.fetch(request);
       }
       
+      // ✅ GAME ROUTES
       if (pathname === "/game/ws" || pathname === "/game") {
         if (!gameServer || gameServer.isDestroyed) {
           gameServer = new GameServer(env);
@@ -43,6 +45,7 @@ export default {
         return gameServer.fetch(request);
       }
       
+      // ✅ HEALTH CHECK
       if (pathname === "/health") {
         return new Response(JSON.stringify({
           status: "ok",
@@ -88,7 +91,6 @@ export default {
       try { await gameServer.destroy(); } catch(e) {}
     }
     gameServer = null;
-    
     isInitialized = false;
   }
 };

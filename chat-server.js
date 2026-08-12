@@ -139,7 +139,6 @@ class RoomManager {
 }
 
 export class ChatServer {
-  // ✅ TANPA PARAMETER state
   constructor(env) {
     this.env = env;
     this.closing = false;
@@ -173,12 +172,9 @@ export class ChatServer {
     }
     
     this._setupPeriodicCleanup();
-    
-    // ✅ PAKAI setInterval BUKAN alarm
     this._startNumberUpdater();
   }
   
-  // ✅ PENGGANTI ALARM
   _startNumberUpdater() {
     if (this._numberInterval) {
       clearInterval(this._numberInterval);
@@ -293,9 +289,6 @@ export class ChatServer {
       }
     } catch(e) {}
   }
-  
-  // ❌ HAPUS METHOD alarm()
-  // async alarm() { ... }
   
   _doCleanup() {
     if (this._cleanupInProgress || this.closing || this.isDestroyed) return;
@@ -1370,6 +1363,7 @@ export class ChatServer {
     return true;
   }
   
+  // ==================== ✅ FIXED FETCH METHOD ====================
   async fetch(req) {
     if (this.closing || this.isDestroyed) {
       return new Response("Shutting down", { status: 503 });
@@ -1389,30 +1383,35 @@ export class ChatServer {
       const pair = new WebSocketPair();
       const [client, server] = [pair[0], pair[1]];
       
-      const timeoutId = setTimeout(() => {
-        try {
-          if (server && server.readyState === 0) {
-            server.close(1000, "Timeout");
-          }
-        } catch(e) {}
-      }, 5000);
-      
-      server._timeoutId = timeoutId;
-      this._pendingTimeouts.add(timeoutId);
-      
-      // ✅ HAPUS INI: this.state.acceptWebSocket(server);
-      // Di Worker biasa, WebSocket langsung bisa dipakai
-      
-      server.username = null;
+      // ✅ SETUP WEBSOCKET
+      server._wsId = Date.now() + Math.random();
+      server._closing = false;
       server.room = null;
       server.roomname = null;
+      server.username = null;
       server.idtarget = null;
-      server._closing = false;
-      server._wsId = Date.now() + Math.random();
       
+      // ✅ TAMBAHKAN KE WS SET
       if (!this.wsSet.has(server)) {
         this.wsSet.add(server);
       }
+      
+      // ✅✅✅ EVENT LISTENER - MESSAGE
+      server.addEventListener("message", (event) => {
+        try {
+          this.handleMessage(server, event.data).catch(() => {});
+        } catch(e) {}
+      });
+      
+      // ✅✅✅ EVENT LISTENER - CLOSE
+      server.addEventListener("close", () => {
+        this.webSocketClose(server);
+      });
+      
+      // ✅✅✅ EVENT LISTENER - ERROR
+      server.addEventListener("error", () => {
+        this.webSocketError(server);
+      });
       
       return new Response(null, { status: 101, webSocket: client });
       
@@ -1447,7 +1446,6 @@ export class ChatServer {
     this.closing = true;
     this.isDestroyed = true;
     
-    // ✅ CLEANUP NUMBER UPDATER
     if (this._numberInterval) {
       clearInterval(this._numberInterval);
       this._numberInterval = null;

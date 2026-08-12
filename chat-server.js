@@ -1,4 +1,4 @@
-// ==================== CHAT SERVER - DENGAN D1 DATABASE ====================
+// ==================== CHAT SERVER - FULL CLASS TANPA DURABLE OBJECTS ====================
 
 const C = {
   MAX_SEATS: 45,
@@ -29,7 +29,6 @@ class DatabaseHelper {
 
   async initTables() {
     try {
-      // Tabel rooms
       await this.db.exec(`
         CREATE TABLE IF NOT EXISTS rooms (
           room_name TEXT PRIMARY KEY,
@@ -39,7 +38,6 @@ class DatabaseHelper {
         )
       `);
 
-      // Tabel seats
       await this.db.exec(`
         CREATE TABLE IF NOT EXISTS seats (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -60,7 +58,6 @@ class DatabaseHelper {
         )
       `);
 
-      // Tabel points
       await this.db.exec(`
         CREATE TABLE IF NOT EXISTS points (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -75,7 +72,6 @@ class DatabaseHelper {
         )
       `);
 
-      // Tabel user_connections (untuk tracking multi-device)
       await this.db.exec(`
         CREATE TABLE IF NOT EXISTS user_connections (
           user_id TEXT,
@@ -89,7 +85,6 @@ class DatabaseHelper {
         )
       `);
 
-      // Initialize rooms
       for (const room of ROOMS) {
         await this.db.prepare(`
           INSERT OR IGNORE INTO rooms (room_name, muted, number, last_activity)
@@ -259,15 +254,13 @@ class DatabaseHelper {
       LEFT JOIN seats s ON r.room_name = s.room_name
       WHERE r.last_activity < ? AND s.room_name IS NULL
     `).bind(now - timeout).all();
-
     return results.results || [];
   }
 }
 
-// ==================== CHAT SERVER ====================
+// ==================== CHAT SERVER CLASS ====================
 export class ChatServer {
-  constructor(state, env) {
-    this.state = state;
+  constructor(env) {
     this.env = env;
     this.closing = false;
     this.isDestroyed = false;
@@ -312,9 +305,10 @@ export class ChatServer {
     
     this._setupPeriodicCleanup();
     
-    try {
-      this.state.storage.setAlarm(Date.now() + C.ALARM_10_DETIK);
-    } catch(e) {}
+    // Alarm untuk number update (pakai setInterval)
+    this._alarmInterval = setInterval(() => {
+      this._alarmTick().catch(e => {});
+    }, C.ALARM_10_DETIK);
   }
   
   _setupPeriodicCleanup() {
@@ -335,7 +329,7 @@ export class ChatServer {
     try {
       const inactiveRooms = await this.db.cleanupInactiveRooms();
       for (const room of inactiveRooms) {
-        console.log(`Room ${room.room_name} is inactive`);
+        // Log saja
       }
     } catch(e) {}
   }
@@ -396,7 +390,7 @@ export class ChatServer {
     } catch(e) {}
   }
   
-  async alarm() {
+  async _alarmTick() {
     if (this.closing || this.isDestroyed) return;
     
     try {
@@ -422,10 +416,6 @@ export class ChatServer {
       
       this._doCleanup();
       
-    } catch(e) {}
-    
-    try {
-      this.state.storage.setAlarm(Date.now() + C.ALARM_10_DETIK);
     } catch(e) {}
   }
   
@@ -1366,6 +1356,7 @@ export class ChatServer {
     return true;
   }
   
+  // ==================== FETCH - WEBSOCKET HANDLER ====================
   async fetch(req) {
     if (this.closing || this.isDestroyed) {
       return new Response("Shutting down", { status: 503 });
@@ -1387,6 +1378,9 @@ export class ChatServer {
       const pair = new WebSocketPair();
       const [client, server] = [pair[0], pair[1]];
       
+      // ✅ ACCEPT WEBSOCKET (Tanpa Durable Objects)
+      server.accept();
+      
       const timeoutId = setTimeout(() => {
         try {
           if (server && server.readyState === 0) {
@@ -1398,20 +1392,29 @@ export class ChatServer {
       server._timeoutId = timeoutId;
       this._pendingTimeouts.add(timeoutId);
       
-      try { 
-        this.state.acceptWebSocket(server);
-      } catch(e) { 
-        clearTimeout(timeoutId);
-        this._pendingTimeouts.delete(timeoutId);
-        return new Response("WebSocket acceptance failed", { status: 500 }); 
-      }
-      
       server.username = null;
       server.room = null;
       server.roomname = null;
       server.idtarget = null;
       server._closing = false;
-      server._wsId = Date.now() + Math.random();
+      server._wsId = Date.now() + Math.random() + Math.random().toString(36).substring(2, 6);
+      
+      // ✅ EVENT HANDLERS
+      server.addEventListener("message", async (event) => {
+        try {
+          await this.webSocketMessage(server, event.data);
+        } catch(e) {
+          console.error("Chat WS message error:", e);
+        }
+      });
+      
+      server.addEventListener("close", () => {
+        this.webSocketClose(server);
+      });
+      
+      server.addEventListener("error", () => {
+        this.webSocketError(server);
+      });
       
       if (!this.wsSet.has(server)) {
         this.wsSet.add(server);
@@ -1420,7 +1423,8 @@ export class ChatServer {
       return new Response(null, { status: 101, webSocket: client });
       
     } catch(e) {
-      return new Response("Internal Server Error", { status: 500 });
+      console.error("Chat WebSocket error:", e);
+      return new Response("Internal Server Error: " + e.message, { status: 500 });
     }
   }
   
@@ -1452,6 +1456,10 @@ export class ChatServer {
     
     this._joinLocks.clear();
     this._kursiLocks.clear();
+    
+    if (this._alarmInterval) {
+      clearInterval(this._alarmInterval);
+    }
     
     for (const timeout of this._pendingTimeouts) {
       clearTimeout(timeout);

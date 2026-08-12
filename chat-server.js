@@ -139,9 +139,8 @@ class RoomManager {
 }
 
 export class ChatServer {
-  // ✅ HAPUS PARAMETER "state"
+  // ✅ TANPA PARAMETER state
   constructor(env) {
-    // ✅ HAPUS this.state = state;
     this.env = env;
     this.closing = false;
     this.isDestroyed = false;
@@ -174,12 +173,9 @@ export class ChatServer {
     }
     
     this._setupPeriodicCleanup();
-    
-    // ✅ GANTI: PAKAI setInterval BUKAN alarm
     this._startNumberUpdater();
   }
   
-  // ✅ TAMBAHKAN METHOD INI (PENGGANTI alarm())
   _startNumberUpdater() {
     if (this._numberInterval) {
       clearInterval(this._numberInterval);
@@ -294,9 +290,6 @@ export class ChatServer {
       }
     } catch(e) {}
   }
-  
-  // ❌ HAPUS METHOD alarm()
-  // async alarm() { ... }
   
   _doCleanup() {
     if (this._cleanupInProgress || this.closing || this.isDestroyed) return;
@@ -1371,7 +1364,7 @@ export class ChatServer {
     return true;
   }
   
-  // ✅ FETCH - TANPA DURABLE OBJECTS
+  // ==================== FETCH - SUDAH DENGAN EVENT LISTENER ====================
   async fetch(req) {
     if (this.closing || this.isDestroyed) {
       return new Response("Shutting down", { status: 503 });
@@ -1391,7 +1384,6 @@ export class ChatServer {
       const pair = new WebSocketPair();
       const [client, server] = [pair[0], pair[1]];
       
-      // ✅ SETUP WEBSOCKET
       server._wsId = Date.now() + Math.random();
       server._closing = false;
       server.room = null;
@@ -1403,7 +1395,7 @@ export class ChatServer {
         this.wsSet.add(server);
       }
       
-      // ✅✅✅ TAMBAHKAN EVENT LISTENER
+      // ✅✅✅ EVENT LISTENER
       server.addEventListener("message", (event) => {
         try {
           this.handleMessage(server, event.data).catch(() => {});

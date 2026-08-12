@@ -1,4 +1,4 @@
-// ==================== CHAT SERVER - FULL CLASS TANPA DURABLE OBJECTS ====================
+// ==================== CHAT SERVER - TANPA DURABLE OBJECTS ====================
 
 const C = {
   MAX_SEATS: 45,
@@ -11,6 +11,7 @@ const C = {
   LOCK_TIMEOUT: 10000,
   CLEANUP_INTERVAL: 30000,
   MAX_ROOM_CLIENTS: 500,
+  MAX_CHAT_HISTORY: 100,
 };
 
 const ROOMS = [
@@ -21,240 +22,226 @@ const ROOMS = [
 
 const ROOMS_SET = new Set(ROOMS);
 
-// ==================== DATABASE HELPER ====================
-class DatabaseHelper {
-  constructor(db) {
+// ==================== ROOM MANAGER CLASS ====================
+class RoomManager {
+  constructor(name, db) {
+    this.name = name;
+    this.seats = new Map();
+    this.points = new Map();
+    this.muted = false;
+    this.number = 1;
+    this.lastActivity = Date.now();
     this.db = db;
+    this._loading = false;
+    this._loaded = false;
   }
 
-  async initTables() {
+  async loadState() {
+    if (this._loading || this._loaded) return;
+    this._loading = true;
+    
     try {
-      await this.db.exec(`
-        CREATE TABLE IF NOT EXISTS rooms (
-          room_name TEXT PRIMARY KEY,
-          muted INTEGER DEFAULT 0,
-          number INTEGER DEFAULT 1,
-          last_activity INTEGER DEFAULT 0
-        )
-      `);
-
-      await this.db.exec(`
-        CREATE TABLE IF NOT EXISTS seats (
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          room_name TEXT,
-          seat_number INTEGER,
-          user_id TEXT,
-          noimage_url TEXT,
-          color TEXT,
-          itembawah INTEGER DEFAULT 0,
-          itematas INTEGER DEFAULT 0,
-          vip INTEGER DEFAULT 0,
-          viptanda INTEGER DEFAULT 0,
-          created_at INTEGER DEFAULT 0,
-          updated_at INTEGER DEFAULT 0,
-          FOREIGN KEY (room_name) REFERENCES rooms(room_name),
-          UNIQUE(room_name, seat_number),
-          UNIQUE(room_name, user_id)
-        )
-      `);
-
-      await this.db.exec(`
-        CREATE TABLE IF NOT EXISTS points (
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          room_name TEXT,
-          seat_number INTEGER,
-          x INTEGER DEFAULT 0,
-          y INTEGER DEFAULT 0,
-          fast INTEGER DEFAULT 0,
-          updated_at INTEGER DEFAULT 0,
-          FOREIGN KEY (room_name) REFERENCES rooms(room_name),
-          UNIQUE(room_name, seat_number)
-        )
-      `);
-
-      await this.db.exec(`
-        CREATE TABLE IF NOT EXISTS user_connections (
-          user_id TEXT,
-          connection_id TEXT,
-          room_name TEXT,
-          seat_number INTEGER,
-          is_multi INTEGER DEFAULT 0,
-          connected_at INTEGER DEFAULT 0,
-          last_active INTEGER DEFAULT 0,
-          PRIMARY KEY (user_id, connection_id)
-        )
-      `);
-
-      for (const room of ROOMS) {
-        await this.db.prepare(`
-          INSERT OR IGNORE INTO rooms (room_name, muted, number, last_activity)
-          VALUES (?, 0, 1, ?)
-        `).bind(room, Date.now()).run();
+      if (this.db) {
+        // Load room data dari D1
+        const roomData = await this.db.prepare(
+          'SELECT * FROM chat_rooms WHERE room_name = ?'
+        ).bind(this.name).first();
+        
+        if (roomData) {
+          this.muted = roomData.muted === 1;
+          this.number = roomData.current_number || 1;
+          
+          // Load seats dari D1
+          const seats = await this.db.prepare(
+            'SELECT seat_number, username, noimage_url, color, item_bawah, item_atas, vip, vip_tanda FROM chat_seats WHERE room_name = ?'
+          ).bind(this.name).all();
+          
+          for (const seat of seats.results || []) {
+            this.seats.set(seat.seat_number, {
+              noimageUrl: seat.noimage_url || "",
+              namauser: seat.username || "",
+              color: seat.color || "",
+              itembawah: seat.item_bawah || 0,
+              itematas: seat.item_atas || 0,
+              vip: seat.vip || 0,
+              viptanda: seat.vip_tanda || 0,
+            });
+          }
+        }
       }
-
-    } catch (e) {
-      console.error("Database init error:", e);
+    } catch(e) {
+      // Silently continue
+    } finally {
+      this._loaded = true;
+      this._loading = false;
     }
   }
 
-  async getRoom(roomName) {
-    const result = await this.db.prepare(
-      'SELECT * FROM rooms WHERE room_name = ?'
-    ).bind(roomName).first();
-    return result;
-  }
-
-  async updateRoomActivity(roomName) {
-    await this.db.prepare(`
-      UPDATE rooms SET last_activity = ? WHERE room_name = ?
-    `).bind(Date.now(), roomName).run();
-  }
-
-  async setRoomMuted(roomName, muted) {
-    await this.db.prepare(`
-      UPDATE rooms SET muted = ?, last_activity = ? WHERE room_name = ?
-    `).bind(muted ? 1 : 0, Date.now(), roomName).run();
-  }
-
-  async setRoomNumber(roomName, number) {
-    await this.db.prepare(`
-      UPDATE rooms SET number = ? WHERE room_name = ?
-    `).bind(number, roomName).run();
-  }
-
-  async getSeat(roomName, seatNumber) {
-    const result = await this.db.prepare(`
-      SELECT * FROM seats WHERE room_name = ? AND seat_number = ?
-    `).bind(roomName, seatNumber).first();
-    return result;
-  }
-
-  async getAllSeats(roomName) {
-    const results = await this.db.prepare(`
-      SELECT * FROM seats WHERE room_name = ?
-    `).bind(roomName).all();
-    return results.results || [];
-  }
-
-  async getSeatsCount(roomName) {
-    const result = await this.db.prepare(`
-      SELECT COUNT(*) as count FROM seats WHERE room_name = ?
-    `).bind(roomName).first();
-    return result?.count || 0;
-  }
-
-  async addSeat(roomName, seatNumber, userId, noimageUrl, color, itembawah, itematas, vip, viptanda) {
+  async saveState() {
     try {
-      await this.db.prepare(`
-        INSERT INTO seats (room_name, seat_number, user_id, noimage_url, color, itembawah, itematas, vip, viptanda, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(room_name, seat_number) DO UPDATE SET
-          user_id = excluded.user_id,
-          noimage_url = excluded.noimage_url,
-          color = excluded.color,
-          itembawah = excluded.itembawah,
-          itematas = excluded.itematas,
-          vip = excluded.vip,
-          viptanda = excluded.viptanda,
-          updated_at = excluded.updated_at
-      `).bind(
-        roomName, seatNumber, userId, noimageUrl || "", color || "",
-        itembawah || 0, itematas || 0, vip || 0, viptanda || 0,
-        Date.now(), Date.now()
-      ).run();
-
-      await this.updateRoomActivity(roomName);
-      return true;
-    } catch (e) {
-      console.error("Add seat error:", e);
-      return false;
-    }
-  }
-
-  async removeSeat(roomName, seatNumber) {
-    try {
-      await this.db.prepare(`
-        DELETE FROM seats WHERE room_name = ? AND seat_number = ?
-      `).bind(roomName, seatNumber).run();
-
-      await this.db.prepare(`
-        DELETE FROM points WHERE room_name = ? AND seat_number = ?
-      `).bind(roomName, seatNumber).run();
-
-      await this.updateRoomActivity(roomName);
-      return true;
-    } catch (e) {
-      console.error("Remove seat error:", e);
-      return false;
-    }
-  }
-
-  async removeUserFromAllSeats(userId) {
-    try {
-      const seat = await this.db.prepare(`
-        SELECT room_name, seat_number FROM seats WHERE user_id = ?
-      `).bind(userId).first();
-
-      if (seat) {
-        await this.removeSeat(seat.room_name, seat.seat_number);
-        return seat;
+      if (!this.db) return;
+      
+      // Save room state
+      await this.db.prepare(
+        `INSERT OR REPLACE INTO chat_rooms (room_name, muted, current_number, last_activity)
+         VALUES (?, ?, ?, ?)`
+      ).bind(this.name, this.muted ? 1 : 0, this.number, Date.now()).run();
+      
+      // Save seats
+      await this.db.prepare(
+        'DELETE FROM chat_seats WHERE room_name = ?'
+      ).bind(this.name).run();
+      
+      const seatsData = [];
+      for (const [seat, data] of this.seats) {
+        seatsData.push([
+          this.name, seat, data.namauser || "", data.noimageUrl || "",
+          data.color || "", data.itembawah || 0, data.itematas || 0,
+          data.vip || 0, data.vip_tanda || 0
+        ]);
       }
-      return null;
-    } catch (e) {
-      console.error("Remove user from seats error:", e);
-      return null;
+      
+      if (seatsData.length > 0) {
+        const stmt = this.db.prepare(
+          `INSERT INTO chat_seats (room_name, seat_number, username, noimage_url, color, item_bawah, item_atas, vip, vip_tanda)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        );
+        
+        for (const data of seatsData) {
+          await stmt.bind(...data).run();
+        }
+      }
+    } catch(e) {
+      // Silently continue
     }
   }
 
-  async updatePoint(roomName, seatNumber, x, y, fast) {
-    try {
-      await this.db.prepare(`
-        INSERT INTO points (room_name, seat_number, x, y, fast, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?)
-        ON CONFLICT(room_name, seat_number) DO UPDATE SET
-          x = excluded.x,
-          y = excluded.y,
-          fast = excluded.fast,
-          updated_at = excluded.updated_at
-      `).bind(roomName, seatNumber, x || 0, y || 0, fast ? 1 : 0, Date.now()).run();
-
-      await this.updateRoomActivity(roomName);
-      return true;
-    } catch (e) {
-      console.error("Update point error:", e);
-      return false;
+  getAvailableSeat() {
+    for (let seat = 1; seat <= C.MAX_SEATS; seat++) {
+      if (!this.seats.has(seat)) return seat;
     }
+    return null;
   }
 
-  async getPoints(roomName) {
-    const results = await this.db.prepare(`
-      SELECT * FROM points WHERE room_name = ?
-    `).bind(roomName).all();
-    return results.results || [];
+  addSeat(userId, noimageUrl, color, itembawah, itematas, vip, viptanda) {
+    if (!userId) return null;
+    
+    for (const [seat, data] of this.seats) {
+      if (data && data.namauser === userId) return seat;
+    }
+    
+    const seat = this.getAvailableSeat();
+    if (!seat) return null;
+    
+    this.seats.set(seat, {
+      noimageUrl: noimageUrl || "",
+      namauser: userId,
+      color: color || "",
+      itembawah: itembawah || 0,
+      itematas: itematas || 0,
+      vip: vip || 0,
+      viptanda: viptanda || 0,
+    });
+    this.lastActivity = Date.now();
+    
+    // Save to DB async
+    this.saveState().catch(() => {});
+    
+    return seat;
   }
 
-  async getPoint(roomName, seatNumber) {
-    const result = await this.db.prepare(`
-      SELECT * FROM points WHERE room_name = ? AND seat_number = ?
-    `).bind(roomName, seatNumber).first();
+  updateSeat(seat, data) {
+    if (!this.seats.has(seat) || !data) return false;
+    
+    this.seats.set(seat, {
+      noimageUrl: data.noimageUrl || "",
+      namauser: data.namauser || "",
+      color: data.color || "",
+      itembawah: data.itembawah || 0,
+      itematas: data.itematas || 0,
+      vip: data.vip || 0,
+      viptanda: data.viptanda || 0
+    });
+    this.lastActivity = Date.now();
+    
+    // Save to DB async
+    this.saveState().catch(() => {});
+    
+    return true;
+  }
+
+  removeSeat(seat) {
+    this.points.delete(seat);
+    this.lastActivity = Date.now();
+    const result = this.seats.delete(seat);
+    
+    // Save to DB async
+    if (result) {
+      this.saveState().catch(() => {});
+    }
+    
+    return result;
+  }
+  
+  getSeat(seat) { 
+    const data = this.seats.get(seat);
+    return data ? { ...data } : null;
+  }
+  
+  getCount() { return this.seats.size; }
+  
+  getAllSeats() {
+    const result = {};
+    for (const [seat, data] of this.seats) {
+      if (data) result[seat] = { ...data };
+    }
     return result;
   }
 
-  async getAllRooms() {
-    const results = await this.db.prepare(`
-      SELECT * FROM rooms
-    `).all();
-    return results.results || [];
+  setMuted(val) { 
+    this.muted = !!val; 
+    this.lastActivity = Date.now();
+    
+    // Save to DB async
+    this.saveState().catch(() => {});
+    
+    return this.muted; 
+  }
+  
+  getMuted() { return this.muted; }
+  
+  setNumber(n) { 
+    this.number = n || 1; 
+    
+    // Save to DB async
+    this.saveState().catch(() => {});
+  }
+  getNumber() { return this.number; }
+
+  updatePoint(seat, x, y, fast) {
+    if (!this.seats.has(seat)) return false;
+    this.points.set(seat, { x: x || 0, y: y || 0, fast: !!fast });
+    this.lastActivity = Date.now();
+    return true;
   }
 
-  async cleanupInactiveRooms(timeout = 3600000) {
-    const now = Date.now();
-    const results = await this.db.prepare(`
-      SELECT r.room_name FROM rooms r
-      LEFT JOIN seats s ON r.room_name = s.room_name
-      WHERE r.last_activity < ? AND s.room_name IS NULL
-    `).bind(now - timeout).all();
-    return results.results || [];
+  getPoint(seat) { 
+    const point = this.points.get(seat);
+    return point ? { ...point } : null;
+  }
+  
+  getAllPoints() {
+    const result = [];
+    for (const [seat, point] of this.points) {
+      if (this.seats.has(seat) && point) {
+        result.push({ seat, x: point.x, y: point.y, fast: point.fast ? 1 : 0 });
+      }
+    }
+    return result;
+  }
+
+  isInactive(timeout = 3600000) {
+    return Date.now() - this.lastActivity > timeout && this.getCount() === 0;
   }
 }
 
@@ -262,52 +249,168 @@ class DatabaseHelper {
 export class ChatServer {
   constructor(env) {
     this.env = env;
+    this.db = env.DB; // D1 Database
     this.closing = false;
     this.isDestroyed = false;
-    this.ROOMS = ROOMS;
-    this.ROOMS_SET = ROOMS_SET;
+    this._initPromise = null;
+    this._initialized = false;
     
-    // WebSocket connections
     this.wsSet = new Set();
     this.userConnections = new Map();
     this.userSeat = new Map();
     this.userRoom = new Map();
     this.roomClients = new Map();
+    this.rooms = new Map();
     this.wsActiveMulti = new Map();
+    this.ROOMS = ROOMS;
+    this.ROOMS_SET = ROOMS_SET;
     
-    // Rate limiting
     this._processingMessages = new Set();
     this._cleaningUp = new Set();
     this._pendingTimeouts = new Set();
+    this._cleanupInProgress = false;
     
-    // Locks
     this._joinLocks = new Map();
     this._kursiLocks = new Map();
     
-    // Rate limiting per room
     this._roomMessageCount = new Map();
     this._roomMessageReset = new Map();
     
     this.currentNumber = 1;
     this._tikCounter = 0;
-    this._cleanupInProgress = false;
+    this._numberInterval = null;
     
-    // Database helper
-    this.db = new DatabaseHelper(env.DB);
-    
-    // Initialize rooms in DB
-    this._initPromise = this.db.initTables().catch(e => console.error("DB init error:", e));
-    
-    // Setup room clients
+    // Initialize rooms
     for (const room of ROOMS) {
+      this.rooms.set(room, new RoomManager(room, this.db));
       this.roomClients.set(room, new Set());
     }
     
+    // Load all room states
+    this._initPromise = this._initRooms();
+    
+    // Setup periodic cleanup
     this._setupPeriodicCleanup();
     
-    // Alarm untuk number update (pakai setInterval)
-    this._alarmInterval = setInterval(() => {
-      this._alarmTick().catch(e => {});
+    // Start number update
+    this._startNumberUpdater();
+  }
+  
+  async _initRooms() {
+    try {
+      // Ensure tables exist
+      await this._ensureTables();
+      
+      // Load all rooms
+      const loadPromises = [];
+      for (const room of this.rooms.values()) {
+        loadPromises.push(room.loadState());
+      }
+      await Promise.all(loadPromises);
+      
+      // Get current number from first room
+      const firstRoom = this.rooms.get(ROOMS[0]);
+      if (firstRoom) {
+        this.currentNumber = firstRoom.getNumber();
+      }
+      
+      this._initialized = true;
+    } catch(e) {
+      // Continue even if DB fails
+      this._initialized = true;
+    }
+  }
+  
+  async _ensureTables() {
+    try {
+      if (!this.db) return;
+      
+      // Create chat_rooms table
+      await this.db.prepare(`
+        CREATE TABLE IF NOT EXISTS chat_rooms (
+          room_name TEXT PRIMARY KEY,
+          muted INTEGER DEFAULT 0,
+          current_number INTEGER DEFAULT 1,
+          last_activity INTEGER DEFAULT 0
+        )
+      `).run();
+      
+      // Create chat_seats table
+      await this.db.prepare(`
+        CREATE TABLE IF NOT EXISTS chat_seats (
+          room_name TEXT,
+          seat_number INTEGER,
+          username TEXT,
+          noimage_url TEXT,
+          color TEXT,
+          item_bawah INTEGER DEFAULT 0,
+          item_atas INTEGER DEFAULT 0,
+          vip INTEGER DEFAULT 0,
+          vip_tanda INTEGER DEFAULT 0,
+          PRIMARY KEY (room_name, seat_number)
+        )
+      `).run();
+      
+      // Create chat_messages table
+      await this.db.prepare(`
+        CREATE TABLE IF NOT EXISTS chat_messages (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          room_name TEXT,
+          username TEXT,
+          message TEXT,
+          noimage_url TEXT,
+          color TEXT,
+          text_color TEXT,
+          timestamp INTEGER DEFAULT 0
+        )
+      `).run();
+      
+      // Initialize rooms in DB
+      for (const room of ROOMS) {
+        await this.db.prepare(
+          `INSERT OR IGNORE INTO chat_rooms (room_name, muted, current_number, last_activity)
+           VALUES (?, 0, 1, ?)`
+        ).bind(room, Date.now()).run();
+      }
+    } catch(e) {
+      // Silently continue
+    }
+  }
+  
+  _startNumberUpdater() {
+    // Update number every 10 seconds
+    this._numberInterval = setInterval(() => {
+      if (this.closing || this.isDestroyed) {
+        clearInterval(this._numberInterval);
+        this._numberInterval = null;
+        return;
+      }
+      
+      this._tikCounter++;
+      
+      if (this._tikCounter >= C.NUMBER_UPDATE_TIK) {
+        this.currentNumber = this.currentNumber < C.MAX_NUMBER ? this.currentNumber + 1 : 1;
+        
+        // Update all rooms
+        for (const room of this.rooms.values()) {
+          if (room) {
+            room.setNumber(this.currentNumber);
+          }
+        }
+        
+        const numberMsg = JSON.stringify(["currentNumber", this.currentNumber]);
+        
+        for (const [room, clients] of this.roomClients) {
+          if (clients && clients.size > 0 && clients.size <= C.MAX_ROOM_CLIENTS) {
+            this._broadcastToRoom(room, numberMsg);
+          }
+        }
+        
+        this._tikCounter = 0;
+      }
+      
+      this._doCleanup();
+      
     }, C.ALARM_10_DETIK);
   }
   
@@ -319,19 +422,9 @@ export class ChatServer {
       }
       this._cleanupStaleLocks();
       this._cleanupMemory();
-      this._cleanupDbRooms();
     }, C.CLEANUP_INTERVAL);
     
     this._pendingTimeouts.add(this._cleanupInterval);
-  }
-  
-  async _cleanupDbRooms() {
-    try {
-      const inactiveRooms = await this.db.cleanupInactiveRooms();
-      for (const room of inactiveRooms) {
-        // Log saja
-      }
-    } catch(e) {}
   }
   
   _cleanupStaleLocks() {
@@ -376,46 +469,19 @@ export class ChatServer {
         }
       }
       
-      for (const [room, clients] of this.roomClients) {
-        const toRemove = [];
-        for (const client of clients) {
-          if (!client || client.readyState !== 1 || client._closing || this._cleaningUp.has(client)) {
-            toRemove.push(client);
+      for (const [roomName, roomMan] of this.rooms) {
+        if (roomMan && roomMan.isInactive()) {
+          const pointsToRemove = [];
+          for (const [seat] of roomMan.points) {
+            if (!roomMan.seats.has(seat)) {
+              pointsToRemove.push(seat);
+            }
+          }
+          for (const seat of pointsToRemove) {
+            roomMan.points.delete(seat);
           }
         }
-        for (const client of toRemove) {
-          clients.delete(client);
-        }
       }
-    } catch(e) {}
-  }
-  
-  async _alarmTick() {
-    if (this.closing || this.isDestroyed) return;
-    
-    try {
-      this._tikCounter++;
-      
-      if (this._tikCounter >= C.NUMBER_UPDATE_TIK) {
-        this.currentNumber = this.currentNumber < C.MAX_NUMBER ? this.currentNumber + 1 : 1;
-        
-        for (const room of ROOMS) {
-          await this.db.setRoomNumber(room, this.currentNumber);
-        }
-        
-        const numberMsg = JSON.stringify(["currentNumber", this.currentNumber]);
-        
-        for (const [room, clients] of this.roomClients) {
-          if (clients && clients.size > 0 && clients.size <= C.MAX_ROOM_CLIENTS) {
-            this._broadcastToRoom(room, numberMsg);
-          }
-        }
-        
-        this._tikCounter = 0;
-      }
-      
-      this._doCleanup();
-      
     } catch(e) {}
   }
   
@@ -433,9 +499,88 @@ export class ChatServer {
       for (const ws of toRemove) {
         this.cleanup(ws);
       }
+      
+      const toRemoveUsers = [];
+      for (const [username, connections] of this.userConnections) {
+        const toRemoveConn = [];
+        for (const conn of connections) {
+          if (!conn || conn.readyState !== 1 || conn._closing || this._cleaningUp.has(conn)) {
+            toRemoveConn.push(conn);
+          }
+        }
+        for (const conn of toRemoveConn) {
+          connections.delete(conn);
+          this.wsSet.delete(conn);
+          this.wsActiveMulti.delete(conn);
+        }
+        if (connections.size === 0) {
+          toRemoveUsers.push(username);
+        }
+      }
+      
+      for (const username of toRemoveUsers) {
+        this._removeUserFromRooms(username);
+      }
+      
+      for (const [room, clients] of this.roomClients) {
+        const toRemoveClient = [];
+        for (const client of clients) {
+          if (!client || client.readyState !== 1 || client._closing || this._cleaningUp.has(client)) {
+            toRemoveClient.push(client);
+          }
+        }
+        for (const client of toRemoveClient) {
+          clients.delete(client);
+        }
+        
+        if (clients.size > C.MAX_ROOM_CLIENTS) {
+          const clientsArray = Array.from(clients);
+          const toRemoveExtra = clientsArray.slice(C.MAX_ROOM_CLIENTS);
+          for (const ws of toRemoveExtra) {
+            clients.delete(ws);
+            if (ws && ws.readyState === 1) {
+              try {
+                ws.close(1000, "Room overloaded");
+              } catch(e) {}
+            }
+            this.cleanup(ws);
+          }
+        }
+      }
+      
+      for (const [roomName, roomMan] of this.rooms) {
+        if (roomMan) {
+          const pointsToRemove = [];
+          for (const [seat] of roomMan.points) {
+            if (!roomMan.seats.has(seat)) {
+              pointsToRemove.push(seat);
+            }
+          }
+          for (const seat of pointsToRemove) {
+            roomMan.points.delete(seat);
+          }
+        }
+      }
+      
     } catch(e) {} finally {
       this._cleanupInProgress = false;
     }
+  }
+  
+  _removeUserFromRooms(username) {
+    try {
+      const seatInfo = this.userSeat.get(username);
+      if (seatInfo && !seatInfo.isMulti) {
+        const roomMan = this.rooms.get(seatInfo.room);
+        if (roomMan) {
+          roomMan.removeSeat(seatInfo.seat);
+          this.broadcast(seatInfo.room, ["removeKursi", seatInfo.room, seatInfo.seat]);
+          this.updateRoomCount(seatInfo.room);
+        }
+        this.userSeat.delete(username);
+        this.userRoom.delete(username);
+      }
+    } catch(e) {}
   }
   
   _broadcastToRoom(room, msgStr) {
@@ -506,10 +651,12 @@ export class ChatServer {
     }
   }
   
-  async updateRoomCount(room) {
+  updateRoomCount(room) {
     if (this.closing || this.isDestroyed || !room) return 0;
     try {
-      const count = await this.db.getSeatsCount(room);
+      const roomMan = this.rooms.get(room);
+      if (!roomMan) return 0;
+      const count = roomMan.getCount();
       this.broadcast(room, ["roomUserCount", room, count]);
       return count;
     } catch(e) {
@@ -517,7 +664,7 @@ export class ChatServer {
     }
   }
   
-  async sendAllStateTo(ws, room, excludeSelf = false) {
+  sendAllStateTo(ws, room, excludeSelf = false) {
     if (!ws || !ws.username) return;
     
     try {
@@ -528,49 +675,33 @@ export class ChatServer {
       return;
     }
     
+    const roomMan = this.rooms.get(room);
+    if (!roomMan) return;
+    
     try {
-      const count = await this.db.getSeatsCount(room);
-      this.safeSend(ws, ["roomUserCount", room, count]);
+      const allSeats = roomMan.getAllSeats();
+      const allPoints = roomMan.getAllPoints();
+      const selfSeat = this.userSeat.get(ws.username)?.seat;
       
-      const allSeats = await this.db.getAllSeats(room);
-      if (allSeats && allSeats.length > 0) {
-        const seatsMap = {};
-        for (const seat of allSeats) {
-          seatsMap[seat.seat_number] = {
-            noimageUrl: seat.noimage_url || "",
-            namauser: seat.user_id || "",
-            color: seat.color || "",
-            itembawah: seat.itembawah || 0,
-            itematas: seat.itematas || 0,
-            vip: seat.vip || 0,
-            viptanda: seat.viptanda || 0,
-          };
-        }
-        
-        const selfSeat = this.userSeat.get(ws.username)?.seat;
-        if (excludeSelf && selfSeat && seatsMap[selfSeat]) {
-          delete seatsMap[selfSeat];
-        }
-        
-        if (Object.keys(seatsMap).length > 0) {
-          this.safeSend(ws, ["allUpdateKursiList", room, seatsMap]);
+      this.safeSend(ws, ["roomUserCount", room, roomMan.getCount()]);
+      
+      if (allSeats && Object.keys(allSeats).length > 0) {
+        if (excludeSelf && selfSeat && allSeats[selfSeat]) {
+          const filtered = { ...allSeats };
+          delete filtered[selfSeat];
+          if (Object.keys(filtered).length > 0) {
+            this.safeSend(ws, ["allUpdateKursiList", room, filtered]);
+          }
+        } else {
+          this.safeSend(ws, ["allUpdateKursiList", room, allSeats]);
         }
       }
       
-      const allPoints = await this.db.getPoints(room);
-      if (allPoints && allPoints.length > 0) {
-        let filteredPoints = allPoints.map(p => ({
-          seat: p.seat_number,
-          x: p.x,
-          y: p.y,
-          fast: p.fast
-        }));
-        
-        const selfSeat = this.userSeat.get(ws.username)?.seat;
+      if (allPoints?.length > 0) {
+        let filteredPoints = allPoints;
         if (excludeSelf && selfSeat) {
-          filteredPoints = filteredPoints.filter(p => p.seat !== selfSeat);
+          filteredPoints = allPoints.filter(p => p.seat !== selfSeat);
         }
-        
         if (filteredPoints.length > 0) {
           this.safeSend(ws, ["allPointsList", room, filteredPoints]);
         }
@@ -619,9 +750,17 @@ export class ChatServer {
               this.userConnections.delete(username);
               
               if (seatInfo?.room) {
-                this.db.removeSeat(seatInfo.room, seatInfo.seat).catch(e => {});
-                this.broadcast(seatInfo.room, ["removeKursi", seatInfo.room, seatInfo.seat]);
-                this.updateRoomCount(seatInfo.room).catch(e => {});
+                const roomMan = this.rooms.get(seatInfo.room);
+                if (roomMan) {
+                  try {
+                    const seatData = roomMan.getSeat(seatInfo.seat);
+                    if (seatData?.namauser === username) {
+                      roomMan.removeSeat(seatInfo.seat);
+                      this.broadcast(seatInfo.room, ["removeKursi", seatInfo.room, seatInfo.seat]);
+                      this.updateRoomCount(seatInfo.room);
+                    }
+                  } catch(e) {}
+                }
               }
               
               this.userSeat.delete(username);
@@ -680,6 +819,11 @@ export class ChatServer {
         if (room && !ROOMS_SET.has(room)) return;
       }
       
+      // ==== Wait for initialization ====
+      if (!this._initialized) {
+        await this._initPromise;
+      }
+      
       switch(evt) {
         case "setIdTarget2":
           await this.handleSetId(ws, args[0], args[1]);
@@ -695,27 +839,37 @@ export class ChatServer {
           if (!multiUsername || !multiRoomname || this.closing || this.isDestroyed) break;
           
           try {
-            const existing = await this.db.removeUserFromAllSeats(multiUsername);
-            if (existing) {
-              this.broadcast(existing.room_name, ["removeKursi", existing.room_name, existing.seat_number]);
-              await this.updateRoomCount(existing.room_name);
+            // Remove existing multi user
+            let existingSeat = null, existingRoom = null;
+            for (const [roomName, roomMan] of this.rooms) {
+              if (!roomMan) continue;
+              for (const [seat, seatData] of roomMan.seats) {
+                if (seatData?.namauser === multiUsername) {
+                  existingSeat = seat;
+                  existingRoom = roomName;
+                  break;
+                }
+              }
+              if (existingSeat) break;
             }
-            this.userSeat.delete(multiUsername);
-            this.userRoom.delete(multiUsername);
+            
+            if (existingSeat && existingRoom) {
+              const oldRoomMan = this.rooms.get(existingRoom);
+              if (oldRoomMan) {
+                oldRoomMan.removeSeat(existingSeat);
+                this.broadcast(existingRoom, ["removeKursi", existingRoom, existingSeat]);
+                this.updateRoomCount(existingRoom);
+              }
+              this.userSeat.delete(multiUsername);
+              this.userRoom.delete(multiUsername);
+            }
           } catch(e) {}
           
-          const count = await this.db.getSeatsCount(multiRoomname);
-          if (count >= C.MAX_SEATS) break;
+          const roomMan = this.rooms.get(multiRoomname);
+          if (!roomMan || roomMan.getCount() >= C.MAX_SEATS) break;
           
-          let seat = 1;
-          const existingSeats = await this.db.getAllSeats(multiRoomname);
-          const takenSeats = new Set(existingSeats.map(s => s.seat_number));
-          while (takenSeats.has(seat)) seat++;
-          
-          if (seat > C.MAX_SEATS) break;
-          
-          const added = await this.db.addSeat(multiRoomname, seat, multiUsername, "", "", 0, 0, 0, 0);
-          if (!added) break;
+          const seat = roomMan.addSeat(multiUsername, "", "", 0, 0, 0, 0);
+          if (!seat) break;
           
           try {
             this.userSeat.set(multiUsername, { room: multiRoomname, seat, isMulti: true });
@@ -731,7 +885,7 @@ export class ChatServer {
             if (roomClients && !roomClients.has(ws)) roomClients.add(ws);
             
             this.safeSend(ws, ["rooMasukMulti", seat, multiRoomname]);
-            await this.updateRoomCount(multiRoomname);
+            this.broadcast(multiRoomname, ["roomUserCount", multiRoomname, roomMan.getCount()]);
           } catch(e) {}
           break;
         }
@@ -754,9 +908,12 @@ export class ChatServer {
               this.wsActiveMulti.delete(ws);
             }
             
-            await this.db.removeSeat(roomName, seatNumber);
-            this.broadcast(roomName, ["removeKursi", roomName, seatNumber]);
-            await this.updateRoomCount(roomName);
+            const roomMan = this.rooms.get(roomName);
+            if (roomMan) {
+              roomMan.removeSeat(seatNumber);
+              this.broadcast(roomName, ["removeKursi", roomName, seatNumber]);
+              this.broadcast(roomName, ["roomUserCount", roomName, roomMan.getCount()]);
+            }
             
             this.userSeat.delete(targetUsername);
             this.userRoom.delete(targetUsername);
@@ -810,6 +967,8 @@ export class ChatServer {
         case "updateKursi": {
           try {
             const [kursiRoom, kursiSeat, kursiNoimg, kursiName, kursiColor, kursiBawah, kursiAtas, kursiVip, kursiVt] = args;
+            const roomMan = this.rooms.get(kursiRoom);
+            if (!roomMan) break;
             
             const lockKey = `kursi_${kursiRoom}_${kursiSeat}`;
             
@@ -820,25 +979,19 @@ export class ChatServer {
             this._kursiLocks.set(lockKey, Date.now());
             
             try {
-              const updated = await this.db.addSeat(
-                kursiRoom, kursiSeat, kursiName, kursiNoimg, kursiColor,
-                kursiBawah, kursiAtas, kursiVip, kursiVt
-              );
+              const updated = roomMan.updateSeat(kursiSeat, {
+                noimageUrl: kursiNoimg || "",
+                namauser: kursiName || "",
+                color: kursiColor || "",
+                itembawah: kursiBawah || 0,
+                itematas: kursiAtas || 0,
+                vip: kursiVip || 0,
+                viptanda: kursiVt || 0
+              });
               
               if (updated) {
-                const updatedSeat = await this.db.getSeat(kursiRoom, kursiSeat);
-                if (updatedSeat) {
-                  const seatData = {
-                    noimageUrl: updatedSeat.noimage_url || "",
-                    namauser: updatedSeat.user_id || "",
-                    color: updatedSeat.color || "",
-                    itembawah: updatedSeat.itembawah || 0,
-                    itematas: updatedSeat.itematas || 0,
-                    vip: updatedSeat.vip || 0,
-                    viptanda: updatedSeat.viptanda || 0,
-                  };
-                  this.broadcast(kursiRoom, ["kursiBatchUpdate", kursiRoom, [[kursiSeat, seatData]]]);
-                }
+                const updatedSeat = roomMan.getSeat(kursiSeat);
+                this.broadcast(kursiRoom, ["kursiBatchUpdate", kursiRoom, [[kursiSeat, updatedSeat]]]);
               }
             } finally {
               this._kursiLocks.delete(lockKey);
@@ -884,6 +1037,17 @@ export class ChatServer {
             if (!clients || clients.size === 0) break;
             
             this._broadcastToRoom(chatRoom, JSON.stringify(["chat", chatRoom, chatNoimg, chatUser, chatMsg, chatColor, chatTextColor]));
+            
+            // Save chat history to DB
+            if (this.db) {
+              try {
+                await this.db.prepare(
+                  `INSERT INTO chat_messages (room_name, username, message, noimage_url, color, text_color, timestamp)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)`
+                ).bind(chatRoom, chatUser, chatMsg, chatNoimg || "", chatColor || "", chatTextColor || "", Date.now()).run();
+              } catch(e) {}
+            }
+            
           } catch(e) {}
           break;
         }
@@ -892,10 +1056,11 @@ export class ChatServer {
           try {
             const [pointRoom, pointSeat, pointX, pointY, pointFast] = args;
             if (pointRoom && typeof pointSeat === 'number' && pointSeat >= 1 && pointSeat <= C.MAX_SEATS) {
-              const seat = await this.db.getSeat(pointRoom, pointSeat);
-              if (seat) {
-                await this.db.updatePoint(pointRoom, pointSeat, pointX, pointY, pointFast === 1);
-                this._broadcastToRoom(pointRoom, JSON.stringify(["pointUpdated", pointRoom, pointSeat, pointX, pointY, pointFast]));
+              const roomMan = this.rooms.get(pointRoom);
+              if (roomMan && roomMan.seats.has(pointSeat)) {
+                if (roomMan.updatePoint(pointSeat, pointX, pointY, pointFast === 1)) {
+                  this._broadcastToRoom(pointRoom, JSON.stringify(["pointUpdated", pointRoom, pointSeat, pointX, pointY, pointFast]));
+                }
               }
             }
           } catch(e) {}
@@ -905,8 +1070,8 @@ export class ChatServer {
         case "removeKursiAndPoint": {
           try {
             const [removeRoom, removeSeat] = args;
-            const seat = await this.db.getSeat(removeRoom, removeSeat);
-            if (seat) {
+            const roomMan = this.rooms.get(removeRoom);
+            if (roomMan && roomMan.seats.has(removeSeat)) {
               for (const [username, info] of this.userSeat) {
                 if (info.seat === removeSeat && info.room === removeRoom) {
                   this.userSeat.delete(username);
@@ -914,9 +1079,9 @@ export class ChatServer {
                   break;
                 }
               }
-              await this.db.removeSeat(removeRoom, removeSeat);
+              roomMan.removeSeat(removeSeat);
               this.broadcast(removeRoom, ["removeKursi", removeRoom, removeSeat]);
-              await this.updateRoomCount(removeRoom);
+              this.updateRoomCount(removeRoom);
             }
           } catch(e) {}
           break;
@@ -1063,8 +1228,8 @@ export class ChatServer {
           try {
             const counts = {};
             for (const room of ROOMS) {
-              const count = await this.db.getSeatsCount(room);
-              counts[room] = count;
+              const rm = this.rooms.get(room);
+              counts[room] = rm?.getCount() || 0;
             }
             this.safeSend(ws, ["allRoomsUserCount", Object.entries(counts)]);
           } catch(e) {}
@@ -1075,8 +1240,8 @@ export class ChatServer {
           try {
             const roomName = args[0];
             if (roomName && ROOMS_SET.has(roomName)) {
-              const count = await this.db.getSeatsCount(roomName);
-              this.safeSend(ws, ["roomUserCount", roomName, count]);
+              const rm = this.rooms.get(roomName);
+              this.safeSend(ws, ["roomUserCount", roomName, rm?.getCount() || 0]);
             }
           } catch(e) {}
           break;
@@ -1087,7 +1252,10 @@ export class ChatServer {
             const [muteVal, muteRoom] = args;
             if (!muteRoom || !ROOMS_SET.has(muteRoom)) break;
             
-            await this.db.setRoomMuted(muteRoom, muteVal);
+            const rm = this.rooms.get(muteRoom);
+            if (!rm) break;
+            
+            rm.setMuted(muteVal);
             this.broadcast(muteRoom, ["muteStatusChanged", !!muteVal, muteRoom]);
             this.safeSend(ws, ["muteTypeSet", !!muteVal, true, muteRoom]);
           } catch(e) {}
@@ -1108,8 +1276,44 @@ export class ChatServer {
           try {
             const getMuteRoom = args[0];
             if (getMuteRoom && ROOMS_SET.has(getMuteRoom)) {
-              const roomData = await this.db.getRoom(getMuteRoom);
-              this.safeSend(ws, ["muteTypeResponse", roomData?.muted || false, getMuteRoom]);
+              const rm = this.rooms.get(getMuteRoom);
+              this.safeSend(ws, ["muteTypeResponse", rm?.getMuted() || false, getMuteRoom]);
+            }
+          } catch(e) {}
+          break;
+        }
+        
+        case "getLastChats": {
+          try {
+            const [chatRoom, limit] = args;
+            if (!chatRoom || !ROOMS_SET.has(chatRoom)) break;
+            
+            if (this.db) {
+              const messages = await this.db.prepare(
+                `SELECT username, message, noimage_url, color, text_color, timestamp
+                 FROM chat_messages
+                 WHERE room_name = ?
+                 ORDER BY timestamp DESC
+                 LIMIT ?`
+              ).bind(chatRoom, limit || 50).all();
+              
+              this.safeSend(ws, ["chatHistory", chatRoom, (messages.results || []).reverse()]);
+            }
+          } catch(e) {}
+          break;
+        }
+        
+        case "clearChatHistory": {
+          try {
+            const [clearRoom] = args;
+            if (!clearRoom || !ROOMS_SET.has(clearRoom)) break;
+            
+            if (this.db) {
+              await this.db.prepare(
+                'DELETE FROM chat_messages WHERE room_name = ?'
+              ).bind(clearRoom).run();
+              
+              this.safeSend(ws, ["chatHistoryCleared", clearRoom]);
             }
           } catch(e) {}
           break;
@@ -1209,14 +1413,69 @@ export class ChatServer {
         }
       }
       
-      const existing = await this.db.removeUserFromAllSeats(username);
-      if (existing) {
-        this.broadcast(existing.room_name, ["removeKursi", existing.room_name, existing.seat_number]);
-        await this.updateRoomCount(existing.room_name);
+      let existingSeatInfo2 = this.userSeat.get(username);
+      
+      if (!existingSeatInfo2) {
+        for (const [roomName, roomMan] of this.rooms) {
+          if (!roomMan) continue;
+          for (const [seat, seatData] of roomMan.seats) {
+            if (seatData?.namauser === username) {
+              existingSeatInfo2 = { 
+                room: roomName, 
+                seat: seat, 
+                isMulti: false 
+              };
+              this.userSeat.set(username, existingSeatInfo2);
+              this.userRoom.set(username, roomName);
+              break;
+            }
+          }
+          if (existingSeatInfo2) break;
+        }
       }
       
-      this.userSeat.delete(username);
-      this.userRoom.delete(username);
+      if (existingSeatInfo2) {
+        try {
+          const oldRoom = existingSeatInfo2.room;
+          const oldSeat = existingSeatInfo2.seat;
+          
+          const oldRoomMan = this.rooms.get(oldRoom);
+          if (oldRoomMan) {
+            const seatData = oldRoomMan.getSeat(oldSeat);
+            if (seatData?.namauser === username) {
+              oldRoomMan.removeSeat(oldSeat);
+              this.broadcast(oldRoom, ["removeKursi", oldRoom, oldSeat]);
+              this.updateRoomCount(oldRoom);
+            }
+          }
+          
+          this.userSeat.delete(username);
+          this.userRoom.delete(username);
+          
+        } catch(e) {}
+      }
+      
+      try {
+        for (const [roomName, roomMan] of this.rooms) {
+          if (!roomMan) continue;
+          let found = false;
+          for (const [seat, seatData] of roomMan.seats) {
+            if (seatData?.namauser === username) {
+              roomMan.removeSeat(seat);
+              this.broadcast(roomName, ["removeKursi", roomName, seat]);
+              this.updateRoomCount(roomName);
+              found = true;
+              break;
+            }
+          }
+          if (found) break;
+        }
+      } catch(e) {}
+      
+      try {
+        this.userSeat.delete(username);
+        this.userRoom.delete(username);
+      } catch(e) {}
       
       try {
         ws.username = username;
@@ -1278,11 +1537,14 @@ export class ChatServer {
     
     if (oldRoom && oldRoom !== roomName) {
       try {
-        const oldSeat = this.userSeat.get(username)?.seat;
-        if (oldSeat) {
-          await this.db.removeSeat(oldRoom, oldSeat);
-          this.broadcast(oldRoom, ["removeKursi", oldRoom, oldSeat]);
-          await this.updateRoomCount(oldRoom);
+        const oldMan = this.rooms.get(oldRoom);
+        if (oldMan) {
+          const oldSeat = this.userSeat.get(username)?.seat;
+          if (oldSeat) {
+            oldMan.removeSeat(oldSeat);
+            this.broadcast(oldRoom, ["removeKursi", oldRoom, oldSeat]);
+            this.updateRoomCount(oldRoom);
+          }
         }
         const oldClients = this.roomClients.get(oldRoom);
         if (oldClients) oldClients.delete(ws);
@@ -1293,32 +1555,28 @@ export class ChatServer {
       ws.roomname = null;
     }
     
-    const existingSeats = await this.db.getAllSeats(roomName);
+    const roomMan = this.rooms.get(roomName);
+    if (!roomMan) return false;
+    
     let seat = null;
-    for (const s of existingSeats) {
-      if (s.user_id === username) { 
-        seat = s.seat_number; 
+    for (const [s, data] of roomMan.seats) {
+      if (data?.namauser === username) { 
+        seat = s; 
         break; 
       }
     }
     
     if (!seat) {
-      const count = existingSeats.length;
-      if (count >= C.MAX_SEATS) {
+      if (roomMan.getCount() >= C.MAX_SEATS) {
         this.safeSend(ws, ["roomFull", roomName]);
         return false;
       }
-      
-      const takenSeats = new Set(existingSeats.map(s => s.seat_number));
-      seat = 1;
-      while (takenSeats.has(seat)) seat++;
-      
-      if (seat > C.MAX_SEATS) {
+      seat = roomMan.getAvailableSeat();
+      if (!seat) {
         this.safeSend(ws, ["roomFull", roomName]);
         return false;
       }
-      
-      await this.db.addSeat(roomName, seat, username, "", "", 0, 0, 0, 0);
+      roomMan.addSeat(username, "", "", 0, 0, 0, 0);
     }
     
     try {
@@ -1331,15 +1589,12 @@ export class ChatServer {
       const roomClients = this.roomClients.get(roomName);
       if (roomClients && !roomClients.has(ws)) roomClients.add(ws);
       
-      const roomData = await this.db.getRoom(roomName);
-      const count = await this.db.getSeatsCount(roomName);
-      
       this.safeSend(ws, ["rooMasuk", seat, roomName]);
       this.safeSend(ws, ["numberKursiSaya", seat]);
-      this.safeSend(ws, ["muteTypeResponse", roomData?.muted || false, roomName]);
-      this.safeSend(ws, ["roomUserCount", roomName, count]);
+      this.safeSend(ws, ["muteTypeResponse", roomMan.getMuted(), roomName]);
+      this.safeSend(ws, ["roomUserCount", roomName, roomMan.getCount()]);
       
-      await this.updateRoomCount(roomName);
+      this.updateRoomCount(roomName);
       
       const timeoutId = setTimeout(() => {
         try {
@@ -1356,13 +1611,10 @@ export class ChatServer {
     return true;
   }
   
-  // ==================== FETCH - WEBSOCKET HANDLER ====================
   async fetch(req) {
     if (this.closing || this.isDestroyed) {
       return new Response("Shutting down", { status: 503 });
     }
-    
-    await this._initPromise;
     
     try {
       const upgrade = req.headers.get("Upgrade");
@@ -1377,9 +1629,6 @@ export class ChatServer {
       
       const pair = new WebSocketPair();
       const [client, server] = [pair[0], pair[1]];
-      
-      // ✅ ACCEPT WEBSOCKET (Tanpa Durable Objects)
-      server.accept();
       
       const timeoutId = setTimeout(() => {
         try {
@@ -1397,15 +1646,16 @@ export class ChatServer {
       server.roomname = null;
       server.idtarget = null;
       server._closing = false;
-      server._wsId = Date.now() + Math.random() + Math.random().toString(36).substring(2, 6);
+      server._wsId = Date.now() + Math.random();
       
-      // ✅ EVENT HANDLERS
+      if (!this.wsSet.has(server)) {
+        this.wsSet.add(server);
+      }
+      
       server.addEventListener("message", async (event) => {
         try {
           await this.webSocketMessage(server, event.data);
-        } catch(e) {
-          console.error("Chat WS message error:", e);
-        }
+        } catch(e) {}
       });
       
       server.addEventListener("close", () => {
@@ -1416,15 +1666,10 @@ export class ChatServer {
         this.webSocketError(server);
       });
       
-      if (!this.wsSet.has(server)) {
-        this.wsSet.add(server);
-      }
-      
       return new Response(null, { status: 101, webSocket: client });
       
     } catch(e) {
-      console.error("Chat WebSocket error:", e);
-      return new Response("Internal Server Error: " + e.message, { status: 500 });
+      return new Response("Internal Server Error", { status: 500 });
     }
   }
   
@@ -1457,10 +1702,6 @@ export class ChatServer {
     this._joinLocks.clear();
     this._kursiLocks.clear();
     
-    if (this._alarmInterval) {
-      clearInterval(this._alarmInterval);
-    }
-    
     for (const timeout of this._pendingTimeouts) {
       clearTimeout(timeout);
     }
@@ -1468,6 +1709,10 @@ export class ChatServer {
     
     if (this._cleanupInterval) {
       clearInterval(this._cleanupInterval);
+    }
+    
+    if (this._numberInterval) {
+      clearInterval(this._numberInterval);
     }
     
     const wsCopy = Array.from(this.wsSet);
@@ -1491,6 +1736,7 @@ export class ChatServer {
     this.userRoom.clear();
     this.wsActiveMulti.clear();
     this.roomClients.clear();
+    this.rooms.clear();
     this._processingMessages.clear();
     this._cleaningUp.clear();
     this._roomMessageCount.clear();

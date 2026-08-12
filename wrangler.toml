@@ -12,7 +12,7 @@ preview_database_id = "c3524570-7bd8-404b-b573-b24533dc5d31"
 # ==================== KV STORAGE ====================
 [[kv_namespaces]]
 binding = "QUESTIONS"
-id = "d1df4bcabc384340bc3623054212570a"
+id = "556345248fb6411fa1b9bacd4740b922"
 
 # ❌ HAPUS DURABLE OBJECTS
 # [durable_objects]

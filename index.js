@@ -4,12 +4,27 @@ import { GameServer } from "./game-server.js";
 
 let chatServer = null;
 let gameServer = null;
+let isInitialized = false;
 
 export default {
   async fetch(request, env, ctx) {
     try {
       const url = new URL(request.url);
       const pathname = url.pathname;
+      
+      // ✅ INISIALISASI DI AWAL
+      if (!isInitialized) {
+        try {
+          chatServer = new ChatServer(env);
+          gameServer = new GameServer(env);
+          if (gameServer._initAsync) {
+            await gameServer._initAsync();
+          }
+          isInitialized = true;
+        } catch(e) {
+          // Gagal init, akan dicoba lagi nanti
+        }
+      }
       
       if (pathname === "/ws" || pathname === "/chat" || pathname === "/") {
         if (!chatServer || chatServer.isDestroyed) {
@@ -73,6 +88,8 @@ export default {
       try { await gameServer.destroy(); } catch(e) {}
     }
     gameServer = null;
+    
+    isInitialized = false;
   }
 };
 

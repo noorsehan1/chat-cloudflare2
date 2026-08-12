@@ -1363,7 +1363,7 @@ export class ChatServer {
     return true;
   }
   
-  // ==================== ✅ FIXED FETCH METHOD ====================
+  // ==================== FETCH - TAMBAHKAN EVENT LISTENER ====================
   async fetch(req) {
     if (this.closing || this.isDestroyed) {
       return new Response("Shutting down", { status: 503 });
@@ -1391,7 +1391,6 @@ export class ChatServer {
       server.username = null;
       server.idtarget = null;
       
-      // ✅ TAMBAHKAN KE WS SET
       if (!this.wsSet.has(server)) {
         this.wsSet.add(server);
       }

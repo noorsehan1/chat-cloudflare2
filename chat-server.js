@@ -139,8 +139,9 @@ class RoomManager {
 }
 
 export class ChatServer {
-  // ✅ TANPA PARAMETER state
+  // ✅ HANYA env, TANPA state
   constructor(env) {
+    // ✅ HAPUS: this.state = state;
     this.env = env;
     this.closing = false;
     this.isDestroyed = false;
@@ -173,9 +174,12 @@ export class ChatServer {
     }
     
     this._setupPeriodicCleanup();
+    
+    // ✅ GANTI: PAKAI setInterval BUKAN state.storage.setAlarm()
     this._startNumberUpdater();
   }
   
+  // ✅ PENGGANTI alarm()
   _startNumberUpdater() {
     if (this._numberInterval) {
       clearInterval(this._numberInterval);
@@ -290,6 +294,9 @@ export class ChatServer {
       }
     } catch(e) {}
   }
+  
+  // ❌ HAPUS METHOD alarm()
+  // async alarm() { ... }
   
   _doCleanup() {
     if (this._cleanupInProgress || this.closing || this.isDestroyed) return;
@@ -1364,7 +1371,7 @@ export class ChatServer {
     return true;
   }
   
-  // ==================== FETCH - SUDAH DENGAN EVENT LISTENER ====================
+  // ✅ FETCH - TANPA DURABLE OBJECTS
   async fetch(req) {
     if (this.closing || this.isDestroyed) {
       return new Response("Shutting down", { status: 503 });
@@ -1384,18 +1391,16 @@ export class ChatServer {
       const pair = new WebSocketPair();
       const [client, server] = [pair[0], pair[1]];
       
-      server._wsId = Date.now() + Math.random();
-      server._closing = false;
+      // ✅ HAPUS: this.state.acceptWebSocket(server);
+      
+      server.username = null;
       server.room = null;
       server.roomname = null;
-      server.username = null;
       server.idtarget = null;
+      server._closing = false;
+      server._wsId = Date.now() + Math.random();
       
-      if (!this.wsSet.has(server)) {
-        this.wsSet.add(server);
-      }
-      
-      // ✅✅✅ EVENT LISTENER
+      // ✅✅✅ TAMBAHKAN EVENT LISTENER
       server.addEventListener("message", (event) => {
         try {
           this.handleMessage(server, event.data).catch(() => {});
@@ -1409,6 +1414,10 @@ export class ChatServer {
       server.addEventListener("error", () => {
         this.webSocketError(server);
       });
+      
+      if (!this.wsSet.has(server)) {
+        this.wsSet.add(server);
+      }
       
       return new Response(null, { status: 101, webSocket: client });
       
@@ -1443,6 +1452,7 @@ export class ChatServer {
     this.closing = true;
     this.isDestroyed = true;
     
+    // ✅ CLEANUP NUMBER UPDATER
     if (this._numberInterval) {
       clearInterval(this._numberInterval);
       this._numberInterval = null;

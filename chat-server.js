@@ -139,7 +139,7 @@ class RoomManager {
 }
 
 export class ChatServer {
-  // ✅ HANYA env, TANPA state
+  // ✅ HANYA env, TANPA state (SESUAI FORMAT DO TAPI DIUBAH)
   constructor(env) {
     // ✅ HAPUS: this.state = state;
     this.env = env;
@@ -179,7 +179,7 @@ export class ChatServer {
     this._startNumberUpdater();
   }
   
-  // ✅ PENGGANTI alarm()
+  // ✅ TAMBAHKAN METHOD INI (PENGGANTI alarm())
   _startNumberUpdater() {
     if (this._numberInterval) {
       clearInterval(this._numberInterval);
@@ -1371,7 +1371,7 @@ export class ChatServer {
     return true;
   }
   
-  // ✅ FETCH - TANPA DURABLE OBJECTS
+  // ✅ FETCH - TANPA DURABLE OBJECTS (TAPI FORMAT SAMA SEPERTI DO)
   async fetch(req) {
     if (this.closing || this.isDestroyed) {
       return new Response("Shutting down", { status: 503 });
@@ -1391,7 +1391,8 @@ export class ChatServer {
       const pair = new WebSocketPair();
       const [client, server] = [pair[0], pair[1]];
       
-      // ✅ HAPUS: this.state.acceptWebSocket(server);
+      // ✅ HAPUS INI: this.state.acceptWebSocket(server);
+      // ✅ GANTI: WebSocket langsung di-setup
       
       server.username = null;
       server.room = null;

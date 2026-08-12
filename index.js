@@ -10,20 +10,7 @@ let isInitialized = false;
 
 // Helper untuk membuat ChatServer (tanpa Durable Objects)
 function createChatServer(env) {
-  // Mock state untuk kompatibilitas (tanpa Durable Objects)
-  const mockState = {
-    storage: {
-      setAlarm: async () => {},
-      deleteAlarm: async () => {},
-      getAlarm: async () => null,
-    },
-    acceptWebSocket: () => {},
-    waitUntil: (promise) => {
-      promise.catch(e => console.error('Background task error:', e));
-    }
-  };
-  
-  return new ChatServer(mockState, env);
+  return new ChatServer(env);
 }
 
 // Helper untuk membuat GameServer (tanpa Durable Objects)
@@ -39,7 +26,7 @@ export default {
       const url = new URL(request.url);
       const pathname = url.pathname;
       
-      // ✅ INISIALISASI DI AWAL
+      // ==================== INISIALISASI ====================
       if (!isInitialized) {
         try {
           // Initialize Chat Server
@@ -510,9 +497,12 @@ export default {
           uptime: process.uptime ? Math.floor(process.uptime()) : null,
           chatRooms: chatServer?.ROOMS?.length || 0,
           gameRooms: gameServer?.GAME_ROOMS?.length || 0,
+          connections: {
+            chat: chatServer?.wsSet?.size || 0,
+            game: gameServer?.wsMap?.size || 0
+          },
           gameDetails: {
             activeGames: gameServer?.activeGames?.size || 0,
-            wsConnections: gameServer?.wsMap?.size || 0,
             diceActive: !!gameServer?.currentDiceRoll,
             diceRound: gameServer?._diceRound || 0,
             tieActive: gameServer?._tieActive || false

@@ -12,13 +12,10 @@ preview_database_id = "c3524570-7bd8-404b-b573-b24533dc5d31"
 binding = "QUESTIONS"
 id = "556345248fb6411fa1b9bacd4740b922"
 
-# ❌ HAPUS INI (DURABLE OBJECTS) - JANGAN ADA!
-# [durable_objects]
-# bindings = [
-#   { name = "CHAT_SERVER", class_name = "ChatServer" },
-#   { name = "GAME_SERVER", class_name = "GameServer" }
-# ]
-# 
-# [[migrations]]
-# tag = "v1"
-# new_sqlite_classes = ["ChatServer", "GameServer"]
+# WebSocket configuration
+[experimental]
+websocket = true
+
+# Environment variables
+[vars]
+ENVIRONMENT = "production"

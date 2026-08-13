@@ -1,4 +1,4 @@
-// ==================== GAME-SERVER-HEMAT-DURABLE-FINAL.JS ====================
+// ==================== GAME-SERVER-FULL-CLASS.JS ====================
 // ✅ TANPA CPU CHECK
 // ✅ SINGLE MASTER INTERVAL
 // ✅ BROADCAST BUFFERING
@@ -8,6 +8,7 @@
 // ✅ OPTIMAL UNTUK DURABLE OBJECT
 // ✅ PERBAIKAN WEEKLY RESET (TERLEWAT BERAPA JAM/HARI/MINGGU)
 // ✅ TANPA CONSOLE.LOG UNTUK DEPLOY
+// ✅ FULL COMPATIBLE DENGAN CLIENT JAVA ANDROID
 
 const CONSTANTS = {
   MAX_LOWCARD_GAMES: 10,
@@ -554,12 +555,6 @@ export class GameServer {
         }
       } catch(e) {}
     }, 1000);
-
-    setTimeout(() => {
-      if (!this.closing && !this.isDestroyed) {
-        this.forceStartDice();
-      }
-    }, 5000);
   }
 
   // ==================== MASTER TICK ====================
@@ -568,6 +563,7 @@ export class GameServer {
     
     if (now - this._lastDiceTick >= CONSTANTS.DICE_TICK_INTERVAL_MS) {
       this._diceTimerTick();
+      this._autoStartDiceIfNeeded();
       this._lastDiceTick = now;
     }
     
@@ -591,6 +587,43 @@ export class GameServer {
       this._checkAndResetWeeklyDice();
       this._lastResetCheck = now;
     }
+  }
+
+  // ==================== AUTO START DICE ====================
+  _autoStartDiceIfNeeded() {
+    try {
+      if (this._isShowingDice || this._diceTimeUpCooldown || this.currentDiceRoll || this._diceTimeout) {
+        return;
+      }
+      if (this._tieActive) return;
+      
+      const isDiceTime = this._isDiceTime();
+      
+      if (!isDiceTime) {
+        if (this.diceAutoEnabled) {
+          this.diceAutoEnabled = false;
+          if (!this.diceEndNotified) {
+            const timeLeft = this._getTimeLeftUntilNextDice();
+            this._broadcastToRoom(DICE_ROOM, ["diceEnded", { 
+              timeLeft: timeLeft.text, 
+              status: "ended"
+            }]);
+            this.diceEndNotified = true;
+          }
+        }
+        return;
+      }
+      
+      this.diceEndNotified = false;
+      this.diceAutoEnabled = true;
+      
+      const clients = this.wsClients.get(DICE_ROOM);
+      if (!clients || clients.size === 0) return;
+      
+      if (!this.currentDiceRoll && !this._diceTimeout) {
+        this.forceStartDice();
+      }
+    } catch(e) {}
   }
 
   // ==================== BROADCAST ====================
@@ -725,14 +758,18 @@ export class GameServer {
       if (this.isDestroyed || !ws || !data || !data[0]) return;
       const evt = data[0];
 
+      // ==================== SWITCH ROOM ====================
       if (evt === "switchRoom") {
-        const [_, room, username] = data;
+        const room = data[1] || "";
+        const username = data[2] || ws.username || "";
         await this._switchRoom(ws, room, username);
         return;
       }
 
+      // ==================== DICE EVENTS ====================
       if (evt === "submitDiceAnswer") {
-        const [_, username, guess] = data;
+        const username = data[1] || "";
+        const guess = data[2] || 0;
         await this.submitDiceAnswer(ws, username, guess);
         return;
       }
@@ -802,8 +839,9 @@ export class GameServer {
         return;
       }
 
+      // ==================== RECORDING EVENTS ====================
       if (evt === "startRecordingWinners") {
-        const roomName = data[1];
+        const roomName = data[1] || "";
         if (!roomName) {
           this._safeSend(ws, ["recordingError", "Room name required"]);
           return;
@@ -814,7 +852,7 @@ export class GameServer {
       }
 
       if (evt === "stopRecordingWinners") {
-        const roomName = data[1];
+        const roomName = data[1] || "";
         if (!roomName) {
           this._safeSend(ws, ["recordingError", "Room name required"]);
           return;
@@ -825,7 +863,7 @@ export class GameServer {
       }
 
       if (evt === "getRecordingStatus") {
-        const roomName = data[1];
+        const roomName = data[1] || "";
         if (!roomName) {
           this._safeSend(ws, ["recordingError", "Room name required"]);
           return;
@@ -849,13 +887,25 @@ export class GameServer {
       }
 
       if (evt === "sendWinnersToRoom") {
-        const room = data[1];
+        const room = data[1] || "";
         if (!room) {
           this._safeSend(ws, ["recordingError", "Room name required"]);
           return;
         }
         await this._sendWinnersToRoom(room);
         this._safeSend(ws, ["sendWinnersResult", { success: true, message: "Winners data sent to room" }]);
+        return;
+      }
+
+      if (evt === "startGameWithRecording") {
+        const room = data[1] || "";
+        const bet = data[2] || 0;
+        const username = data[3] || "";
+        if (!room || !username) {
+          this._safeSend(ws, ["recordingError", "Room and username required"]);
+          return;
+        }
+        await this._startGameWithRecording(ws, room, bet, username);
         return;
       }
 
@@ -867,6 +917,7 @@ export class GameServer {
         return;
       }
 
+      // ==================== LOWCARD GAME EVENTS ====================
       const room = ws.room || ws.roomname || this.clientRooms.get(ws._wsId);
       if (!room) {
         this._safeSend(ws, ["gameLowCardError", "Please switch to a room first"]);
@@ -875,19 +926,23 @@ export class GameServer {
 
       switch (evt) {
         case "gameLowCardStart":
-          await this._startGame(ws, data[1], data[2]);
+          const usernameStart = data[2] || ws.username || "";
+          await this._startGame(ws, data[1] || 0, usernameStart);
           break;
         case "gameLowCardJoin":
-          await this._joinGame(ws, data[1]);
+          const usernameJoin = data[1] || ws.username || "";
+          await this._joinGame(ws, usernameJoin);
           break;
         case "gameLowCardNumber":
-          await this._submitNumber(ws, data[1], data[2] || "", data[3]);
+          const usernameNumber = data[3] || ws.username || "";
+          await this._submitNumber(ws, data[1] || 0, data[2] || "", usernameNumber);
           break;
         case "gameLowCardLeave":
-          await this._leaveGame(ws, data[1]);
+          const usernameLeave = data[1] || ws.username || "";
+          await this._leaveGame(ws, usernameLeave);
           break;
         case "checkGameRunning":
-          await this._checkGameRunning(ws, data[1]);
+          await this._checkGameRunning(ws, data[1] || room);
           break;
         default:
           break;
@@ -939,7 +994,6 @@ export class GameServer {
     } catch(e) {}
   }
 
-  // ==================== FIX: WEEKLY RESET ====================
   async _checkAndResetWeeklyDice() {
     try {
       if (!this.env?.QUESTIONS) return false;
@@ -1560,6 +1614,60 @@ export class GameServer {
     if (this._tieInterval) clearInterval(this._tieInterval);
   }
 
+  // ==================== SWITCH ROOM ====================
+
+  async _switchRoom(ws, room, username) {
+    try {
+      if (this.isDestroyed) { 
+        this._safeSend(ws, ["gameLowCardError", "Server is shutting down"]); 
+        return; 
+      }
+      if (!room || room.trim() === "") { 
+        this._safeSend(ws, ["gameLowCardError", "Invalid room name"]); 
+        return; 
+      }
+      const roomName = room.trim();
+      const wsId = ws._wsId;
+      if (!wsId) { 
+        this._safeSend(ws, ["gameLowCardError", "Connection error"]); 
+        return; 
+      }
+      
+      let finalUsername = username;
+      if (!finalUsername || finalUsername.trim() === "") {
+        finalUsername = ws.username || "";
+      }
+      
+      const currentRoom = ws.room || ws.roomname || this.clientRooms.get(wsId);
+      if (currentRoom) {
+        this._removeClientFromRoom(currentRoom, wsId);
+      }
+      
+      this._addClient(roomName, ws, finalUsername || null, false);
+      ws.room = roomName;
+      ws.roomname = roomName;
+      if (finalUsername) ws.username = finalUsername;
+      
+      if (finalUsername) {
+        this._safeSend(ws, ["switchRoomSuccess", roomName, finalUsername]);
+      } else {
+        this._safeSend(ws, ["switchRoomSuccess", roomName]);
+      }
+      
+      this._sendGameStateToClient(ws, roomName);
+      
+      this._broadcastToRoom(roomName, ["userJoinedRoom", finalUsername || "", roomName]);
+      if (currentRoom && currentRoom !== roomName) {
+        this._broadcastToRoom(currentRoom, ["userLeftRoom", finalUsername || "", currentRoom]);
+      }
+      
+      if (roomName === DICE_ROOM && this._isDiceTime() && !this.currentDiceRoll && !this._isShowingDice) {
+        this.forceStartDice();
+      }
+      
+    } catch(e) {}
+  }
+
   // ==================== LOWCARD GAME METHODS ====================
 
   _sendGameStateToClient(ws, room) {
@@ -1618,12 +1726,17 @@ export class GameServer {
         this._safeSend(ws, ["gameLowCardError", "Server is shutting down"]);
         return;
       }
-      if (!username?.trim()) {
+      
+      let finalUsername = username;
+      if (!finalUsername || finalUsername.trim() === "") {
+        finalUsername = ws.username || "";
+      }
+      if (!finalUsername || finalUsername.trim() === "") {
         this._safeSend(ws, ["gameLowCardError", "Username is required"]);
         return;
       }
       
-      const usernameClean = username.trim();
+      const usernameClean = finalUsername.trim();
       const room = ws.room || ws.roomname || this.clientRooms.get(ws._wsId);
       if (!room) {
         this._safeSend(ws, ["gameLowCardError", "Please switch to a room first"]);
@@ -1686,18 +1799,110 @@ export class GameServer {
     } catch(e) {}
   }
 
+  async _startGameWithRecording(ws, room, bet, username) {
+    try {
+      if (this.isDestroyed) {
+        this._safeSend(ws, ["recordingError", "Server is shutting down"]);
+        return;
+      }
+      
+      let finalUsername = username;
+      if (!finalUsername || finalUsername.trim() === "") {
+        finalUsername = ws.username || "";
+      }
+      if (!finalUsername || finalUsername.trim() === "") {
+        this._safeSend(ws, ["recordingError", "Username is required"]);
+        return;
+      }
+      
+      const usernameClean = finalUsername.trim();
+      const roomClean = room.trim();
+      
+      if (!roomClean) {
+        this._safeSend(ws, ["recordingError", "Room name required"]);
+        return;
+      }
+      
+      const betAmount = parseInt(bet, 10) || 0;
+      if (betAmount < 0 || (betAmount !== 0 && betAmount < 100) || betAmount > CONSTANTS.MAX_BET) {
+        this._safeSend(ws, ["recordingError", `Invalid bet (0 or 100-${CONSTANTS.MAX_BET})`]);
+        return;
+      }
+      
+      const isRecordingEnabled = await this._getRecordingStatusFromKV(roomClean);
+      if (!isRecordingEnabled) {
+        await this._startRecordingWinners(roomClean);
+      }
+      
+      const existingGame = this.activeGames.get(roomClean);
+      if (existingGame?._isActive && !existingGame._gameEnded) {
+        this._broadcastToRoom(roomClean, ["recordingGameStarted", {
+          room: roomClean,
+          host: usernameClean,
+          bet: betAmount,
+          message: "Game already running with recording"
+        }]);
+        return;
+      }
+      
+      if (existingGame) {
+        await this._forceCleanupGame(roomClean, existingGame);
+      }
+      
+      if (this.activeGames.size >= this._maxGames) {
+        this._safeSend(ws, ["recordingError", "Server is busy"]);
+        return;
+      }
+      
+      const wsId = ws._wsId;
+      const game = {
+        room: roomClean, players: new Map(), botPlayers: new Map(), registrationOpen: true,
+        round: 1, numbers: new Map(), tanda: new Map(), eliminated: new Set(),
+        betAmount, hostId: usernameClean, hostName: usernameClean,
+        evaluationLocked: false, drawTimeExpired: false,
+        _isActive: true, _gameEnded: false, _phase: 'registration',
+        _botTimeouts: new Set(), _botsAdded: false,
+        _evalTimer: null, _safetyTimer: null,
+        _isEvaluating: false, _createdAt: Date.now(), _drawPhaseStart: null,
+        _registrationStartTime: Date.now(),
+        playerWsId: new Map(),
+        _startedBy: 'recording'
+      };
+      
+      game.players.set(usernameClean, { id: usernameClean, name: usernameClean });
+      game.playerWsId.set(usernameClean, wsId);
+      this.activeGames.set(roomClean, game);
+      this._addClient(roomClean, ws, usernameClean, false);
+      
+      this._broadcastToRoom(roomClean, ["gameLowCardStart", betAmount]);
+      this._broadcastToRoom(roomClean, ["gameLowCardStartSuccess", usernameClean, betAmount]);
+      this._broadcastToRoom(roomClean, ["recordingGameStarted", {
+        room: roomClean,
+        host: usernameClean,
+        bet: betAmount,
+        message: "Game started with recording"
+      }]);
+      
+    } catch(e) {}
+  }
+
   async _joinGame(ws, username) {
     try {
       if (this.isDestroyed) {
         this._safeSend(ws, ["gameLowCardError", "Server is shutting down"]);
         return;
       }
-      if (!username?.trim()) {
+      
+      let finalUsername = username;
+      if (!finalUsername || finalUsername.trim() === "") {
+        finalUsername = ws.username || "";
+      }
+      if (!finalUsername || finalUsername.trim() === "") {
         this._safeSend(ws, ["gameLowCardError", "Username is required"]);
         return;
       }
       
-      const usernameClean = username.trim();
+      const usernameClean = finalUsername.trim();
       const wsId = ws._wsId;
       const room = ws.room || ws.roomname || this.clientRooms.get(wsId);
       if (!room) {
@@ -1733,6 +1938,7 @@ export class GameServer {
       game.playerWsId.set(usernameClean, wsId);
       this._broadcastToRoom(room, ["gameLowCardJoin", usernameClean, game.betAmount]);
       this._sendGameStateToClient(ws, room);
+      
     } catch(e) {}
   }
 
@@ -1742,12 +1948,17 @@ export class GameServer {
         this._safeSend(ws, ["gameLowCardError", "Server is shutting down"]);
         return;
       }
-      if (!username?.trim()) {
+      
+      let finalUsername = username;
+      if (!finalUsername || finalUsername.trim() === "") {
+        finalUsername = ws.username || "";
+      }
+      if (!finalUsername || finalUsername.trim() === "") {
         this._safeSend(ws, ["gameLowCardError", "Username is required"]);
         return;
       }
       
-      const usernameClean = username.trim();
+      const usernameClean = finalUsername.trim();
       const room = ws.room || ws.roomname || this.clientRooms.get(ws._wsId);
       if (!room) {
         this._safeSend(ws, ["gameLowCardError", "Please switch to a room first"]);
@@ -1807,12 +2018,17 @@ export class GameServer {
         this._safeSend(ws, ["gameLowCardError", "Server is shutting down"]);
         return;
       }
-      if (!username?.trim()) {
+      
+      let finalUsername = username;
+      if (!finalUsername || finalUsername.trim() === "") {
+        finalUsername = ws.username || "";
+      }
+      if (!finalUsername || finalUsername.trim() === "") {
         this._safeSend(ws, ["gameLowCardError", "Username is required"]);
         return;
       }
       
-      const usernameClean = username.trim();
+      const usernameClean = finalUsername.trim();
       const room = ws.room || ws.roomname || this.clientRooms.get(ws._wsId);
       if (!room) {
         this._safeSend(ws, ["gameLowCardError", "Please switch to a room first"]);
@@ -1831,6 +2047,7 @@ export class GameServer {
       
       this._removePlayerFromGame(usernameClean, room);
       this._sendGameStateToClient(ws, room);
+      
     } catch(e) {}
   }
 
@@ -2141,9 +2358,13 @@ export class GameServer {
         game._botTimeouts = new Set();
         
         const remainingNames = remaining.map(id => players.get(id)?.name || id);
-        this._broadcastToRoom(room, ["gameLowCardRoundResult", game.round - 1,
-          entries.map(([id, n]) => `${players.get(id)?.name || id}:${n}${tanda.get(id) ? `(${tanda.get(id)})` : ''}`),
-          [], remainingNames, true
+        
+        this._broadcastToRoom(room, ["gameLowCardRoundResult", 
+            game.round - 1, 
+            JSON.stringify(entries.map(([id, n]) => `${players.get(id)?.name || id}:${n}${tanda.get(id) ? `(${tanda.get(id)})` : ''}`)), 
+            JSON.stringify([]), 
+            JSON.stringify(remainingNames),
+            true
         ]);
         
         if (this._isGameActuallyRunning(game) && !game._gameEnded) {
@@ -2180,7 +2401,13 @@ export class GameServer {
       const loserNames = [...losers].map(id => players.get(id)?.name || id);
       const remainingNames = remaining.map(id => players.get(id)?.name || id);
       
-      this._broadcastToRoom(room, ["gameLowCardRoundResult", game.round, numbersArr, loserNames, remainingNames]);
+      this._broadcastToRoom(room, ["gameLowCardRoundResult", 
+          game.round, 
+          JSON.stringify(numbersArr), 
+          JSON.stringify(loserNames), 
+          JSON.stringify(remainingNames),
+          false
+      ]);
       
       numbers.clear();
       tanda.clear();
@@ -2327,46 +2554,6 @@ export class GameServer {
       if (!game?._isActive || game._gameEnded || !game?.players) return [];
       return Array.from(game.players.keys()).filter(id => !game.eliminated?.has(id));
     } catch(e) { return []; }
-  }
-
-  // ==================== SWITCH ROOM ====================
-
-  async _switchRoom(ws, room, username) {
-    try {
-      if (this.isDestroyed) { 
-        this._safeSend(ws, ["gameLowCardError", "Server is shutting down"]); 
-        return; 
-      }
-      if (!room || room.trim() === "") { 
-        this._safeSend(ws, ["gameLowCardError", "Invalid room name"]); 
-        return; 
-      }
-      const roomName = room.trim();
-      const wsId = ws._wsId;
-      if (!wsId) { 
-        this._safeSend(ws, ["gameLowCardError", "Connection error"]); 
-        return; 
-      }
-      
-      const currentRoom = ws.room || ws.roomname || this.clientRooms.get(wsId);
-      if (currentRoom) {
-        this._removeClientFromRoom(currentRoom, wsId);
-      }
-      
-      this._addClient(roomName, ws, username || null, false);
-      ws.room = roomName;
-      ws.roomname = roomName;
-      if (username) ws.username = username;
-      
-      this._safeSend(ws, ["switchRoomSuccess", roomName]);
-      this._sendGameStateToClient(ws, roomName);
-      
-      this._broadcastToRoom(roomName, ["userJoinedRoom", username, roomName]);
-      if (currentRoom && currentRoom !== roomName) {
-        this._broadcastToRoom(currentRoom, ["userLeftRoom", username, currentRoom]);
-      }
-      
-    } catch(e) {}
   }
 
   // ==================== HELPER METHODS ====================

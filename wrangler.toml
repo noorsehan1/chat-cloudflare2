@@ -1,66 +1,18 @@
-// ==================== INDEX.JS - DENGAN DURABLE OBJECTS ====================
-import { ChatServer } from "./chat-server.js";
-import { GameServer } from "./game-server.js";
+name = "chat-cloudflare3"
+main = "index.js"
+compatibility_date = "2024-12-12"
 
-export default {
-  async fetch(request, env, ctx) {
-    try {
-      const url = new URL(request.url);
-      const pathname = url.pathname;
-      
-      // ==================== CHAT ROUTES ====================
-      if (pathname === "/ws" || pathname === "/chat" || pathname === "/") {
-        // ✅ PAKAI DURABLE OBJECTS
-        const id = env.CHAT_SERVER.idFromName('default');
-        const stub = env.CHAT_SERVER.get(id);
-        return stub.fetch(request);
-      }
-      
-      // ==================== GAME ROUTES ====================
-      if (pathname === "/game/ws" || pathname === "/game") {
-        // ✅ PAKAI DURABLE OBJECTS
-        const id = env.GAME_SERVER.idFromName('default');
-        const stub = env.GAME_SERVER.get(id);
-        return stub.fetch(request);
-      }
-      
-      // ==================== API ROUTES ====================
-      // ... API routes tetap sama, tapi akses ke Durable Objects
-      
-      // ==================== HEALTH ====================
-      if (pathname === "/health") {
-        return new Response(JSON.stringify({
-          status: "ok",
-          type: "Durable Objects + D1 Database",
-          timestamp: Date.now()
-        }), {
-          status: 200,
-          headers: { 'Content-Type': 'application/json' }
-        });
-      }
-      
-      return new Response(JSON.stringify({
-        name: 'Chat & Game Server',
-        version: '2.0.0',
-        type: 'Durable Objects + D1 Database',
-        endpoints: {
-          chat: '/ws',
-          game: '/game/ws',
-          health: '/health'
-        }
-      }), {
-        status: 200,
-        headers: { 'Content-Type': 'application/json' }
-      });
-      
-    } catch(error) {
-      return new Response(JSON.stringify({
-        error: 'Internal server error',
-        message: error.message
-      }), {
-        status: 500,
-        headers: { 'Content-Type': 'application/json' }
-      });
-    }
-  }
-};
+[durable_objects]
+bindings = [
+  { name = "CHAT_SERVER", class_name = "ChatServer" },
+  { name = "GAME_SERVER", class_name = "GameServer" }
+]
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["ChatServer", "GameServer"]
+
+# ==================== KV STORAGE UNTUK SOAL QUIZ ====================
+[[kv_namespaces]]
+binding = "QUESTIONS"
+id = "2b61fe8b00064736a0054041fda7c2f2"

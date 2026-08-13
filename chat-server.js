@@ -1,5 +1,6 @@
 // ==================== CHAT SERVER - OPTIMIZED ====================
 // Dengan delay 1000ms untuk UI, hemat Durable Objects
+// Optimasi MultiJoin tanpa event tambahan
 
 const C = {
   MAX_SEATS: 35,
@@ -14,6 +15,9 @@ const C = {
   
   // ✅ WAJIB! 1000ms AGAR UI PASTI JALAN
   UI_READY_DELAY: 1000,
+  
+  // ✅ RATE LIMIT MULTIJOIN (5 detik cooldown)
+  MULTIJOIN_COOLDOWN: 5000,
 };
 
 const ROOMS = [
@@ -169,6 +173,11 @@ export class ChatServer {
     this._joinLocks = new Map();
     this._kursiLocks = new Map();
     
+    // ✅ CACHE UNTUK MULTIJOIN
+    this._multiJoinCache = new Map();
+    this._multiJoinTimestamps = new Map();
+    this._roomCountCache = new Map();
+    
     // Number
     this.currentNumber = 1;
     this._numberUpdateTime = Date.now();
@@ -211,6 +220,14 @@ export class ChatServer {
       for (const [key, time] of this._kursiLocks) {
         if (now - time > C.LOCK_TIMEOUT) {
           this._kursiLocks.delete(key);
+        }
+      }
+      
+      // ✅ CLEANUP MULTIJOIN CACHE
+      for (const [key, time] of this._multiJoinTimestamps) {
+        if (now - time > 60000) { // 1 menit
+          this._multiJoinTimestamps.delete(key);
+          this._multiJoinCache.delete(key.replace('mj_', ''));
         }
       }
     } catch(e) {}
@@ -263,21 +280,22 @@ export class ChatServer {
           this.userSeat.delete(username);
           this.userRoom.delete(username);
         }
-      }
-      
-      // ✅ CLEANUP TIMEOUT YANG SUDAH JATUH TEMPO
-      const now = Date.now();
-      for (const timeout of this._pendingTimeouts) {
-        if (timeout._expired && timeout._expired < now) {
-          clearTimeout(timeout);
-          this._pendingTimeouts.delete(timeout);
-        }
+        // ✅ CLEANUP CACHE
+        this._multiJoinCache.delete(username);
       }
       
       // Cleanup empty room points
       for (const [roomName, roomMan] of this.rooms) {
         if (roomMan.getCount() === 0 && roomMan.points.size > 0) {
           roomMan.points.clear();
+        }
+      }
+      
+      // ✅ CLEANUP ROOM COUNT CACHE
+      for (const [roomName, count] of this._roomCountCache) {
+        const roomMan = this.rooms.get(roomName);
+        if (!roomMan || roomMan.getCount() !== count) {
+          this._roomCountCache.delete(roomName);
         }
       }
       
@@ -382,11 +400,26 @@ export class ChatServer {
       const roomMan = this.rooms.get(room);
       if (!roomMan) return 0;
       const count = roomMan.getCount();
+      
+      // ✅ UPDATE CACHE
+      this._roomCountCache.set(room, count);
+      
       this.broadcast(room, ["roomUserCount", room, count]);
       return count;
     } catch(e) {
       return 0;
     }
+  }
+  
+  // ✅ GET ROOM COUNT DARI CACHE
+  getRoomCount(room) {
+    if (this._roomCountCache.has(room)) {
+      return this._roomCountCache.get(room);
+    }
+    const roomMan = this.rooms.get(room);
+    const count = roomMan?.getCount() || 0;
+    this._roomCountCache.set(room, count);
+    return count;
   }
   
   sendAllStateTo(ws, room, excludeSelf = false) {
@@ -563,20 +596,34 @@ export class ChatServer {
           const multiRoomname = args[1];
           if (!multiUsername || !multiRoomname || this.closing || this.isDestroyed) break;
           
+          // ✅ RATE LIMIT MULTIJOIN (5 detik cooldown)
+          const now = Date.now();
+          const key = `mj_${multiUsername}`;
+          if (this._multiJoinTimestamps.has(key) && now - this._multiJoinTimestamps.get(key) < C.MULTIJOIN_COOLDOWN) {
+            this.safeSend(ws, ["multiJoinThrottled", multiUsername]);
+            break;
+          }
+          this._multiJoinTimestamps.set(key, now);
+          
+          // ✅ CEK CACHE
+          const cached = this._multiJoinCache.get(multiUsername);
+          if (cached && cached.room === multiRoomname) {
+            this.safeSend(ws, ["rooMasukMulti", cached.seat, multiRoomname]);
+            break;
+          }
+          
           try {
-            let existingSeat = null, existingRoom = null;
-            for (const [roomName, roomMan] of this.rooms) {
-              if (!roomMan) continue;
-              for (const [seat, seatData] of roomMan.seats) {
-                if (seatData?.namauser === multiUsername) {
-                  existingSeat = seat;
-                  existingRoom = roomName;
-                  break;
-                }
-              }
-              if (existingSeat) break;
+            // ✅ OPTIMASI: CEK USER SEAT (TANPA LOOP SEMUA ROOM)
+            const existingSeatInfo = this.userSeat.get(multiUsername);
+            let existingSeat = null;
+            let existingRoom = null;
+            
+            if (existingSeatInfo) {
+              existingSeat = existingSeatInfo.seat;
+              existingRoom = existingSeatInfo.room;
             }
             
+            // ✅ HAPUS DARI ROOM LAMA (JIKA ADA)
             if (existingSeat && existingRoom) {
               const oldRoomMan = this.rooms.get(existingRoom);
               if (oldRoomMan) {
@@ -586,18 +633,20 @@ export class ChatServer {
               }
               this.userSeat.delete(multiUsername);
               this.userRoom.delete(multiUsername);
+              this._multiJoinCache.delete(multiUsername);
             }
-          } catch(e) {}
-          
-          const roomMan = this.rooms.get(multiRoomname);
-          if (!roomMan || roomMan.getCount() >= C.MAX_SEATS) break;
-          
-          const seat = roomMan.addSeat(multiUsername, "", "", 0, 0, 0, 0);
-          if (!seat) break;
-          
-          try {
+            
+            // ✅ TAMBAHKAN KE ROOM BARU
+            const roomMan = this.rooms.get(multiRoomname);
+            if (!roomMan || roomMan.getCount() >= C.MAX_SEATS) break;
+            
+            const seat = roomMan.addSeat(multiUsername, "", "", 0, 0, 0, 0);
+            if (!seat) break;
+            
+            // ✅ UPDATE DATA
             this.userSeat.set(multiUsername, { room: multiRoomname, seat, isMulti: true });
             this.userRoom.set(multiUsername, multiRoomname);
+            this._multiJoinCache.set(multiUsername, { room: multiRoomname, seat });
             
             let connections = this.userConnections.get(multiUsername);
             if (!connections) connections = new Set();
@@ -610,6 +659,7 @@ export class ChatServer {
             
             this.safeSend(ws, ["rooMasukMulti", seat, multiRoomname]);
             this.broadcast(multiRoomname, ["roomUserCount", multiRoomname, roomMan.getCount()]);
+            
           } catch(e) {}
           break;
         }
@@ -641,6 +691,7 @@ export class ChatServer {
             
             this.userSeat.delete(targetUsername);
             this.userRoom.delete(targetUsername);
+            this._multiJoinCache.delete(targetUsername);
             
             const connections = this.userConnections.get(targetUsername);
             if (connections) {
@@ -762,6 +813,7 @@ export class ChatServer {
                 if (info.seat === removeSeat && info.room === removeRoom) {
                   this.userSeat.delete(username);
                   this.userRoom.delete(username);
+                  this._multiJoinCache.delete(username);
                   break;
                 }
               }
@@ -1074,6 +1126,7 @@ export class ChatServer {
           
           this.userSeat.delete(username);
           this.userRoom.delete(username);
+          this._multiJoinCache.delete(username);
           
         } catch(e) {}
       }
@@ -1098,6 +1151,7 @@ export class ChatServer {
       try {
         this.userSeat.delete(username);
         this.userRoom.delete(username);
+        this._multiJoinCache.delete(username);
       } catch(e) {}
       
       try {
@@ -1174,6 +1228,7 @@ export class ChatServer {
         if (oldClients) oldClients.delete(ws);
         this.userSeat.delete(username);
         this.userRoom.delete(username);
+        this._multiJoinCache.delete(username);
       } catch(e) {}
       ws.room = null;
       ws.roomname = null;
@@ -1325,6 +1380,11 @@ export class ChatServer {
       clearTimeout(timeout);
     }
     this._pendingTimeouts.clear();
+    
+    // ✅ CLEANUP CACHE
+    this._multiJoinCache.clear();
+    this._multiJoinTimestamps.clear();
+    this._roomCountCache.clear();
     
     this._joinLocks.clear();
     this._kursiLocks.clear();

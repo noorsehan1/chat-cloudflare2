@@ -1,6 +1,5 @@
-// ==================== CHAT SERVER - chat-cloudflare3 ====================
-// OPTIMIZED FOR CLOUDFLARE FREE PLAN
-// Minimal CPU, Memory, dan Durable Objects usage
+// ==================== CHAT SERVER - OPTIMIZED ====================
+// Dengan delay 1000ms untuk UI, hemat Durable Objects
 
 const C = {
   MAX_SEATS: 35,
@@ -12,6 +11,9 @@ const C = {
   MAX_ROOM_CLIENTS: 200,
   NUMBER_UPDATE_INTERVAL: 900000,  // 15 menit
   MAX_NUMBER: 6,
+  
+  // ✅ WAJIB! 1000ms AGAR UI PASTI JALAN
+  UI_READY_DELAY: 1000,
 };
 
 const ROOMS = [
@@ -263,6 +265,15 @@ export class ChatServer {
         }
       }
       
+      // ✅ CLEANUP TIMEOUT YANG SUDAH JATUH TEMPO
+      const now = Date.now();
+      for (const timeout of this._pendingTimeouts) {
+        if (timeout._expired && timeout._expired < now) {
+          clearTimeout(timeout);
+          this._pendingTimeouts.delete(timeout);
+        }
+      }
+      
       // Cleanup empty room points
       for (const [roomName, roomMan] of this.rooms) {
         if (roomMan.getCount() === 0 && roomMan.points.size > 0) {
@@ -435,6 +446,12 @@ export class ChatServer {
     try {
       const username = ws.username;
       const room = ws.room;
+      
+      // ✅ CLEANUP TIMEOUT
+      if (ws._stateTimeoutId) {
+        clearTimeout(ws._stateTimeoutId);
+        this._pendingTimeouts.delete(ws._stateTimeoutId);
+      }
       
       if (room) {
         try {
@@ -1196,6 +1213,7 @@ export class ChatServer {
       const roomClients = this.roomClients.get(roomName);
       if (roomClients && !roomClients.has(ws)) roomClients.add(ws);
       
+      // Kirim data join
       this.safeSend(ws, ["rooMasuk", seat, roomName]);
       this.safeSend(ws, ["numberKursiSaya", seat]);
       this.safeSend(ws, ["muteTypeResponse", roomMan.getMuted(), roomName]);
@@ -1203,8 +1221,17 @@ export class ChatServer {
       
       this.updateRoomCount(roomName);
       
-      // ✅ LANGSUNG KIRIM STATE (TANPA TIMEOUT)
-      this.sendAllStateTo(ws, roomName, true);
+      // ✅ DELAY 1000ms = PASTI UI SIAP
+      const stateTimeout = setTimeout(() => {
+        try {
+          if (ws && ws.readyState === 1 && !this.closing && !this.isDestroyed) {
+            this.sendAllStateTo(ws, roomName, true);
+          }
+        } catch(e) {}
+      }, C.UI_READY_DELAY);
+      
+      this._pendingTimeouts.add(stateTimeout);
+      ws._stateTimeoutId = stateTimeout;
       
     } catch(e) {}
     
@@ -1220,7 +1247,7 @@ export class ChatServer {
     try {
       const upgrade = req.headers.get("Upgrade");
       if (upgrade !== "websocket") {
-        return new Response("Chat Server - chat-cloudflare3", { 
+        return new Response("Chat Server - Optimized", { 
           status: 200,
           headers: {
             "Cache-Control": "no-cache"
@@ -1266,6 +1293,11 @@ export class ChatServer {
   async webSocketClose(ws) { 
     if (!ws) return;
     try {
+      // ✅ CLEANUP TIMEOUT
+      if (ws._stateTimeoutId) {
+        clearTimeout(ws._stateTimeoutId);
+        this._pendingTimeouts.delete(ws._stateTimeoutId);
+      }
       this.cleanup(ws);
     } catch(e) {}
   }
@@ -1273,6 +1305,11 @@ export class ChatServer {
   async webSocketError(ws) { 
     if (!ws) return;
     try {
+      // ✅ CLEANUP TIMEOUT
+      if (ws._stateTimeoutId) {
+        clearTimeout(ws._stateTimeoutId);
+        this._pendingTimeouts.delete(ws._stateTimeoutId);
+      }
       this.cleanup(ws);
     } catch(e) {}
   }
@@ -1283,13 +1320,14 @@ export class ChatServer {
     this.closing = true;
     this.isDestroyed = true;
     
-    this._joinLocks.clear();
-    this._kursiLocks.clear();
-    
+    // ✅ CLEANUP ALL TIMEOUTS
     for (const timeout of this._pendingTimeouts) {
       clearTimeout(timeout);
     }
     this._pendingTimeouts.clear();
+    
+    this._joinLocks.clear();
+    this._kursiLocks.clear();
     
     if (this._cleanupInterval) {
       clearInterval(this._cleanupInterval);

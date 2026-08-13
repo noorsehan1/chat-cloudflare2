@@ -1,21 +1,66 @@
-name = "chat-cloudflare2"
-main = "index.js"
-compatibility_date = "2024-12-18"
+// ==================== INDEX.JS - DENGAN DURABLE OBJECTS ====================
+import { ChatServer } from "./chat-server.js";
+import { GameServer } from "./game-server.js";
 
-[[d1_databases]]
-binding = "DB"
-database_name = "chat-db"
-database_id = "c3524570-7bd8-404b-b573-b24533dc5d31"
-preview_database_id = "c3524570-7bd8-404b-b573-b24533dc5d31"
-
-[[kv_namespaces]]
-binding = "QUESTIONS"
-id = "556345248fb6411fa1b9bacd4740b922"
-
-# WebSocket configuration
-[experimental]
-websocket = true
-
-# Environment variables
-[vars]
-ENVIRONMENT = "production"
+export default {
+  async fetch(request, env, ctx) {
+    try {
+      const url = new URL(request.url);
+      const pathname = url.pathname;
+      
+      // ==================== CHAT ROUTES ====================
+      if (pathname === "/ws" || pathname === "/chat" || pathname === "/") {
+        // ✅ PAKAI DURABLE OBJECTS
+        const id = env.CHAT_SERVER.idFromName('default');
+        const stub = env.CHAT_SERVER.get(id);
+        return stub.fetch(request);
+      }
+      
+      // ==================== GAME ROUTES ====================
+      if (pathname === "/game/ws" || pathname === "/game") {
+        // ✅ PAKAI DURABLE OBJECTS
+        const id = env.GAME_SERVER.idFromName('default');
+        const stub = env.GAME_SERVER.get(id);
+        return stub.fetch(request);
+      }
+      
+      // ==================== API ROUTES ====================
+      // ... API routes tetap sama, tapi akses ke Durable Objects
+      
+      // ==================== HEALTH ====================
+      if (pathname === "/health") {
+        return new Response(JSON.stringify({
+          status: "ok",
+          type: "Durable Objects + D1 Database",
+          timestamp: Date.now()
+        }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' }
+        });
+      }
+      
+      return new Response(JSON.stringify({
+        name: 'Chat & Game Server',
+        version: '2.0.0',
+        type: 'Durable Objects + D1 Database',
+        endpoints: {
+          chat: '/ws',
+          game: '/game/ws',
+          health: '/health'
+        }
+      }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' }
+      });
+      
+    } catch(error) {
+      return new Response(JSON.stringify({
+        error: 'Internal server error',
+        message: error.message
+      }), {
+        status: 500,
+        headers: { 'Content-Type': 'application/json' }
+      });
+    }
+  }
+};

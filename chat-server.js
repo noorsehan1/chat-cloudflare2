@@ -1,4 +1,4 @@
-// ==================== CHAT SERVER - TANPA DURABLE OBJECTS ====================
+// ==================== CHAT SERVER - TANPA COUNTRY ====================
 
 const C = {
   MAX_SEATS: 45,
@@ -11,7 +11,6 @@ const C = {
   LOCK_TIMEOUT: 10000,
   CLEANUP_INTERVAL: 30000,
   MAX_ROOM_CLIENTS: 500,
-  MAX_CHAT_HISTORY: 100,
 };
 
 const ROOMS = [
@@ -22,98 +21,14 @@ const ROOMS = [
 
 const ROOMS_SET = new Set(ROOMS);
 
-// ==================== ROOM MANAGER CLASS ====================
 class RoomManager {
-  constructor(name, db) {
+  constructor(name) {
     this.name = name;
     this.seats = new Map();
     this.points = new Map();
     this.muted = false;
     this.number = 1;
     this.lastActivity = Date.now();
-    this.db = db;
-    this._loading = false;
-    this._loaded = false;
-  }
-
-  async loadState() {
-    if (this._loading || this._loaded) return;
-    this._loading = true;
-    
-    try {
-      if (this.db) {
-        // Load room data dari D1
-        const roomData = await this.db.prepare(
-          'SELECT * FROM chat_rooms WHERE room_name = ?'
-        ).bind(this.name).first();
-        
-        if (roomData) {
-          this.muted = roomData.muted === 1;
-          this.number = roomData.current_number || 1;
-          
-          // Load seats dari D1
-          const seats = await this.db.prepare(
-            'SELECT seat_number, username, noimage_url, color, item_bawah, item_atas, vip, vip_tanda FROM chat_seats WHERE room_name = ?'
-          ).bind(this.name).all();
-          
-          for (const seat of seats.results || []) {
-            this.seats.set(seat.seat_number, {
-              noimageUrl: seat.noimage_url || "",
-              namauser: seat.username || "",
-              color: seat.color || "",
-              itembawah: seat.item_bawah || 0,
-              itematas: seat.item_atas || 0,
-              vip: seat.vip || 0,
-              viptanda: seat.vip_tanda || 0,
-            });
-          }
-        }
-      }
-    } catch(e) {
-      // Silently continue
-    } finally {
-      this._loaded = true;
-      this._loading = false;
-    }
-  }
-
-  async saveState() {
-    try {
-      if (!this.db) return;
-      
-      // Save room state
-      await this.db.prepare(
-        `INSERT OR REPLACE INTO chat_rooms (room_name, muted, current_number, last_activity)
-         VALUES (?, ?, ?, ?)`
-      ).bind(this.name, this.muted ? 1 : 0, this.number, Date.now()).run();
-      
-      // Save seats
-      await this.db.prepare(
-        'DELETE FROM chat_seats WHERE room_name = ?'
-      ).bind(this.name).run();
-      
-      const seatsData = [];
-      for (const [seat, data] of this.seats) {
-        seatsData.push([
-          this.name, seat, data.namauser || "", data.noimageUrl || "",
-          data.color || "", data.itembawah || 0, data.itematas || 0,
-          data.vip || 0, data.vip_tanda || 0
-        ]);
-      }
-      
-      if (seatsData.length > 0) {
-        const stmt = this.db.prepare(
-          `INSERT INTO chat_seats (room_name, seat_number, username, noimage_url, color, item_bawah, item_atas, vip, vip_tanda)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
-        );
-        
-        for (const data of seatsData) {
-          await stmt.bind(...data).run();
-        }
-      }
-    } catch(e) {
-      // Silently continue
-    }
   }
 
   getAvailableSeat() {
@@ -143,10 +58,6 @@ class RoomManager {
       viptanda: viptanda || 0,
     });
     this.lastActivity = Date.now();
-    
-    // Save to DB async
-    this.saveState().catch(() => {});
-    
     return seat;
   }
 
@@ -163,24 +74,13 @@ class RoomManager {
       viptanda: data.viptanda || 0
     });
     this.lastActivity = Date.now();
-    
-    // Save to DB async
-    this.saveState().catch(() => {});
-    
     return true;
   }
 
   removeSeat(seat) {
     this.points.delete(seat);
     this.lastActivity = Date.now();
-    const result = this.seats.delete(seat);
-    
-    // Save to DB async
-    if (result) {
-      this.saveState().catch(() => {});
-    }
-    
-    return result;
+    return this.seats.delete(seat);
   }
   
   getSeat(seat) { 
@@ -201,10 +101,6 @@ class RoomManager {
   setMuted(val) { 
     this.muted = !!val; 
     this.lastActivity = Date.now();
-    
-    // Save to DB async
-    this.saveState().catch(() => {});
-    
     return this.muted; 
   }
   
@@ -212,9 +108,6 @@ class RoomManager {
   
   setNumber(n) { 
     this.number = n || 1; 
-    
-    // Save to DB async
-    this.saveState().catch(() => {});
   }
   getNumber() { return this.number; }
 
@@ -245,15 +138,12 @@ class RoomManager {
   }
 }
 
-// ==================== CHAT SERVER CLASS ====================
 export class ChatServer {
-  constructor(env) {
+  constructor(state, env) {
+    this.state = state;
     this.env = env;
-    this.db = env.DB; // D1 Database
     this.closing = false;
     this.isDestroyed = false;
-    this._initPromise = null;
-    this._initialized = false;
     
     this.wsSet = new Set();
     this.userConnections = new Map();
@@ -262,8 +152,6 @@ export class ChatServer {
     this.roomClients = new Map();
     this.rooms = new Map();
     this.wsActiveMulti = new Map();
-    this.ROOMS = ROOMS;
-    this.ROOMS_SET = ROOMS_SET;
     
     this._processingMessages = new Set();
     this._cleaningUp = new Set();
@@ -278,140 +166,17 @@ export class ChatServer {
     
     this.currentNumber = 1;
     this._tikCounter = 0;
-    this._numberInterval = null;
     
-    // Initialize rooms
     for (const room of ROOMS) {
-      this.rooms.set(room, new RoomManager(room, this.db));
+      this.rooms.set(room, new RoomManager(room));
       this.roomClients.set(room, new Set());
     }
     
-    // Load all room states
-    this._initPromise = this._initRooms();
-    
-    // Setup periodic cleanup
     this._setupPeriodicCleanup();
     
-    // Start number update
-    this._startNumberUpdater();
-  }
-  
-  async _initRooms() {
     try {
-      // Ensure tables exist
-      await this._ensureTables();
-      
-      // Load all rooms
-      const loadPromises = [];
-      for (const room of this.rooms.values()) {
-        loadPromises.push(room.loadState());
-      }
-      await Promise.all(loadPromises);
-      
-      // Get current number from first room
-      const firstRoom = this.rooms.get(ROOMS[0]);
-      if (firstRoom) {
-        this.currentNumber = firstRoom.getNumber();
-      }
-      
-      this._initialized = true;
-    } catch(e) {
-      // Continue even if DB fails
-      this._initialized = true;
-    }
-  }
-  
-  async _ensureTables() {
-    try {
-      if (!this.db) return;
-      
-      // Create chat_rooms table
-      await this.db.prepare(`
-        CREATE TABLE IF NOT EXISTS chat_rooms (
-          room_name TEXT PRIMARY KEY,
-          muted INTEGER DEFAULT 0,
-          current_number INTEGER DEFAULT 1,
-          last_activity INTEGER DEFAULT 0
-        )
-      `).run();
-      
-      // Create chat_seats table
-      await this.db.prepare(`
-        CREATE TABLE IF NOT EXISTS chat_seats (
-          room_name TEXT,
-          seat_number INTEGER,
-          username TEXT,
-          noimage_url TEXT,
-          color TEXT,
-          item_bawah INTEGER DEFAULT 0,
-          item_atas INTEGER DEFAULT 0,
-          vip INTEGER DEFAULT 0,
-          vip_tanda INTEGER DEFAULT 0,
-          PRIMARY KEY (room_name, seat_number)
-        )
-      `).run();
-      
-      // Create chat_messages table
-      await this.db.prepare(`
-        CREATE TABLE IF NOT EXISTS chat_messages (
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          room_name TEXT,
-          username TEXT,
-          message TEXT,
-          noimage_url TEXT,
-          color TEXT,
-          text_color TEXT,
-          timestamp INTEGER DEFAULT 0
-        )
-      `).run();
-      
-      // Initialize rooms in DB
-      for (const room of ROOMS) {
-        await this.db.prepare(
-          `INSERT OR IGNORE INTO chat_rooms (room_name, muted, current_number, last_activity)
-           VALUES (?, 0, 1, ?)`
-        ).bind(room, Date.now()).run();
-      }
-    } catch(e) {
-      // Silently continue
-    }
-  }
-  
-  _startNumberUpdater() {
-    // Update number every 10 seconds
-    this._numberInterval = setInterval(() => {
-      if (this.closing || this.isDestroyed) {
-        clearInterval(this._numberInterval);
-        this._numberInterval = null;
-        return;
-      }
-      
-      this._tikCounter++;
-      
-      if (this._tikCounter >= C.NUMBER_UPDATE_TIK) {
-        this.currentNumber = this.currentNumber < C.MAX_NUMBER ? this.currentNumber + 1 : 1;
-        
-        // Update all rooms
-        for (const room of this.rooms.values()) {
-          if (room) {
-            room.setNumber(this.currentNumber);
-          }
-        }
-        
-        const numberMsg = JSON.stringify(["currentNumber", this.currentNumber]);
-        
-        for (const [room, clients] of this.roomClients) {
-          if (clients && clients.size > 0 && clients.size <= C.MAX_ROOM_CLIENTS) {
-            this._broadcastToRoom(room, numberMsg);
-          }
-        }
-        
-        this._tikCounter = 0;
-      }
-      
-      this._doCleanup();
-      
-    }, C.ALARM_10_DETIK);
+      this.state.storage.setAlarm(Date.now() + C.ALARM_10_DETIK);
+    } catch(e) {}
   }
   
   _setupPeriodicCleanup() {
@@ -482,6 +247,41 @@ export class ChatServer {
           }
         }
       }
+    } catch(e) {}
+  }
+  
+  async alarm() {
+    if (this.closing || this.isDestroyed) return;
+    
+    try {
+      this._tikCounter++;
+      
+      if (this._tikCounter >= C.NUMBER_UPDATE_TIK) {
+        this.currentNumber = this.currentNumber < C.MAX_NUMBER ? this.currentNumber + 1 : 1;
+        
+        for (const room of this.rooms.values()) {
+          if (room) {
+            room.setNumber(this.currentNumber);
+          }
+        }
+        
+        const numberMsg = JSON.stringify(["currentNumber", this.currentNumber]);
+        
+        for (const [room, clients] of this.roomClients) {
+          if (clients && clients.size > 0 && clients.size <= C.MAX_ROOM_CLIENTS) {
+            this._broadcastToRoom(room, numberMsg);
+          }
+        }
+        
+        this._tikCounter = 0;
+      }
+      
+      this._doCleanup();
+      
+    } catch(e) {}
+    
+    try {
+      this.state.storage.setAlarm(Date.now() + C.ALARM_10_DETIK);
     } catch(e) {}
   }
   
@@ -819,11 +619,6 @@ export class ChatServer {
         if (room && !ROOMS_SET.has(room)) return;
       }
       
-      // ==== Wait for initialization ====
-      if (!this._initialized) {
-        await this._initPromise;
-      }
-      
       switch(evt) {
         case "setIdTarget2":
           await this.handleSetId(ws, args[0], args[1]);
@@ -839,7 +634,6 @@ export class ChatServer {
           if (!multiUsername || !multiRoomname || this.closing || this.isDestroyed) break;
           
           try {
-            // Remove existing multi user
             let existingSeat = null, existingRoom = null;
             for (const [roomName, roomMan] of this.rooms) {
               if (!roomMan) continue;
@@ -1037,17 +831,6 @@ export class ChatServer {
             if (!clients || clients.size === 0) break;
             
             this._broadcastToRoom(chatRoom, JSON.stringify(["chat", chatRoom, chatNoimg, chatUser, chatMsg, chatColor, chatTextColor]));
-            
-            // Save chat history to DB
-            if (this.db) {
-              try {
-                await this.db.prepare(
-                  `INSERT INTO chat_messages (room_name, username, message, noimage_url, color, text_color, timestamp)
-                   VALUES (?, ?, ?, ?, ?, ?, ?)`
-                ).bind(chatRoom, chatUser, chatMsg, chatNoimg || "", chatColor || "", chatTextColor || "", Date.now()).run();
-              } catch(e) {}
-            }
-            
           } catch(e) {}
           break;
         }
@@ -1278,42 +1061,6 @@ export class ChatServer {
             if (getMuteRoom && ROOMS_SET.has(getMuteRoom)) {
               const rm = this.rooms.get(getMuteRoom);
               this.safeSend(ws, ["muteTypeResponse", rm?.getMuted() || false, getMuteRoom]);
-            }
-          } catch(e) {}
-          break;
-        }
-        
-        case "getLastChats": {
-          try {
-            const [chatRoom, limit] = args;
-            if (!chatRoom || !ROOMS_SET.has(chatRoom)) break;
-            
-            if (this.db) {
-              const messages = await this.db.prepare(
-                `SELECT username, message, noimage_url, color, text_color, timestamp
-                 FROM chat_messages
-                 WHERE room_name = ?
-                 ORDER BY timestamp DESC
-                 LIMIT ?`
-              ).bind(chatRoom, limit || 50).all();
-              
-              this.safeSend(ws, ["chatHistory", chatRoom, (messages.results || []).reverse()]);
-            }
-          } catch(e) {}
-          break;
-        }
-        
-        case "clearChatHistory": {
-          try {
-            const [clearRoom] = args;
-            if (!clearRoom || !ROOMS_SET.has(clearRoom)) break;
-            
-            if (this.db) {
-              await this.db.prepare(
-                'DELETE FROM chat_messages WHERE room_name = ?'
-              ).bind(clearRoom).run();
-              
-              this.safeSend(ws, ["chatHistoryCleared", clearRoom]);
             }
           } catch(e) {}
           break;
@@ -1641,6 +1388,14 @@ export class ChatServer {
       server._timeoutId = timeoutId;
       this._pendingTimeouts.add(timeoutId);
       
+      try { 
+        this.state.acceptWebSocket(server);
+      } catch(e) { 
+        clearTimeout(timeoutId);
+        this._pendingTimeouts.delete(timeoutId);
+        return new Response("WebSocket acceptance failed", { status: 500 }); 
+      }
+      
       server.username = null;
       server.room = null;
       server.roomname = null;
@@ -1651,20 +1406,6 @@ export class ChatServer {
       if (!this.wsSet.has(server)) {
         this.wsSet.add(server);
       }
-      
-      server.addEventListener("message", async (event) => {
-        try {
-          await this.webSocketMessage(server, event.data);
-        } catch(e) {}
-      });
-      
-      server.addEventListener("close", () => {
-        this.webSocketClose(server);
-      });
-      
-      server.addEventListener("error", () => {
-        this.webSocketError(server);
-      });
       
       return new Response(null, { status: 101, webSocket: client });
       
@@ -1709,10 +1450,6 @@ export class ChatServer {
     
     if (this._cleanupInterval) {
       clearInterval(this._cleanupInterval);
-    }
-    
-    if (this._numberInterval) {
-      clearInterval(this._numberInterval);
     }
     
     const wsCopy = Array.from(this.wsSet);

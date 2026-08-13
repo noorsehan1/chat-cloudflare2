@@ -1,4 +1,4 @@
-// ==================== GAME-SERVER.JS - TANPA DURABLE OBJECTS ====================
+// ==================== GAME-SERVER.JS - FIXED VERSION ====================
 
 const CONSTANTS = {
   MAX_LOWCARD_GAMES: 10,
@@ -385,16 +385,15 @@ class DiceGameSystem {
 
 // ==================== GAME SERVER CLASS ====================
 export class GameServer extends CPUProtection {
-  constructor(env) {
+  constructor(state, env) {
     try {
       super();
+      this.state = state;
       this.env = env;
-      this.db = env.DB; // D1 Database
       this.closing = false;
       this.isDestroyed = false;
       this._initialized = false;
       this._initializing = false;
-      this.GAME_ROOMS = ["Quiz", "Gacor", "LowCard", "General"];
 
       this._restartCount = 0;
       this._lastRestartTime = 0;
@@ -516,7 +515,10 @@ export class GameServer extends CPUProtection {
 
       this.diceGameSystem = new DiceGameSystem(this);
 
-      // ==================== FIX: 1 INTERVAL SAJA UNTUK SEMUA ====================
+      // ==================== ✅ FIX: 1 INTERVAL SAJA UNTUK SEMUA ====================
+      // HAPUS SEMUA interval YANG BERJALAN BERBEDA
+      // GANTI DENGAN 1 INTERVAL SAJA
+      
       this._mainInterval = setInterval(() => {
         try {
           if (this.closing || this.isDestroyed) {
@@ -553,6 +555,8 @@ export class GameServer extends CPUProtection {
           // DIAM SAJA, JANGAN CRASH
         }
       }, 10000); // JALANKAN SETIAP 10 DETIK
+      
+      // ==================== END FIX ====================
 
       // TETAP JALANKAN INIT ASYNC
       this._initAsync();
@@ -872,8 +876,12 @@ export class GameServer extends CPUProtection {
     } catch(e) {}
   }
 
+  // ==================== ✅ FIX: TANPA INTERVAL BARU ====================
   _startDiceAutoChecker() {
     try {
+      // HAPUS interval, PANGGIL MANUAL SAJA
+      // TIDAK PERLU INTERVAL KARENA SUDAH ADA _mainInterval
+      
       // PANGGIL SEKALI SAAT START
       setTimeout(() => {
         if (!this.closing && !this.isDestroyed) {
@@ -1456,8 +1464,10 @@ export class GameServer extends CPUProtection {
     } catch(e) {}
   }
 
+  // ==================== ✅ FIX: TANPA INTERVAL BARU ====================
   _startDiceTimerNotifications() {
     try {
+      // HAPUS interval, GANTI DENGAN TIMEOUT
       if (this._diceTimerTimeout) {
         clearTimeout(this._diceTimerTimeout);
         this._diceTimerTimeout = null;
@@ -1485,6 +1495,7 @@ export class GameServer extends CPUProtection {
     } catch(e) {}
   }
 
+  // ==================== ✅ FIX: TAMBAH METHOD TIMER TICK ====================
   _diceTimerTick() {
     try {
       if (!this.currentDiceRoll || !this._diceQuestionStartTime) {
@@ -2107,6 +2118,7 @@ export class GameServer extends CPUProtection {
     let notified5 = false;
     let isProcessed = false;
     
+    // ✅ FIX: PAKAI INTERVAL TAPI HANYA UNTUK TIE BREAKER
     this._tieInterval = setInterval(() => {
       timeLeft--;
       
@@ -2529,6 +2541,7 @@ export class GameServer extends CPUProtection {
           }
         }
         
+        // ✅ TAMBAHKAN CPU YIELD
         if (Date.now() - startTime > 8) {
           await this._cpuYield();
           startTime = Date.now();
@@ -2730,6 +2743,7 @@ export class GameServer extends CPUProtection {
           }
         }
         
+        // ✅ TAMBAHKAN CPU YIELD
         if (Date.now() - startTime > 8) {
           await this._cpuYield();
           startTime = Date.now();
@@ -3132,6 +3146,7 @@ export class GameServer extends CPUProtection {
     } catch(e) {}
   }
 
+  // ==================== ✅ FIX: TAMBAHKAN CPU YIELD DI BROADCAST ====================
   async _broadcastToRoom(room, message) {
     try {
       if (this.closing || this.isDestroyed || !room || !message) return;
@@ -3153,6 +3168,7 @@ export class GameServer extends CPUProtection {
           }
         }
         
+        // ✅ TAMBAHKAN CPU YIELD
         if (Date.now() - startTime > 8) {
           await this._cpuYield();
           startTime = Date.now();
@@ -3664,6 +3680,7 @@ export class GameServer extends CPUProtection {
     } catch(e) {}
   }
 
+  // ==================== ✅ FIX: TAMBAHKAN CPU YIELD DI EVALUATE ====================
   async _evaluateRound(room, game) {
     try {
       if (this.isDestroyed || !game?._isActive || game._gameEnded || game._isEvaluating || !game.players) return;
@@ -3697,6 +3714,7 @@ export class GameServer extends CPUProtection {
       const submittedIds = new Set(numbers.keys());
       const activeIds = this._getActivePlayerIds(game);
       
+      // ✅ CEK CPU
       if (this._checkCPULimit()) await this._cpuYield();
       
       for (const id of activeIds) {
@@ -4244,6 +4262,7 @@ export class GameServer extends CPUProtection {
     } catch(e) {}
   }
 
+  // ==================== ✅ FIX: TAMBAHKAN CPU YIELD DI EVENT QUEUE ====================
   async _processEventQueue() {
     try {
       if (this._isProcessingQueue || this._eventQueue.length === 0) return;
@@ -4260,6 +4279,7 @@ export class GameServer extends CPUProtection {
         } catch(e) {
           this._handleError('processEvent', e);
         }
+        // ✅ CEK CPU SETIAP ITEM
         if (this._checkCPULimit()) {
           await this._cpuYield();
           this._startCPUTimer();
@@ -4944,7 +4964,7 @@ export class GameServer extends CPUProtection {
       this.isDestroyed = true;
       this.closing = true;
       
-      // CLEANUP SEMUA INTERVAL
+      // ✅ CLEANUP SEMUA INTERVAL
       if (this._mainInterval) {
         clearInterval(this._mainInterval);
         this._mainInterval = null;
@@ -5000,7 +5020,7 @@ export class GameServer extends CPUProtection {
         this._diceTimerTimeout = null;
       }
       
-      // BERSIHKAN CACHE
+      // ✅ BERSIHKAN CACHE
       this._cachedResetWeek = null;
       this._cachedResetWeekTimestamp = 0;
       this._cachedLastWeekWinner = null;
@@ -5101,6 +5121,12 @@ export class GameServer extends CPUProtection {
           server._cf = req.cf || {};
           server._country = req.cf?.country || 'US';
           server._language = 'en';
+          
+          try { 
+            this.state.acceptWebSocket(server); 
+          } catch(e) { 
+            return new Response("WebSocket acceptance failed", { status: 500 }); 
+          }
           
           server.addEventListener("message", async (event) => {
             try {

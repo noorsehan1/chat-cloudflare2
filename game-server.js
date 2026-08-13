@@ -1,13 +1,4 @@
-// ==================== GAME-SERVER-HEMAT-DURABLE.JS ====================
-// ✅ TANPA CPU CHECK
-// ✅ SINGLE MASTER INTERVAL
-// ✅ BROADCAST BUFFERING
-// ✅ FULL CACHE
-// ✅ THROTTLED NOTIFICATIONS
-// ✅ GLOBAL GAME SCHEDULER
-// ✅ OPTIMAL UNTUK DURABLE OBJECT
-// ✅ PERBAIKAN WEEKLY RESET (TERLEWAT BERAPA detik/menit/JAM/HARI/MINGGU)
-// ✅ TANPA LOG / CONSOLE
+// ==================== GAME-SERVER.JS - FULL FIXED VERSION ====================
 
 const CONSTANTS = {
   MAX_LOWCARD_GAMES: 10,
@@ -81,11 +72,6 @@ const CONSTANTS = {
   
   TIE_BREAKER_TIME_LIMIT: 20,
   TIE_BREAKER_COOLDOWN: 15000,
-
-  MASTER_INTERVAL_MS: 1000,
-  BROADCAST_BUFFER_FLUSH_MS: 200,
-  NOTIFICATION_THROTTLE_MS: 3000,
-  LEADERBOARD_CACHE_TTL_MS: 10000,
 };
 
 const QUIZ_SCHEDULE = {
@@ -99,30 +85,21 @@ const QUIZ_SCHEDULE = {
 
 const DICE_ROOM = "Quiz";
 
-// ==================== KV CACHE CLASS ====================
+// ==================== KV CACHE CLASS - NO TTL ====================
 class KVCache {
   constructor() {
     this.cache = new Map();
-    this.ttl = 30000;
-    this._cleanupInterval = null;
   }
 
   get(key) {
     const entry = this.cache.get(key);
     if (!entry) return null;
-    if (Date.now() - entry.timestamp > entry.ttl) {
-      this.cache.delete(key);
-      return null;
-    }
     return entry.value;
   }
 
-  set(key, value, customTtl = null) {
-    const ttl = customTtl || this.ttl;
+  set(key, value) {
     this.cache.set(key, {
-      value: value,
-      timestamp: Date.now(),
-      ttl: ttl
+      value: value
     });
   }
 
@@ -132,25 +109,6 @@ class KVCache {
 
   clear() {
     this.cache.clear();
-  }
-
-  startCleanup() {
-    if (this._cleanupInterval) return;
-    this._cleanupInterval = setInterval(() => {
-      const now = Date.now();
-      for (const [key, entry] of this.cache) {
-        if (now - entry.timestamp > entry.ttl) {
-          this.cache.delete(key);
-        }
-      }
-    }, 60000);
-  }
-
-  stopCleanup() {
-    if (this._cleanupInterval) {
-      clearInterval(this._cleanupInterval);
-      this._cleanupInterval = null;
-    }
   }
 }
 
@@ -163,17 +121,10 @@ class DiceGameSystem {
     this._isLoaded = false;
     this._loading = false;
     this._usedDiceValues = new Set();
-    this._lastLoadTime = 0;
-    this._cacheTTL = 5000;
   }
 
   async loadScores() {
     try {
-      const now = Date.now();
-      if (this._isLoaded && (now - this._lastLoadTime) < this._cacheTTL) {
-        return true;
-      }
-      
       if (this._loading) return this._isLoaded;
       this._loading = true;
       
@@ -191,7 +142,6 @@ class DiceGameSystem {
       
       this._isLoaded = true;
       this._loading = false;
-      this._lastLoadTime = Date.now();
       return true;
     } catch(e) {
       this._loading = false;
@@ -221,6 +171,7 @@ class DiceGameSystem {
       for (const [username, score] of Object.entries(points)) {
         this.userScores.set(username, score);
       }
+      this.gameServer._cachedPoints = points;
       return true;
     } catch(e) {
       return false;
@@ -237,7 +188,6 @@ class DiceGameSystem {
       
       const winnerData = await this.env.QUESTIONS.get(CONSTANTS.DICE_LAST_WEEK_WINNER, 'json');
       this.gameServer._cachedLastWeekWinner = winnerData;
-      this.gameServer._cachedLastWeekWinnerTimestamp = Date.now();
       return winnerData;
     } catch(e) {
       return null;
@@ -249,7 +199,6 @@ class DiceGameSystem {
       if (!this.env?.QUESTIONS) return false;
       await this.env.QUESTIONS.put(CONSTANTS.DICE_LAST_WEEK_WINNER, JSON.stringify(winner));
       this.gameServer._cachedLastWeekWinner = winner;
-      this.gameServer._cachedLastWeekWinnerTimestamp = Date.now();
       return true;
     } catch(e) {
       return false;
@@ -261,7 +210,6 @@ class DiceGameSystem {
       if (!this.env?.QUESTIONS) return false;
       await this.env.QUESTIONS.delete(CONSTANTS.DICE_LAST_WEEK_WINNER);
       this.gameServer._cachedLastWeekWinner = null;
-      this.gameServer._cachedLastWeekWinnerTimestamp = 0;
       return true;
     } catch(e) {
       return false;
@@ -300,6 +248,8 @@ export class GameServer {
 
       this._restartCount = 0;
       this._lastRestartTime = 0;
+      this._healthCheckInterval = null;
+      this._isRestarting = false;
       this._startTime = Date.now();
       this._lastHeartbeat = Date.now();
       this._errorCount = 0;
@@ -310,6 +260,7 @@ export class GameServer {
       this._lastRecoveryTime = 0;
 
       this._winnerProcessed = false;
+      this._tikCounter = 0;
 
       this.activeGames = new Map();
       this._maxGames = CONSTANTS.MAX_LOWCARD_GAMES;
@@ -327,7 +278,6 @@ export class GameServer {
       this._cleanupTimers = new Map();
       this._roomBroadcastCount = new Map();
       this._roomBroadcastReset = new Map();
-      this._tikCounter = 0;
       this._gameStartFlags = new Map();
 
       this.diceAnswered = new Set();
@@ -407,37 +357,30 @@ export class GameServer {
       this._lastTieLog = '';
 
       this._cachedResetWeek = null;
-      this._cachedResetWeekTimestamp = 0;
-
       this._cachedLastWeekWinner = null;
-      this._cachedLastWeekWinnerTimestamp = 0;
+      this._cachedPoints = null;
 
       this._kvCache = new KVCache();
-      this._kvCache.startCleanup();
 
       this.diceGameSystem = new DiceGameSystem(this);
 
-      this._broadcastBuffer = new Map();
-      this._bufferFlushTimer = null;
+      // ==================== EVENT QUEUE ====================
+      this._eventQueue = [];
+      this._isProcessingQueue = false;
 
-      this._leaderboardCache = {
-        data: null,
-        timestamp: 0
-      };
-
-      this._masterInterval = setInterval(() => {
-        this._masterTick();
-      }, CONSTANTS.MASTER_INTERVAL_MS);
-
-      this._bufferFlushTimer = setInterval(() => {
-        this._flushBroadcastBuffer();
-      }, CONSTANTS.BROADCAST_BUFFER_FLUSH_MS);
-
-      this._weeklyResetInterval = setInterval(async () => {
-        if (!this.closing && !this.isDestroyed) {
-          await this._checkAndResetWeeklyDice();
+      // ==================== 1 INTERVAL UTAMA ====================
+      this._mainInterval = setInterval(() => {
+        try {
+          if (this.closing || this.isDestroyed) {
+            clearInterval(this._mainInterval);
+            this._mainInterval = null;
+            return;
+          }
+          this._mainTick();
+        } catch(e) {
+          // DIAM
         }
-      }, CONSTANTS.WEEKLY_RESET_CHECK_INTERVAL_MS);
+      }, 1000); // ✅ 1 DETIK
 
       this._initAsync();
 
@@ -468,34 +411,56 @@ export class GameServer {
     } catch(e) {}
   }
 
-  // ==================== MASTER TICK ====================
-  _masterTick() {
+  // ==================== MAIN TICK - SETIAP 1 DETIK ====================
+  _mainTick() {
     try {
-      if (this.closing || this.isDestroyed) return;
-
-      const now = Date.now();
-
-      this._lastHeartbeat = now;
-      this._diceKeepAliveTask();
-      this._diceAutoTask();
+      this._tikCounter++;
+      
+      // 1. DICE TIMER - SETIAP DETIK (KRITICAL!)
       this._diceTimerTask();
-      this._checkStuckGames();
-      this._cleanupStaleGames();
-      this._cleanupDeadConnections();
-      this._performHealthCheck();
-
-      if (now - this._leaderboardCache.timestamp > CONSTANTS.LEADERBOARD_CACHE_TTL_MS) {
-        this._refreshLeaderboardCache();
+      
+      // 2. DICE KEEP ALIVE (setiap 5 detik)
+      if (this._tikCounter % 5 === 0) {
+        this._diceKeepAliveTask();
       }
-
+      
+      // 3. HEALTH CHECK (setiap 10 detik)
+      if (this._tikCounter % 10 === 0) {
+        this._performHealthCheck();
+      }
+      
+      // 4. STUCK GAMES (setiap 30 detik)
+      if (this._tikCounter % 30 === 0) {
+        this._checkStuckGames();
+      }
+      
+      // 5. DEAD CONNECTIONS (setiap 30 detik)
+      if (this._tikCounter % 30 === 0) {
+        this._cleanupDeadConnections();
+      }
+      
+      // 6. STALE GAMES (setiap 60 detik)
+      if (this._tikCounter % 60 === 0) {
+        this._cleanupStaleGames();
+      }
+      
+      // 7. WEEKLY RESET (setiap 300 detik)
+      if (this._tikCounter % 300 === 0) {
+        this._checkAndResetWeeklyDice().catch(() => {});
+      }
+      
+      // 8. DICE AUTO TASK (setiap 5 detik)
+      if (this._tikCounter % 5 === 0) {
+        this._diceAutoTask().catch(() => {});
+      }
+      
     } catch(e) {}
   }
 
-  // ==================== CACHE UNTUK dice_last_reset_week ====================
+  // ==================== CACHE METHODS ====================
 
   async _updateCachedResetWeek(week) {
     this._cachedResetWeek = week;
-    this._cachedResetWeekTimestamp = Date.now();
   }
 
   async _getCachedResetWeek() {
@@ -508,7 +473,6 @@ export class GameServer {
         const lastResetWeek = await this.env.QUESTIONS.get(CONSTANTS.DICE_LAST_RESET_WEEK);
         if (lastResetWeek) {
           this._cachedResetWeek = lastResetWeek;
-          this._cachedResetWeekTimestamp = Date.now();
           return lastResetWeek;
         }
       }
@@ -518,8 +482,6 @@ export class GameServer {
       return null;
     }
   }
-
-  // ==================== CACHE UNTUK lowcard_recording_status_* ====================
 
   async _getRecordingStatusFromKV(roomName) {
     try {
@@ -572,7 +534,6 @@ export class GameServer {
     }
   }
 
-  // ==================== WEEKLY RESET ====================
   async _checkAndResetWeeklyDice() {
     try {
       if (!this.env?.QUESTIONS) return false;
@@ -597,110 +558,56 @@ export class GameServer {
       const dayOfWeek = now.getUTCDay();
       const hours = now.getUTCHours();
       const minutes = now.getUTCMinutes();
-      const seconds = now.getUTCSeconds();
       
       const isMonday = dayOfWeek === 1;
-      const isResetTime = hours === 0 && minutes === 0 && seconds < 60;
+      const isResetTime = hours === 0 && minutes === 0;
       
-      let delayMinutes = 0;
-      let delayHours = 0;
-      let delayDays = 0;
-      let delayWeeks = 0;
-      
-      if (weekChanged) {
-        const weekA = parseInt(lastResetWeek.split('-W')[1]);
-        const weekB = parseInt(currentWeek.split('-W')[1]);
-        delayWeeks = weekB - weekA;
+      if (weekChanged && isMonday && isResetTime) {
+        const points = await this.env.QUESTIONS.get(CONSTANTS.DICE_POINT_KEY, 'json') || {};
         
-        let daysSinceMonday = dayOfWeek === 0 ? 6 : dayOfWeek - 1;
-        delayDays = daysSinceMonday;
-        delayHours = hours;
-        delayMinutes = minutes;
+        let winner = null;
+        let highestScore = 0;
         
-        const totalDelaySeconds = (delayWeeks * 7 * 24 * 60 * 60) + 
-                                  (delayDays * 24 * 60 * 60) + 
-                                  (delayHours * 60 * 60) + 
-                                  (delayMinutes * 60) + 
-                                  seconds;
-        
-        if (isMonday && isResetTime) {
-          await this._performWeeklyReset(lastResetWeek, currentWeek);
-          return true;
-        } else if (weekChanged) {
-          const resetKey = `weekly_reset_${currentWeek}`;
-          const alreadyReset = await this.env.QUESTIONS.get(resetKey);
-          
-          if (alreadyReset === 'true') {
-            return false;
+        for (const [username, score] of Object.entries(points)) {
+          const numericScore = typeof score === 'number' ? score : parseInt(score, 10) || 0;
+          if (numericScore > highestScore) {
+            highestScore = numericScore;
+            winner = username;
           }
-          
-          await this._performWeeklyReset(lastResetWeek, currentWeek);
-          await this.env.QUESTIONS.put(resetKey, 'true');
-          
-          return true;
         }
+        
+        if (winner && highestScore > 0) {
+          const winnerData = {
+            username: winner,
+            score: highestScore,
+            week: lastResetWeek,
+            timestamp: Date.now()
+          };
+          
+          await this.env.QUESTIONS.put(
+            CONSTANTS.DICE_LAST_WEEK_WINNER,
+            JSON.stringify(winnerData)
+          );
+          
+          this._cachedLastWeekWinner = winnerData;
+          
+        } else {
+          await this.env.QUESTIONS.delete(CONSTANTS.DICE_LAST_WEEK_WINNER);
+          this._cachedLastWeekWinner = null;
+        }
+        
+        await this.env.QUESTIONS.put(CONSTANTS.DICE_POINT_KEY, JSON.stringify({}));
+        
+        await this._updateCachedResetWeek(currentWeek);
+        await this.env.QUESTIONS.put(CONSTANTS.DICE_LAST_RESET_WEEK, currentWeek);
+        
+        this.diceGameSystem.userScores.clear();
+        this._cachedPoints = {};
+        
+        return true;
       }
       
       return false;
-      
-    } catch(e) {
-      return false;
-    }
-  }
-
-  async _performWeeklyReset(lastResetWeek, currentWeek) {
-    try {
-      const points = await this.env.QUESTIONS.get(CONSTANTS.DICE_POINT_KEY, 'json') || {};
-      
-      let winner = null;
-      let highestScore = 0;
-      
-      for (const [username, score] of Object.entries(points)) {
-        const numericScore = typeof score === 'number' ? score : parseInt(score, 10) || 0;
-        if (numericScore > highestScore) {
-          highestScore = numericScore;
-          winner = username;
-        }
-      }
-      
-      if (winner && highestScore > 0) {
-        const winnerData = {
-          username: winner,
-          score: highestScore,
-          week: lastResetWeek,
-          timestamp: Date.now()
-        };
-        
-        await this.env.QUESTIONS.put(
-          CONSTANTS.DICE_LAST_WEEK_WINNER,
-          JSON.stringify(winnerData)
-        );
-        
-        this._cachedLastWeekWinner = winnerData;
-        this._cachedLastWeekWinnerTimestamp = Date.now();
-        
-      } else {
-        await this.env.QUESTIONS.delete(CONSTANTS.DICE_LAST_WEEK_WINNER);
-        this._cachedLastWeekWinner = null;
-        this._cachedLastWeekWinnerTimestamp = 0;
-      }
-      
-      await this.env.QUESTIONS.put(CONSTANTS.DICE_POINT_KEY, JSON.stringify({}));
-      
-      await this._updateCachedResetWeek(currentWeek);
-      await this.env.QUESTIONS.put(CONSTANTS.DICE_LAST_RESET_WEEK, currentWeek);
-      
-      this.diceGameSystem.userScores.clear();
-      
-      this._broadcastToRoom(DICE_ROOM, ["weeklyReset", {
-        oldWeek: lastResetWeek,
-        newWeek: currentWeek,
-        winner: winner,
-        score: highestScore,
-        timestamp: Date.now()
-      }]);
-      
-      return true;
       
     } catch(e) {
       return false;
@@ -720,218 +627,8 @@ export class GameServer {
     }
   }
 
-  // ==================== BROADCAST BUFFER ====================
-  _bufferBroadcast(room, message) {
-    try {
-      if (this.closing || this.isDestroyed || !room || !message) return;
-      
-      if (!this._broadcastBuffer.has(room)) {
-        this._broadcastBuffer.set(room, []);
-      }
-      
-      const buffer = this._broadcastBuffer.get(room);
-      const msgStr = JSON.stringify(message);
-      
-      if (buffer.length > 0) {
-        const last = buffer[buffer.length - 1];
-        if (last === msgStr) {
-          return;
-        }
-      }
-      
-      buffer.push(msgStr);
-      
-      if (buffer.length > 20) {
-        this._flushBroadcastBuffer();
-      }
-      
-    } catch(e) {}
-  }
+  // ==================== DICE GAME METHODS ====================
 
-  _flushBroadcastBuffer() {
-    try {
-      if (this.closing || this.isDestroyed) return;
-      
-      for (const [room, messages] of this._broadcastBuffer) {
-        if (messages.length === 0) continue;
-        
-        const wsIds = this.wsClients.get(room);
-        if (!wsIds?.size) {
-          this._broadcastBuffer.set(room, []);
-          continue;
-        }
-        
-        const combined = messages.join('\n');
-        this._broadcastBuffer.set(room, []);
-        
-        const wsIdArray = Array.from(wsIds);
-        const BATCH_SIZE = CONSTANTS.BROADCAST_BATCH_SIZE || 5;
-        
-        for (let i = 0; i < wsIdArray.length; i += BATCH_SIZE) {
-          const batch = wsIdArray.slice(i, i + BATCH_SIZE);
-          for (const wsId of batch) {
-            const ws = this.wsMap.get(wsId);
-            if (ws && ws.readyState === 1) {
-              try { ws.send(combined); } catch(e) {}
-            }
-          }
-        }
-      }
-      
-    } catch(e) {}
-  }
-
-  // ==================== DICE KEEP ALIVE ====================
-  _diceKeepAliveTask() {
-    try {
-      this._lastHeartbeat = Date.now();
-      
-      if (!this._isDiceTime()) {
-        if (!this._diceOutOfTimeShown) {
-          const timeLeft = this._getTimeLeftUntilNextDice();
-          this._broadcastDiceNotification("diceError", {
-            message: `Next dice game in: ${timeLeft.text}`,
-            timeLeft: timeLeft.text,
-            hours: timeLeft.hours,
-            minutes: timeLeft.minutes,
-            remaining: -1,
-            isDiceTime: false,
-            isActive: false
-          });
-          this._diceOutOfTimeShown = true;
-        }
-        return;
-      }
-      
-      if (this._diceOutOfTimeShown) {
-        this._diceOutOfTimeShown = false;
-        this._diceRemainingShown = false;
-        this._diceTimeUpShown = false;
-      }
-      
-    } catch(e) {}
-  }
-
-  // ==================== DICE AUTO ====================
-  async _diceAutoTask() {
-    try {
-      if (this._tieActive) {
-        return;
-      }
-      
-      await this._checkDiceAutoStatus();
-      await this._checkAndRestartDice();
-      
-      const isDiceTime = this._isDiceTime();
-      const clients = this.wsClients.get(DICE_ROOM);
-      const hasPlayers = clients && clients.size > 0;
-      
-      if (isDiceTime) {
-        this._diceOutOfTimeShown = false;
-        this._diceRemainingShown = false;
-        this._diceTimeUpShown = false;
-        this._diceJoinedNotified.clear();
-        
-        this.diceEndedToday = false;
-        this.diceEndMessageShown = false;
-        this.diceEndNotified = false;
-        this._nextDiceNotified.clear();
-        
-        if (hasPlayers && !this.currentDiceRoll && !this._diceTimeout && 
-            !this._diceStartTimeout && !this._isShowingDice && !this._diceTimeUpCooldown) {
-          
-          if (!this.diceAutoEnabled) {
-            this.diceAutoEnabled = true;
-            await this.startDiceWithDelay(CONSTANTS.DICE_AUTO_START_DELAY_MS || 3000);
-          }
-          
-          setTimeout(() => {
-            if (!this.closing && !this.isDestroyed && 
-                !this.currentDiceRoll && !this._diceTimeout && 
-                !this._isShowingDice && !this._diceTimeUpCooldown) {
-              this.forceStartDice();
-            }
-          }, CONSTANTS.DICE_AUTO_START_DELAY_MS || 3000);
-        }
-        
-      } else {
-        if (this.diceAutoEnabled && !this.diceEndNotified) {
-          this.diceAutoEnabled = false;
-          this.diceEndedToday = true;
-          this.diceEndMessageShown = false;
-          await this.resetDice();
-          this._clearDiceData();
-          this._diceTimeLeftNotified.clear();
-          this._nextDiceNotified.clear();
-          this._diceJoinedNotified.clear();
-          this._sendDiceEndNotificationOnce();
-        }
-      }
-      
-    } catch(e) {}
-  }
-
-  // ==================== DICE TIMER ====================
-  _diceTimerTask() {
-    try {
-      if (this._tieActive) {
-        return;
-      }
-      
-      if (this._isDiceTime()) {
-        if (!this.currentDiceRoll && !this._diceTimeout && 
-            !this._isShowingDice && !this._diceTimeUpCooldown) {
-          const clients = this.wsClients.get(DICE_ROOM);
-          if (clients?.size > 0) {
-            this._showDiceQuestion();
-          }
-        }
-      }
-    } catch(e) {}
-  }
-
-  // ==================== DICE AUTO CHECKER ====================
-  _startDiceAutoChecker() {
-    try {
-      if (this._diceAutoCheckInterval) {
-        clearInterval(this._diceAutoCheckInterval);
-      }
-      
-      this._diceAutoCheckInterval = setInterval(() => {
-        try {
-          if (this.closing || this.isDestroyed) {
-            clearInterval(this._diceAutoCheckInterval);
-            this._diceAutoCheckInterval = null;
-            return;
-          }
-          
-          if (this._isDiceTime()) {
-            const clients = this.wsClients.get(DICE_ROOM);
-            const hasPlayers = clients && clients.size > 0;
-            
-            if (hasPlayers && !this.currentDiceRoll && !this._diceTimeout && 
-                !this._diceStartTimeout && !this._isShowingDice && !this._diceTimeUpCooldown) {
-              
-              if (!this.diceAutoEnabled) {
-                this.diceAutoEnabled = true;
-              }
-              
-              setTimeout(() => {
-                if (!this.closing && !this.isDestroyed && 
-                    !this.currentDiceRoll && !this._diceTimeout && 
-                    !this._isShowingDice && !this._diceTimeUpCooldown) {
-                  this.forceStartDice();
-                }
-              }, CONSTANTS.DICE_AUTO_START_DELAY_MS || 3000);
-            }
-          }
-        } catch(e) {}
-      }, CONSTANTS.DICE_CHECK_INTERVAL_MS || 5000);
-      
-    } catch(e) {}
-  }
-
-  // ==================== DICE TIME HELPERS ====================
   _isDiceTime() {
     try {
       const witaTime = this._getCurrentWITATime();
@@ -993,278 +690,339 @@ export class GameServer {
     }
   }
 
-  _getDiceAnswerRemainingTime() {
+  _getTimeLeftUntilNextDiceEvent() {
     try {
-      if (!this.currentDiceRoll || !this._diceQuestionStartTime) return 0;
-      const elapsed = (Date.now() - this._diceQuestionStartTime) / 1000;
-      return Math.max(0, Math.round((CONSTANTS.DICE_ANSWER_TIME_MS / 1000) - elapsed));
-    } catch(e) { return 0; }
-  }
-
-  // ==================== RECORDING ====================
-  async _startRecordingWinners(roomName) {
-    try {
-      if (!roomName) return false;
-      
-      const currentStatus = await this._getRecordingStatusFromKV(roomName);
-      if (currentStatus) {
-        this._broadcastToRoom(roomName, ["recordingStatus", true]);
-        return true;
-      }
-      
-      this._recordingEnabled.set(roomName, true);
-      
-      if (this.env?.QUESTIONS) {
-        await this.env.QUESTIONS.put(
-          CONSTANTS.LOWCARD_RECORDING_KEY + roomName, 
-          'true'
-        );
-      }
-      
-      this._broadcastToRoom(roomName, ["recordingStatus", true]);
-      
-      return true;
-    } catch(e) {
-      return false;
-    }
-  }
-
-  async _stopRecordingWinners(roomName) {
-    try {
-      if (!roomName) return false;
-      
-      const room = roomName.trim();
-      
-      const currentStatus = await this._getRecordingStatusFromKV(room);
-      if (!currentStatus) {
-        this._broadcastToRoom(room, ["recordingStatus", false]);
-        return true;
-      }
-      
-      this._recordingEnabled.set(room, false);
-      
-      if (this.env?.QUESTIONS) {
-        const statusKey = CONSTANTS.LOWCARD_RECORDING_KEY + room;
-        const winnerKey = CONSTANTS.LOWCARD_WINNER_KEY + room;
-        
-        await this.env.QUESTIONS.delete(statusKey);
-        await this.env.QUESTIONS.delete(winnerKey);
-        
-        const prefixes = [
-          CONSTANTS.LOWCARD_WINNER_KEY,
-          CONSTANTS.LOWCARD_RECORDING_KEY
-        ];
-        
-        for (const prefix of prefixes) {
-          try {
-            const list = await this.env.QUESTIONS.list({ prefix: prefix });
-            for (const key of list.keys) {
-              if (key.name === prefix + room || key.name.includes(room)) {
-                await this.env.QUESTIONS.delete(key.name);
-              }
-            }
-          } catch(e) {}
+      const witaTime = this._getCurrentWITATime();
+      const currentTotal = witaTime.totalMinutes;
+      for (const session of QUIZ_SCHEDULE.SESSIONS) {
+        const startTotal = session.start * 60;
+        const endTotal = session.end * 60;
+        if (currentTotal >= startTotal && currentTotal < endTotal) {
+          const remaining = endTotal - currentTotal;
+          const hours = Math.floor(remaining / 60);
+          const minutes = Math.floor(remaining % 60);
+          return {
+            minutes: remaining,
+            seconds: 0,
+            isRunning: true,
+            hours: hours,
+            totalMinutes: remaining,
+            status: 'running',
+            remainingText: `${hours}h ${minutes}m`
+          };
         }
       }
-      
-      this._broadcastToRoom(room, ["recordingStatus", false]);
-      
-      return true;
+      let minDiff = Infinity;
+      for (const session of QUIZ_SCHEDULE.SESSIONS) {
+        let startTotal = session.start * 60;
+        let diff = startTotal - currentTotal;
+        if (diff < 0) diff += 24 * 60;
+        if (diff < minDiff) {
+          minDiff = diff;
+        }
+      }
+      const hours = Math.floor(minDiff / 60);
+      const minutes = Math.floor(minDiff % 60);
+      return {
+        hours: hours,
+        minutes: minutes,
+        seconds: 0,
+        totalMinutes: minDiff,
+        totalSeconds: minDiff * 60,
+        isRunning: false,
+        status: 'waiting',
+        remainingText: `${hours}h ${minutes}m`
+      };
     } catch(e) {
-      return false;
+      return { hours: 0, minutes: 0, isRunning: false, status: 'unknown' };
     }
   }
 
-  async _sendWinnersToRoom(room) {
+  _diceKeepAliveTask() {
     try {
-      if (!room) return;
+      this._lastHeartbeat = Date.now();
       
-      const isRecordingEnabled = await this._getRecordingStatusFromKV(room);
-      const winners = await this._getLowCardWinners(room);
-      
-      this._broadcastToRoom(room, ["lowCardWinnerUpdate", {
-        winners: winners,
-        room: room,
-        recording: isRecordingEnabled
-      }]);
-      
-    } catch(e) {}
-  }
-
-  async _getLowCardWinners(room) {
-    try {
-      if (!room) return {};
-      if (!this.env?.QUESTIONS) return {};
-      
-      const isRecording = await this._getRecordingStatusFromKV(room);
-      if (!isRecording) {
-        return {};
-      }
-      
-      const key = CONSTANTS.LOWCARD_WINNER_KEY + room;
-      const winners = await this.env.QUESTIONS.get(key, 'json');
-      
-      if (winners && typeof winners === 'object' && Object.keys(winners).length > 0) {
-        return winners;
-      }
-      
-      return {};
-    } catch(e) {
-      return {};
-    }
-  }
-
-  async _broadcastLowCardWinners(room) {
-    try {
-      if (!room) return;
-      
-      const isRecordingEnabled = await this._getRecordingStatusFromKV(room);
-      if (!isRecordingEnabled) {
+      if (!this._isDiceTime()) {
+        if (!this._diceOutOfTimeShown) {
+          const timeLeft = this._getTimeLeftUntilNextDice();
+          this._broadcastDiceNotification("diceError", {
+            message: `Next dice game in: ${timeLeft.text}`,
+            timeLeft: timeLeft.text,
+            hours: timeLeft.hours,
+            minutes: timeLeft.minutes,
+            remaining: -1,
+            isDiceTime: false,
+            isActive: false
+          });
+          this._diceOutOfTimeShown = true;
+        }
         return;
       }
       
-      const winners = await this._getLowCardWinners(room);
-      
-      if (Object.keys(winners).length === 0) {
-        this._broadcastToRoom(room, ["lowCardWinnerUpdate", {
-          winners: {},
-          room: room,
-          recording: true,
-          message: "No winner"
-        }]);
-      } else {
-        this._broadcastToRoom(room, ["lowCardWinnerUpdate", {
-          winners: winners,
-          room: room,
-          recording: true
-        }]);
+      if (this._diceOutOfTimeShown) {
+        this._diceOutOfTimeShown = false;
+        this._diceRemainingShown = false;
+        this._diceTimeUpShown = false;
       }
       
     } catch(e) {}
   }
 
-  async _addLowCardWinner(room, username) {
+  async _diceAutoTask() {
     try {
-      if (!room || !username) return false;
-      
-      const isRecordingEnabled = await this._getRecordingStatusFromKV(room);
-      if (!isRecordingEnabled) {
-        return false;
+      if (this._tieActive) {
+        return;
       }
       
-      if (room === DICE_ROOM) {
-        return false;
-      }
+      await this._checkDiceAutoStatus();
+      await this._checkAndRestartDice();
       
-      if (!this.env?.QUESTIONS) return false;
+      const isDiceTime = this._isDiceTime();
+      const clients = this.wsClients.get(DICE_ROOM);
+      const hasPlayers = clients && clients.size > 0;
       
-      const key = CONSTANTS.LOWCARD_WINNER_KEY + room;
-      
-      let roomWinners = await this.env.QUESTIONS.get(key, 'json') || {};
-      
-      let currentCount = 0;
-      if (roomWinners[username]) {
-        const valStr = String(roomWinners[username]);
-        currentCount = parseInt(valStr.replace("x", "").replace("X", "")) || 0;
-      }
-      const newCount = currentCount + 1;
-      
-      roomWinners[username] = newCount + "x";
-      
-      await this.env.QUESTIONS.put(key, JSON.stringify(roomWinners));
-      
-      return true;
-    } catch(e) {
-      return false;
-    }
-  }
-
-  // ==================== LEADERBOARD CACHE ====================
-  async _refreshLeaderboardCache() {
-    try {
-      if (!this.env?.QUESTIONS) return;
-      
-      const points = await this.env.QUESTIONS.get(CONSTANTS.DICE_POINT_KEY, 'json') || {};
-      const sorted = Object.entries(points)
-        .sort((a, b) => b[1] - a[1])
-        .slice(0, 30);
-      
-      this._leaderboardCache.data = sorted.map(([username, score]) => `${username}|${score}`);
-      this._leaderboardCache.timestamp = Date.now();
-      
-    } catch(e) {}
-  }
-
-  // ==================== INIT ====================
-  async _initAsync() {
-    try {
-      if (this._initializing) return;
-      if (this._initialized && !this._isRecovering) return;
-      this._initializing = true;
-      
-      await this.diceGameSystem.loadScores();
-      await this._initDice();
-      
-      this._startWeeklyResetChecker();
-      this._startDiceAutoChecker();
-      
-      setTimeout(() => {
-        if (!this.closing && !this.isDestroyed) {
-          if (this._isDiceTime()) {
-            const clients = this.wsClients.get(DICE_ROOM);
-            if (clients && clients.size > 0) {
-              this.diceAutoEnabled = true;
-              this._broadcastDiceNotification("diceError", {
-                message: "Dice game is starting now",
-                isDiceTime: true,
-                remaining: -1,
-                timestamp: Date.now()
-              });
-              
-              setTimeout(() => {
-                if (!this.closing && !this.isDestroyed) {
-                  this.forceStartDice();
-                }
-              }, CONSTANTS.DICE_AUTO_START_DELAY_MS || 3000);
+      if (isDiceTime) {
+        this._diceOutOfTimeShown = false;
+        this._diceRemainingShown = false;
+        this._diceTimeUpShown = false;
+        this._diceJoinedNotified.clear();
+        
+        this.diceEndedToday = false;
+        this.diceEndMessageShown = false;
+        this.diceEndNotified = false;
+        this._nextDiceNotified.clear();
+        
+        if (hasPlayers && !this.currentDiceRoll && !this._diceTimeout && 
+            !this._diceStartTimeout && !this._isShowingDice && !this._diceTimeUpCooldown) {
+          
+          if (!this.diceAutoEnabled) {
+            this.diceAutoEnabled = true;
+            await this.startDiceWithDelay(CONSTANTS.DICE_AUTO_START_DELAY_MS || 3000);
+          }
+          
+          setTimeout(() => {
+            if (!this.closing && !this.isDestroyed && 
+                !this.currentDiceRoll && !this._diceTimeout && 
+                !this._isShowingDice && !this._diceTimeUpCooldown) {
+              this.forceStartDice();
             }
+          }, CONSTANTS.DICE_AUTO_START_DELAY_MS || 3000);
+        }
+        
+      } else {
+        if (this.diceAutoEnabled && !this.diceEndNotified) {
+          this.diceAutoEnabled = false;
+          this.diceEndedToday = true;
+          this.diceEndMessageShown = false;
+          await this.resetDice();
+          this._clearDiceData();
+          this._diceTimeLeftNotified.clear();
+          this._nextDiceNotified.clear();
+          this._diceJoinedNotified.clear();
+          this._sendDiceEndNotificationOnce();
+        }
+      }
+      
+    } catch(e) {}
+  }
+
+  _diceTimerTask() {
+    try {
+      if (this._tieActive) {
+        return;
+      }
+      
+      // CEK JIKA DICE HARUS MULAI
+      if (this._isDiceTime()) {
+        if (!this.currentDiceRoll && !this._diceTimeout && 
+            !this._isShowingDice && !this._diceTimeUpCooldown) {
+          const clients = this.wsClients.get(DICE_ROOM);
+          if (clients?.size > 0) {
+            this._showDiceQuestion();
           }
         }
-      }, 2000);
+      }
       
-      this._initialized = true;
-      this._initializing = false;
-      this._errorCount = 0;
-      this._isRecovering = false;
-      this._diceInitAttempts = 0;
-    } catch(e) {
-      this._initializing = false;
-      this._handleError('initAsync', e);
-      if (this._diceInitAttempts < this._maxDiceInitAttempts && !this.closing && !this.isDestroyed) {
-        this._diceInitAttempts++;
-        setTimeout(() => {
-          if (!this.closing && !this.isDestroyed) {
-            this._initAsync();
-          }
-        }, 5000 * this._diceInitAttempts);
+      // UPDATE DICE TIMER NOTIFICATIONS - SETIAP DETIK
+      if (this.currentDiceRoll && this._diceQuestionStartTime && !this._tieActive) {
+        this._updateDiceTimerDisplay();
       }
-    }
+      
+    } catch(e) {}
   }
 
-  async _initDice(retryCount = 0) {
+  _updateDiceTimerDisplay() {
     try {
-      await this.diceGameSystem.loadScores();
-      return true;
-    } catch(e) {
-      if (retryCount < CONSTANTS.MAX_RETRY_INIT_QUIZ && !this.closing && !this.isDestroyed) {
-        setTimeout(() => this._initDice(retryCount + 1), 5000);
+      if (!this.currentDiceRoll || !this._diceQuestionStartTime) {
+        return;
       }
-      return false;
-    }
+      
+      const elapsed = (Date.now() - this._diceQuestionStartTime) / 1000;
+      const totalTime = CONSTANTS.DICE_ANSWER_TIME_MS / 1000;
+      const remaining = Math.max(0, totalTime - elapsed);
+      const remainingInt = Math.floor(remaining);
+      
+      // NOTIFIKASI PADA DETIK TERTENTU
+      if (remainingInt === 20 && !this._diceNotifiedFlags[20]) {
+        this._diceNotifiedFlags[20] = true;
+        this._broadcastDiceNotification("diceError", {
+          remaining: 20,
+          message: "20s remaining",
+          round: this._diceRound || 1,
+          isDiceTime: true,
+          isActive: true
+        });
+      } else if (remainingInt === 10 && !this._diceNotifiedFlags[10]) {
+        this._diceNotifiedFlags[10] = true;
+        this._broadcastDiceNotification("diceError", {
+          remaining: 10,
+          message: "10s remaining",
+          round: this._diceRound || 1,
+          isDiceTime: true,
+          isActive: true
+        });
+      } else if (remainingInt === 5 && !this._diceNotifiedFlags[5]) {
+        this._diceNotifiedFlags[5] = true;
+        this._broadcastDiceNotification("diceError", {
+          remaining: 5,
+          message: "5s remaining",
+          round: this._diceRound || 1,
+          isDiceTime: true,
+          isActive: true
+        });
+      } else if (remainingInt <= 0 && !this._diceNotifiedFlags.timeup) {
+        this._diceNotifiedFlags.timeup = true;
+        this._broadcastDiceNotification("diceError", {
+          remaining: 0,
+          message: "TIME UP",
+          round: this._diceRound || 1,
+          isDiceTime: true,
+          isActive: true
+        });
+        this._stopDiceTimerNotifications();
+        this._startTimeUpCooldown();
+        
+        // AUTO PROCESS TIME UP
+        this._handleDiceTimeUp();
+      }
+      
+      // UPDATE BROADCAST SETIAP 2 DETIK UNTUK COUNTDOWN
+      if (remainingInt > 0 && remainingInt <= 20) {
+        const now = Date.now();
+        if (now - this._lastDiceTimeLeftBroadcast > 2000) {
+          this._broadcastDiceTimeLeft();
+          this._lastDiceTimeLeftBroadcast = now;
+        }
+      }
+      
+    } catch(e) {}
   }
 
-  _startWeeklyResetChecker() {}
+  async _handleDiceTimeUp() {
+    try {
+      if (this.closing || this.isDestroyed) return;
+      if (this._tieActive) return;
+      
+      const currentClients = this.wsClients.get(DICE_ROOM);
+      if (!currentClients?.size) {
+        this.currentDiceRoll = null;
+        this._isShowingDice = false;
+        this._canSubmitDiceAnswer = false;
+        return;
+      }
+      
+      const diceValue = this.currentDiceRoll?.value;
+      const roundNumber = this._diceRound || 1;
+      
+      if (this.diceHasWinner && this.diceWinner) {
+        const correctPlayers = [];
+        for (const player of this.diceAnswered) {
+          const answer = this._playerAnswers.get(player);
+          if (answer === this.currentDiceRoll?.value) {
+            correctPlayers.push(player);
+          }
+        }
+        
+        if (correctPlayers.length > 1 && !this._tieActive) {
+          await this._startTieBreaker(DICE_ROOM, correctPlayers);
+          return;
+        }
+        
+        const points = await this._getDicePoints();
+        this._broadcastToRoom(DICE_ROOM, ["diceWinner", {
+          username: this.diceWinner,
+          totalPoints: points[this.diceWinner] || 0,
+          diceValue: diceValue,
+          round: roundNumber
+        }]);
+        
+        this._broadcastDiceNotification("diceError", {
+          username: this.diceWinner,
+          totalPoints: points[this.diceWinner] || 0,
+          diceValue: diceValue,
+          round: roundNumber,
+          remaining: -1,
+          message: `${this.diceWinner} won with value ${diceValue}`
+        });
+      } else {
+        this._broadcastToRoom(DICE_ROOM, ["diceNoWinner", {
+          message: `No winner`,
+          value: diceValue,
+          round: roundNumber
+        }]);
+      }
+      
+      this.currentDiceRoll = null;
+      this._isShowingDice = false;
+      this._canSubmitDiceAnswer = false;
+      
+      if (this._diceTimeout) {
+        clearTimeout(this._diceTimeout);
+        this._diceTimeout = null;
+      }
+      
+      this._startTimeUpCooldown();
+      
+    } catch(e) {}
+  }
 
-  // ==================== DICE FORCE START ====================
+  _startDiceTimerNotifications() {
+    try {
+      this._diceNotifiedFlags = {
+        20: false,
+        10: false,
+        5: false,
+        timeup: false
+      };
+      this._lastSentRemaining = -1;
+      this._lastNotificationKey = "";
+      this._lastNotificationTime = 0;
+      this._lastDiceTimeLeftBroadcast = 0;
+    } catch(e) {}
+  }
+
+  _stopDiceTimerNotifications() {
+    try {
+      this._diceNotifiedFlags = {
+        20: false,
+        10: false,
+        5: false,
+        timeup: false
+      };
+      this._lastSentRemaining = -1;
+    } catch(e) {}
+  }
+
+  _startDiceAutoChecker() {
+    try {
+      setTimeout(() => {
+        if (!this.closing && !this.isDestroyed) {
+          this._diceAutoTask().catch(() => {});
+        }
+      }, 1000);
+    } catch(e) {}
+  }
+
   forceStartDice() {
     try {
       if (this._tieActive) {
@@ -1282,63 +1040,6 @@ export class GameServer {
     } catch(e) { return false; }
   }
 
-  async _checkDiceAutoStatus() {
-    try {
-      const isDiceTime = this._isDiceTime();
-      if (isDiceTime) {
-        this._diceOutOfTimeShown = false;
-        this._diceRemainingShown = false;
-        this._diceTimeUpShown = false;
-        this._diceJoinedNotified.clear();
-        
-        this.diceEndedToday = false;
-        this.diceEndMessageShown = false;
-        this.diceEndNotified = false;
-        this._nextDiceNotified.clear();
-        
-        if (!this.diceAutoEnabled) {
-          this.diceAutoEnabled = true;
-          const wsIds = this.wsClients.get(DICE_ROOM);
-          if (wsIds?.size > 0) {
-            let hasUnnotified = false;
-            for (const wsId of wsIds) {
-              if (!this._diceTimeLeftNotified.has(wsId) && !this._nextDiceNotified.has(wsId)) {
-                hasUnnotified = true;
-                break;
-              }
-            }
-            if (hasUnnotified) {
-              this._broadcastDiceTimeLeft();
-            }
-          }
-          await this.startDiceWithDelay(CONSTANTS.QUIZ_START_DELAY_MS);
-          if (!this._diceStartTimeout && !this._isShowingDice && !this._diceTimeUpCooldown) {
-            this.forceStartDice();
-          }
-        } else if (!this.currentDiceRoll && !this._diceTimeout && !this._diceStartTimeout && !this._isShowingDice && !this._diceTimeUpCooldown) {
-          const clients = this.wsClients.get(DICE_ROOM);
-          if (clients?.size > 0) {
-            await this._showDiceQuestion();
-          }
-        }
-        return false;
-      } else {
-        if (this.diceAutoEnabled && !this.diceEndNotified) {
-          this.diceAutoEnabled = false;
-          this.diceEndedToday = true;
-          this.diceEndMessageShown = false;
-          await this.resetDice();
-          this._clearDiceData();
-          this._diceTimeLeftNotified.clear();
-          this._nextDiceNotified.clear();
-          this._diceJoinedNotified.clear();
-          this._sendDiceEndNotificationOnce();
-        }
-        return true;
-      }
-    } catch(e) { return true; }
-  }
-
   _checkAndRestartDice() {
     try {
       if (!this._isDiceTime()) return;
@@ -1353,31 +1054,66 @@ export class GameServer {
     } catch(e) {}
   }
 
-  async startDiceWithDelay(delayMs) {
+  ensureDiceRunning() {
     try {
-      if (this._diceStartTimeout) return;
-      this._diceStartTimeout = setTimeout(() => {
-        try {
-          if (this.closing || this.isDestroyed) { 
-            this._diceStartTimeout = null; 
-            return; 
-          }
-          this._diceStartTimeout = null;
-          if (!this.currentDiceRoll && this.diceAutoEnabled && !this._isShowingDice && !this._diceTimeUpCooldown) {
-            this.forceStartDice();
-          }
-        } catch(e) {}
-      }, delayMs);
+      if (this._isShowingDice) return;
+      if (this._diceTimeUpCooldown) return;
+      this._forceStartDiceIfTime();
+      if (!this.currentDiceRoll && !this._diceTimeout && !this._diceStartTimeout && !this._isShowingDice) {
+        this.forceStartDice();
+      }
+      if (!this._diceKeepAliveInterval) {
+        this._startDiceKeepAlive();
+      }
     } catch(e) {}
   }
 
-  // ==================== DICE QUESTION ====================
-  async _showDiceQuestion() {
+  _forceStartDiceIfTime() {
     try {
-      if (this._tieActive) {
+      if (this._isShowingDice) return;
+      if (this._diceTimeUpCooldown) return;
+      if (!this._isDiceTime() || this.currentDiceRoll || this._diceTimeout || this._diceStartTimeout) {
         return;
       }
+      this.diceAutoEnabled = true;
+      this._showDiceQuestion();
+    } catch(e) {}
+  }
+
+  _startTimeUpCooldown() {
+    if (this._diceTimeUpCooldown) return;
+    
+    this._diceTimeUpCooldown = true;
+    
+    this._broadcastDiceNotification("diceError", {
+      message: "wait 15s",
+      remaining: 15,
+      isDiceTime: true,
+      isActive: false,
+      cooldown: true
+    });
+    
+    this._diceTimeUpCooldownTimer = setTimeout(() => {
+      this._diceTimeUpCooldownTimer = null;
+      this._diceTimeUpCooldown = false;
       
+      this._diceNotifiedFlags = {
+        20: false,
+        10: false,
+        5: false,
+        timeup: false
+      };
+      this._lastSentRemaining = -1;
+      this._lastNotificationKey = "";
+      this._lastNotificationTime = 0;
+      
+      this._showDiceQuestionSilent();
+    }, 15000);
+  }
+
+  async _showDiceQuestionSilent() {
+    try {
+      if (this._tieActive) return;
       if (this._isShowingDice) return;
       if (this._diceTimeUpCooldown) return;
       this._lastActivityTime = Date.now();
@@ -1389,10 +1125,8 @@ export class GameServer {
       
       if (!this._isDiceTime()) {
         const clients = this.wsClients.get(DICE_ROOM);
-        if (clients?.size > 0) {
-          if (!this.diceEndNotified) {
-            this._sendDiceEndNotificationOnce();
-          }
+        if (clients?.size > 0 && !this.diceEndNotified) {
+          this._sendDiceEndNotificationOnce();
         }
         return;
       }
@@ -1417,7 +1151,6 @@ export class GameServer {
       
       try {
         this._diceRound = (this._diceRound || 0) + 1;
-        
         const diceValue = this.diceGameSystem.rollDice();
         
         this.currentDiceRoll = {
@@ -1429,7 +1162,6 @@ export class GameServer {
         this._diceQuestionStartTime = Date.now();
         
         this._canSubmitDiceAnswer = true;
-        
         this.diceAnswered = new Set();
         this.diceHasWinner = false;
         this.diceWinner = null;
@@ -1437,11 +1169,155 @@ export class GameServer {
         this._diceRemainingShown = false;
         this._diceTimeUpShown = false;
         
-        this._diceNotified20 = false;
-        this._diceNotified10 = false;
-        this._diceNotified5 = false;
-        this._diceNotified3 = false;
-        this._lastSentRemaining = -1;
+        this._diceNotifiedFlags = {
+          20: false,
+          10: false,
+          5: false,
+          timeup: false
+        };
+        
+        await this._broadcastDiceRoll(diceValue);
+        
+        this._broadcastDiceNotification("diceError", {
+          answerTime: CONSTANTS.DICE_ANSWER_TIME_MS / 1000,
+          remaining: 20,
+          message: "♡ clik draw ♡",
+          round: this._diceRound
+        });
+        
+        this._startDiceTimerNotifications();
+        
+        if (this._diceTimeout) clearTimeout(this._diceTimeout);
+        if (this._diceBreakTimeout) clearTimeout(this._diceBreakTimeout);
+        
+        this._diceTimeout = setTimeout(async () => {
+          try {
+            if (this.closing || this.isDestroyed) { 
+              this._diceTimeout = null; 
+              this._isShowingDice = false;
+              this._canSubmitDiceAnswer = false;
+              this._stopDiceTimerNotifications();
+              return; 
+            }
+            
+            if (this._tieActive) {
+              this._diceTimeout = null;
+              return;
+            }
+            
+            const currentClients = this.wsClients.get(DICE_ROOM);
+            if (!currentClients?.size) { 
+              this._diceTimeout = null; 
+              this.currentDiceRoll = null;
+              this._isShowingDice = false;
+              this._canSubmitDiceAnswer = false;
+              this._stopDiceTimerNotifications();
+              return; 
+            }
+            
+            this._stopDiceTimerNotifications();
+            
+            if (this.diceHasWinner && this.diceWinner) {
+              const points = await this._getDicePoints();
+              this._broadcastToRoom(DICE_ROOM, ["diceWinner", {
+                username: this.diceWinner,
+                totalPoints: points[this.diceWinner] || 0,
+                diceValue: diceValue,
+                round: roundNumber
+              }]);
+              
+              this._broadcastDiceNotification("diceError", {
+                username: this.diceWinner,
+                totalPoints: points[this.diceWinner] || 0,
+                diceValue: diceValue,
+                round: roundNumber,
+                remaining: -1,
+                message: `${this.diceWinner} won with value ${diceValue}`
+              });
+            } else {
+              this._broadcastToRoom(DICE_ROOM, ["diceNoWinner", {
+                message: `No winner`,
+                value: diceValue,
+                round: roundNumber
+              }]);
+            }
+            
+            this._diceTimeout = null;
+            this.currentDiceRoll = null;
+            this._isShowingDice = false;
+            this._canSubmitDiceAnswer = false;
+            this._startTimeUpCooldown();
+            
+          } catch(e) {}
+        }, CONSTANTS.DICE_TOTAL_TIME_MS);
+        
+      } catch(e) {
+        this._isShowingDice = false;
+        this.currentDiceRoll = null;
+        this._canSubmitDiceAnswer = false;
+        this._stopDiceTimerNotifications();
+      }
+    } catch(e) {}
+  }
+
+  async _showDiceQuestion() {
+    try {
+      if (this._tieActive) return;
+      if (this._isShowingDice) return;
+      if (this._diceTimeUpCooldown) return;
+      this._lastActivityTime = Date.now();
+      this._isDiceIdle = false;
+      
+      this._diceRemainingShown = false;
+      this._diceTimeUpShown = false;
+      this._diceOutOfTimeShown = false;
+      
+      if (!this._isDiceTime()) {
+        const clients = this.wsClients.get(DICE_ROOM);
+        if (clients?.size > 0 && !this.diceEndNotified) {
+          this._sendDiceEndNotificationOnce();
+        }
+        return;
+      }
+      
+      if (!this.diceAutoEnabled) {
+        this.diceAutoEnabled = true;
+        const clients = this.wsClients.get(DICE_ROOM);
+        if (clients?.size > 0) {
+          this._broadcastDiceNotification("diceError", {
+            message: "Dice game is starting soon",
+            isDiceTime: true,
+            isActive: false,
+            remaining: -1
+          });
+        }
+        return;
+      }
+      
+      if (this.isDestroyed || this._diceStartTimeout || this.currentDiceRoll) return;
+      
+      this._isShowingDice = true;
+      
+      try {
+        this._diceRound = (this._diceRound || 0) + 1;
+        const diceValue = this.diceGameSystem.rollDice();
+        
+        this.currentDiceRoll = {
+          value: diceValue,
+          timestamp: Date.now(),
+          round: this._diceRound
+        };
+        this._diceStartTime = Date.now();
+        this._diceQuestionStartTime = Date.now();
+        
+        this._canSubmitDiceAnswer = true;
+        this.diceAnswered = new Set();
+        this.diceHasWinner = false;
+        this.diceWinner = null;
+        this._winnerProcessed = false;
+        this._diceRemainingShown = false;
+        this._diceTimeUpShown = false;
+        
         this._diceNotifiedFlags = {
           20: false,
           10: false,
@@ -1489,31 +1365,9 @@ export class GameServer {
               return; 
             }
             
-            const diceValue = this.currentDiceRoll?.value;
-            const roundNumber = this._diceRound || 1;
-            
             this._stopDiceTimerNotifications();
             
             if (this.diceHasWinner && this.diceWinner) {
-              const correctPlayers = [];
-              for (const player of this.diceAnswered) {
-                const answer = this._playerAnswers.get(player);
-                if (answer === this.currentDiceRoll?.value) {
-                  correctPlayers.push(player);
-                }
-              }
-              
-              if (correctPlayers.length > 1 && !this._tieActive) {
-                this._diceTimeout = null;
-                this.currentDiceRoll = null;
-                this._isShowingDice = false;
-                this._canSubmitDiceAnswer = false;
-                this._stopDiceTimerNotifications();
-                
-                await this._startTieBreaker(DICE_ROOM, correctPlayers);
-                return;
-              }
-              
               const points = await this._getDicePoints();
               this._broadcastToRoom(DICE_ROOM, ["diceWinner", {
                 username: this.diceWinner,
@@ -1542,7 +1396,6 @@ export class GameServer {
             this.currentDiceRoll = null;
             this._isShowingDice = false;
             this._canSubmitDiceAnswer = false;
-            
             this._startTimeUpCooldown();
             
           } catch(e) {}
@@ -1557,313 +1410,37 @@ export class GameServer {
     } catch(e) {}
   }
 
-  // ==================== DICE TIMER NOTIFICATIONS ====================
-  _startDiceTimerNotifications() {
+  async _broadcastDiceRoll(diceValue) {
     try {
-      if (this._diceTimerInterval) {
-        clearInterval(this._diceTimerInterval);
-      }
+      if (this._tieActive) return;
       
-      this._diceNotified20 = false;
-      this._diceNotified10 = false;
-      this._diceNotified5 = false;
-      this._diceNotified3 = false;
-      this._diceTimeUpShown = false;
-      this._diceRemainingShown = false;
-      this._lastSentRemaining = -1;
-      this._lastNotificationKey = "";
-      this._lastNotificationTime = 0;
-      this._diceNotifiedFlags = {
-        20: false,
-        10: false,
-        5: false,
-        timeup: false
+      const wsIds = this.wsClients.get(DICE_ROOM);
+      if (!wsIds?.size) return;
+
+      const msgData = {
+        value: diceValue,
+        timestamp: Date.now(),
+        answerTime: CONSTANTS.DICE_ANSWER_TIME_MS / 1000,
+        canAnswerNow: true,
+        message: "♡ clik draw ♡",
+        round: this._diceRound || 1,
+        timerNotifications: [20, 10, 5]
       };
       
-      this._diceTimerInterval = setInterval(() => {
-        try {
-          if (!this.currentDiceRoll || !this._diceQuestionStartTime) {
-            this._stopDiceTimerNotifications();
-            return;
-          }
-          
-          const elapsed = (Date.now() - this._diceQuestionStartTime) / 1000;
-          const remaining = Math.max(0, CONSTANTS.DICE_ANSWER_TIME_MS / 1000 - elapsed);
-          const remainingInt = Math.floor(remaining);
-          
-          let shouldSend = false;
-          let message = "";
-          
-          if (remainingInt === 20 && !this._diceNotifiedFlags[20]) {
-            this._diceNotifiedFlags[20] = true;
-            shouldSend = true;
-            message = "20s remaining";
-          } else if (remainingInt === 10 && !this._diceNotifiedFlags[10]) {
-            this._diceNotifiedFlags[10] = true;
-            shouldSend = true;
-            message = "10s remaining";
-          } else if (remainingInt === 5 && !this._diceNotifiedFlags[5]) {
-            this._diceNotifiedFlags[5] = true;
-            shouldSend = true;
-            message = "5s remaining";
-          } else if (remainingInt <= 0 && !this._diceNotifiedFlags.timeup) {
-            this._diceNotifiedFlags.timeup = true;
-            shouldSend = true;
-            message = "TIME UP";
-            this._stopDiceTimerNotifications();
-            this._startTimeUpCooldown();
-          }
-          
-          if (shouldSend) {
-            this._broadcastDiceNotification("diceError", {
-              remaining: remainingInt,
-              message: message,
-              round: this._diceRound || 1,
-              isDiceTime: true,
-              isActive: true
-            });
-          }
-          
-        } catch(e) {}
-      }, 1000);
+      const msgStr = JSON.stringify(["diceRoll", msgData]);
+      const wsIdArray = Array.from(wsIds);
+      const BATCH_SIZE = CONSTANTS.BROADCAST_BATCH_SIZE || 5;
       
-    } catch(e) {}
-  }
-
-  _stopDiceTimerNotifications() {
-    try {
-      if (this._diceTimerInterval) {
-        clearInterval(this._diceTimerInterval);
-        this._diceTimerInterval = null;
-      }
-      this._diceNotified20 = false;
-      this._diceNotified10 = false;
-      this._diceNotified5 = false;
-      this._diceNotified3 = false;
-      this._diceTimeUpShown = false;
-      this._diceRemainingShown = false;
-      this._lastSentRemaining = -1;
-      this._diceNotifiedFlags = {
-        20: false,
-        10: false,
-        5: false,
-        timeup: false
-      };
-    } catch(e) {}
-  }
-
-  _startTimeUpCooldown() {
-    if (this._diceTimeUpCooldown) return;
-    
-    this._diceTimeUpCooldown = true;
-    
-    this._broadcastDiceNotification("diceError", {
-      message: "wait 15s",
-      remaining: 15,
-      isDiceTime: true,
-      isActive: false,
-      cooldown: true
-    });
-    
-    this._diceTimeUpCooldownTimer = setTimeout(() => {
-      this._diceTimeUpCooldownTimer = null;
-      this._diceTimeUpCooldown = false;
-      
-      this._diceNotifiedFlags = {
-        20: false,
-        10: false,
-        5: false,
-        timeup: false
-      };
-      this._lastSentRemaining = -1;
-      this._lastNotificationKey = "";
-      this._lastNotificationTime = 0;
-      
-      this._showDiceQuestionSilent();
-    }, 15000);
-  }
-
-  async _showDiceQuestionSilent() {
-    try {
-      if (this._tieActive) {
-        return;
-      }
-      
-      if (this._isShowingDice) return;
-      if (this._diceTimeUpCooldown) return;
-      this._lastActivityTime = Date.now();
-      this._isDiceIdle = false;
-      
-      this._diceRemainingShown = false;
-      this._diceTimeUpShown = false;
-      this._diceOutOfTimeShown = false;
-      
-      if (!this._isDiceTime()) {
-        const clients = this.wsClients.get(DICE_ROOM);
-        if (clients?.size > 0) {
-          if (!this.diceEndNotified) {
-            this._sendDiceEndNotificationOnce();
+      for (let i = 0; i < wsIdArray.length; i += BATCH_SIZE) {
+        const batch = wsIdArray.slice(i, i + BATCH_SIZE);
+        for (const wsId of batch) {
+          const ws = this.wsMap.get(wsId);
+          if (ws && ws.readyState === 1) {
+            try { ws.send(msgStr); } catch(e) {}
           }
         }
-        return;
       }
       
-      if (!this.diceAutoEnabled) {
-        this.diceAutoEnabled = true;
-        const clients = this.wsClients.get(DICE_ROOM);
-        if (clients?.size > 0) {
-          this._broadcastDiceNotification("diceError", {
-            message: "Dice game is starting soon",
-            isDiceTime: true,
-            isActive: false,
-            remaining: -1
-          });
-        }
-        return;
-      }
-      
-      if (this.isDestroyed || this._diceStartTimeout || this.currentDiceRoll) return;
-      
-      this._isShowingDice = true;
-      
-      try {
-        this._diceRound = (this._diceRound || 0) + 1;
-        
-        const diceValue = this.diceGameSystem.rollDice();
-        
-        this.currentDiceRoll = {
-          value: diceValue,
-          timestamp: Date.now(),
-          round: this._diceRound
-        };
-        this._diceStartTime = Date.now();
-        this._diceQuestionStartTime = Date.now();
-        
-        this._canSubmitDiceAnswer = true;
-        
-        this.diceAnswered = new Set();
-        this.diceHasWinner = false;
-        this.diceWinner = null;
-        this._winnerProcessed = false;
-        this._diceRemainingShown = false;
-        this._diceTimeUpShown = false;
-        
-        this._diceNotified20 = false;
-        this._diceNotified10 = false;
-        this._diceNotified5 = false;
-        this._diceNotified3 = false;
-        this._lastSentRemaining = -1;
-        this._diceNotifiedFlags = {
-          20: false,
-          10: false,
-          5: false,
-          timeup: false
-        };
-        
-        await this._broadcastDiceRoll(diceValue);
-        
-        this._broadcastDiceNotification("diceError", {
-          answerTime: CONSTANTS.DICE_ANSWER_TIME_MS / 1000,
-          remaining: 20,
-          message: "♡ clik draw ♡",
-          round: this._diceRound
-        });
-        
-        this._startDiceTimerNotifications();
-        
-        if (this._diceTimeout) clearTimeout(this._diceTimeout);
-        if (this._diceBreakTimeout) clearTimeout(this._diceBreakTimeout);
-        
-        this._diceTimeout = setTimeout(async () => {
-          try {
-            if (this.closing || this.isDestroyed) { 
-              this._diceTimeout = null; 
-              this._isShowingDice = false;
-              this._canSubmitDiceAnswer = false;
-              this._stopDiceTimerNotifications();
-              return; 
-            }
-            
-            if (this._tieActive) {
-              this._diceTimeout = null;
-              return;
-            }
-            
-            const currentClients = this.wsClients.get(DICE_ROOM);
-            if (!currentClients?.size) { 
-              this._diceTimeout = null; 
-              this.currentDiceRoll = null;
-              this._isShowingDice = false;
-              this._canSubmitDiceAnswer = false;
-              this._stopDiceTimerNotifications();
-              return; 
-            }
-            
-            const diceValue = this.currentDiceRoll?.value;
-            const roundNumber = this._diceRound || 1;
-            
-            this._stopDiceTimerNotifications();
-            
-            if (this.diceHasWinner && this.diceWinner) {
-              const correctPlayers = [];
-              for (const player of this.diceAnswered) {
-                const answer = this._playerAnswers.get(player);
-                if (answer === this.currentDiceRoll?.value) {
-                  correctPlayers.push(player);
-                }
-              }
-              
-              if (correctPlayers.length > 1 && !this._tieActive) {
-                this._diceTimeout = null;
-                this.currentDiceRoll = null;
-                this._isShowingDice = false;
-                this._canSubmitDiceAnswer = false;
-                this._stopDiceTimerNotifications();
-                
-                await this._startTieBreaker(DICE_ROOM, correctPlayers);
-                return;
-              }
-              
-              const points = await this._getDicePoints();
-              this._broadcastToRoom(DICE_ROOM, ["diceWinner", {
-                username: this.diceWinner,
-                totalPoints: points[this.diceWinner] || 0,
-                diceValue: diceValue,
-                round: roundNumber
-              }]);
-              
-              this._broadcastDiceNotification("diceError", {
-                username: this.diceWinner,
-                totalPoints: points[this.diceWinner] || 0,
-                diceValue: diceValue,
-                round: roundNumber,
-                remaining: -1,
-                message: `${this.diceWinner} won with value ${diceValue}`
-              });
-            } else {
-              this._broadcastToRoom(DICE_ROOM, ["diceNoWinner", {
-                message: `No winner`,
-                value: diceValue,
-                round: roundNumber
-              }]);
-            }
-            
-            this._diceTimeout = null;
-            this.currentDiceRoll = null;
-            this._isShowingDice = false;
-            this._canSubmitDiceAnswer = false;
-            
-            this._startTimeUpCooldown();
-            
-          } catch(e) {}
-        }, CONSTANTS.DICE_TOTAL_TIME_MS);
-        
-      } catch(e) {
-        this._isShowingDice = false;
-        this.currentDiceRoll = null;
-        this._canSubmitDiceAnswer = false;
-        this._stopDiceTimerNotifications();
-      }
     } catch(e) {}
   }
 
@@ -1882,18 +1459,11 @@ export class GameServer {
         return;
       }
       
+      // TIE BREAKER MODE
       if (this._tieActive) {
-        if (!this._tiePlayers.includes(username)) {
-          return;
-        }
-        
-        if (this._tieAnswers.has(username)) {
-          return;
-        }
-        
-        if (!this._canSubmitDiceAnswer) {
-          return;
-        }
+        if (!this._tiePlayers.includes(username)) return;
+        if (this._tieAnswers.has(username)) return;
+        if (!this._canSubmitDiceAnswer) return;
         
         this._tieAnswers.set(username, guessValue);
         this.diceAnswered.add(username);
@@ -1907,14 +1477,8 @@ export class GameServer {
         }]);
         
         if (this._tieAnswers.size === this._tiePlayers.length) {
-          if (this._tieTimer) {
-            clearTimeout(this._tieTimer);
-            this._tieTimer = null;
-          }
-          if (this._tieInterval) {
-            clearInterval(this._tieInterval);
-            this._tieInterval = null;
-          }
+          if (this._tieTimer) clearTimeout(this._tieTimer);
+          if (this._tieInterval) clearInterval(this._tieInterval);
           
           this._canSubmitDiceAnswer = false;
           this._isShowingDice = false;
@@ -1932,6 +1496,7 @@ export class GameServer {
         return;
       }
       
+      // NORMAL MODE
       if (this.diceAnswered.has(username)) return;
       
       const diceValue = this.currentDiceRoll?.value;
@@ -1963,17 +1528,8 @@ export class GameServer {
     } catch(e) {}
   }
 
-  async _getDicePoints() {
-    try {
-      if (!this.env?.QUESTIONS) return {};
-      const points = await this.diceGameSystem.getPoints();
-      return points;
-    } catch(e) {
-      return {};
-    }
-  }
+  // ==================== TIE BREAKER METHODS ====================
 
-  // ==================== TIE BREAKER ====================
   async _startTieBreaker(room, players) {
     if (!players || players.length < 2) return;
     if (this._tieActive) return;
@@ -1998,14 +1554,8 @@ export class GameServer {
     const data = this._tieBreakers.get(id);
     if (!data) return;
     
-    if (this._tieTimer) {
-      clearTimeout(this._tieTimer);
-      this._tieTimer = null;
-    }
-    if (this._tieInterval) {
-      clearInterval(this._tieInterval);
-      this._tieInterval = null;
-    }
+    if (this._tieTimer) clearTimeout(this._tieTimer);
+    if (this._tieInterval) clearInterval(this._tieInterval);
     
     this._tieRound++;
     this._tiePlayers = [...players];
@@ -2015,10 +1565,7 @@ export class GameServer {
     data.players = players;
     
     const playerNames = players.join(', ');
-    
-    this._broadcastToRoom(DICE_ROOM, ["diceNotification", 
-      `♡ Round ${this._tieRound}: ${playerNames}`
-    ]);
+    this._broadcastToRoom(DICE_ROOM, ["diceNotification", `♡ Round ${this._tieRound}: ${playerNames}`]);
     
     this._canSubmitDiceAnswer = true;
     this._diceQuestionStartTime = Date.now();
@@ -2029,14 +1576,8 @@ export class GameServer {
   }
 
   _startTieTimer(room, id, players) {
-    if (this._tieTimer) {
-      clearTimeout(this._tieTimer);
-      this._tieTimer = null;
-    }
-    if (this._tieInterval) {
-      clearInterval(this._tieInterval);
-      this._tieInterval = null;
-    }
+    if (this._tieTimer) clearTimeout(this._tieTimer);
+    if (this._tieInterval) clearInterval(this._tieInterval);
     
     let timeLeft = CONSTANTS.TIE_BREAKER_TIME_LIMIT || 20;
     let notified10 = false;
@@ -2067,7 +1608,6 @@ export class GameServer {
         
         this._canSubmitDiceAnswer = false;
         this._isShowingDice = false;
-        
         this._broadcastToRoom(DICE_ROOM, ["diceNotification", `TIME UP`]);
         
         const tieId = this._getActiveTieBreakerId();
@@ -2090,7 +1630,6 @@ export class GameServer {
         
         this._canSubmitDiceAnswer = false;
         this._isShowingDice = false;
-        
         this._broadcastToRoom(DICE_ROOM, ["diceNotification", `TIME UP`]);
         
         const tieId = this._getActiveTieBreakerId();
@@ -2108,7 +1647,6 @@ export class GameServer {
     const data = this._tieBreakers.get(id);
     if (!data) return;
     
-    const results = [];
     let highest = 0;
     let highestPlayers = [];
     let answeredPlayers = [];
@@ -2116,7 +1654,6 @@ export class GameServer {
     for (const player of players) {
       const answer = this._tieAnswers.get(player);
       if (answer !== undefined && answer >= 1 && answer <= 6) {
-        results.push({ player, answer });
         answeredPlayers.push(player);
         if (answer > highest) {
           highest = answer;
@@ -2128,9 +1665,7 @@ export class GameServer {
     }
     
     if (answeredPlayers.length === 0) {
-      this._broadcastToRoom(DICE_ROOM, ["diceNotification", 
-        `No one answered`
-      ]);
+      this._broadcastToRoom(DICE_ROOM, ["diceNotification", `No one answered`]);
       this._resetTieBreakerState(id);
       this._startCooldownAfterTieBreaker();
       return;
@@ -2138,7 +1673,6 @@ export class GameServer {
     
     if (highestPlayers.length === 1) {
       const winner = highestPlayers[0];
-      
       const points = await this._getDicePoints();
       points[winner] = (points[winner] || 0) + 1;
       await this.diceGameSystem.setPoints(points);
@@ -2170,11 +1704,9 @@ export class GameServer {
         if (this._tieActive && this._tiePlayers.length > 1) {
           this._runTieRound(room, id, this._tiePlayers);
         } else if (this._tiePlayers.length === 1) {
-          const winner = this._tiePlayers[0];
-          this._processSingleWinner(room, id, winner);
+          this._processSingleWinner(room, id, this._tiePlayers[0]);
         }
       }, 2000);
-      
       return;
     }
     
@@ -2212,10 +1744,7 @@ export class GameServer {
     
     this._diceTimeUpCooldown = true;
     
-    if (this._diceTimeUpCooldownTimer) {
-      clearTimeout(this._diceTimeUpCooldownTimer);
-      this._diceTimeUpCooldownTimer = null;
-    }
+    if (this._diceTimeUpCooldownTimer) clearTimeout(this._diceTimeUpCooldownTimer);
     
     this._diceTimeUpCooldownTimer = setTimeout(() => {
       this._diceTimeUpCooldownTimer = null;
@@ -2236,9 +1765,7 @@ export class GameServer {
   }
 
   _resetTieBreakerState(id) {
-    if (id) {
-      this._tieBreakers.delete(id);
-    }
+    if (id) this._tieBreakers.delete(id);
     this._tieActive = false;
     this._tiePlayers = [];
     this._tieAnswers = new Map();
@@ -2249,14 +1776,8 @@ export class GameServer {
     this.diceAnswered = new Set();
     this._processingTieResults = false;
     
-    if (this._tieTimer) {
-      clearTimeout(this._tieTimer);
-      this._tieTimer = null;
-    }
-    if (this._tieInterval) {
-      clearInterval(this._tieInterval);
-      this._tieInterval = null;
-    }
+    if (this._tieTimer) clearTimeout(this._tieTimer);
+    if (this._tieInterval) clearInterval(this._tieInterval);
   }
 
   _getActiveTieBreakerId() {
@@ -2268,22 +1789,14 @@ export class GameServer {
     return null;
   }
 
-  // ==================== DICE RESET ====================
   async resetDice() {
     try {
       if (this._diceTimeout) clearTimeout(this._diceTimeout);
       if (this._diceBreakTimeout) clearTimeout(this._diceBreakTimeout);
       if (this._diceStartTimeout) clearTimeout(this._diceStartTimeout);
       if (this._diceKeepAliveInterval) clearInterval(this._diceKeepAliveInterval);
-      if (this._diceAutoCheckInterval) {
-        clearInterval(this._diceAutoCheckInterval);
-        this._diceAutoCheckInterval = null;
-      }
-      
-      if (this._diceTimeUpCooldownTimer) {
-        clearTimeout(this._diceTimeUpCooldownTimer);
-        this._diceTimeUpCooldownTimer = null;
-      }
+      if (this._diceAutoCheckInterval) clearInterval(this._diceAutoCheckInterval);
+      if (this._diceTimeUpCooldownTimer) clearTimeout(this._diceTimeUpCooldownTimer);
       
       this._stopDiceTimerNotifications();
       
@@ -2320,85 +1833,168 @@ export class GameServer {
       this._tieBreakers.clear();
       this._tieRound = 0;
       this._processingTieResults = false;
-      if (this._tieTimer) {
-        clearTimeout(this._tieTimer);
-        this._tieTimer = null;
-      }
-      if (this._tieInterval) {
-        clearInterval(this._tieInterval);
-        this._tieInterval = null;
-      }
+      if (this._tieTimer) clearTimeout(this._tieTimer);
+      if (this._tieInterval) clearInterval(this._tieInterval);
     } catch(e) {}
   }
 
-  _clearDiceData() {
+  // ==================== LOW CARD RECORDING METHODS ====================
+
+  async _startRecordingWinners(roomName) {
     try {
-      if (this._diceTimeUpCooldownTimer) {
-        clearTimeout(this._diceTimeUpCooldownTimer);
-        this._diceTimeUpCooldownTimer = null;
+      if (!roomName) return false;
+      
+      const currentStatus = await this._getRecordingStatusFromKV(roomName);
+      if (currentStatus) {
+        this._broadcastToRoom(roomName, ["recordingStatus", true]);
+        return true;
       }
       
-      this.currentDiceRoll = null;
-      this._diceStartTime = null;
-      this.diceAnswered = new Set();
-      this.diceHasWinner = false;
-      this.diceWinner = null;
-      this._isShowingDice = false;
-      this._winnerProcessed = false;
-      this._canSubmitDiceAnswer = false;
-      this._diceQuestionStartTime = null;
-      this._diceOutOfTimeShown = false;
-      this._diceRemainingShown = false;
-      this._diceTimeUpShown = false;
-      this._lastSentRemaining = -1;
-      this._diceTimeUpCooldown = false;
-      this._diceNotifiedFlags = {
-        20: false,
-        10: false,
-        5: false,
-        timeup: false
-      };
+      this._recordingEnabled.set(roomName, true);
       
-      this._stopDiceTimerNotifications();
-      
-      if (this._diceTimeout) {
-        clearTimeout(this._diceTimeout);
-        this._diceTimeout = null;
-      }
-      if (this._diceBreakTimeout) {
-        clearTimeout(this._diceBreakTimeout);
-        this._diceBreakTimeout = null;
-      }
-      if (this._diceStartTimeout) {
-        clearTimeout(this._diceStartTimeout);
-        this._diceStartTimeout = null;
+      if (this.env?.QUESTIONS) {
+        await this.env.QUESTIONS.put(
+          CONSTANTS.LOWCARD_RECORDING_KEY + roomName, 
+          'true'
+        );
       }
       
-      this._playerAnswers = new Map();
-      this._tiePlayers = [];
-      this._tieAnswers = new Map();
-      this._tieActive = false;
-      this._tieBreakers.clear();
-      this._tieRound = 0;
-      this._processingTieResults = false;
-      if (this._tieTimer) {
-        clearTimeout(this._tieTimer);
-        this._tieTimer = null;
-      }
-      if (this._tieInterval) {
-        clearInterval(this._tieInterval);
-        this._tieInterval = null;
+      this._broadcastToRoom(roomName, ["recordingStatus", true]);
+      return true;
+    } catch(e) {
+      return false;
+    }
+  }
+
+  async _stopRecordingWinners(roomName) {
+    try {
+      if (!roomName) return false;
+      const room = roomName.trim();
+      
+      const currentStatus = await this._getRecordingStatusFromKV(room);
+      if (!currentStatus) {
+        this._broadcastToRoom(room, ["recordingStatus", false]);
+        return true;
       }
       
-      this._broadcastDiceNotification("diceError", {
-        message: "Dice game has ended",
-        remaining: -1,
-        clearUI: true
-      });
+      this._recordingEnabled.set(room, false);
+      
+      if (this.env?.QUESTIONS) {
+        await this.env.QUESTIONS.delete(CONSTANTS.LOWCARD_RECORDING_KEY + room);
+        await this.env.QUESTIONS.delete(CONSTANTS.LOWCARD_WINNER_KEY + room);
+      }
+      
+      this._broadcastToRoom(room, ["recordingStatus", false]);
+      return true;
+    } catch(e) {
+      return false;
+    }
+  }
+
+  async _getLowCardWinners(room) {
+    try {
+      if (!room || !this.env?.QUESTIONS) return {};
+      
+      const isRecording = await this._getRecordingStatusFromKV(room);
+      if (!isRecording) return {};
+      
+      const key = CONSTANTS.LOWCARD_WINNER_KEY + room;
+      const winners = await this.env.QUESTIONS.get(key, 'json');
+      if (winners && typeof winners === 'object' && Object.keys(winners).length > 0) {
+        return winners;
+      }
+      return {};
+    } catch(e) {
+      return {};
+    }
+  }
+
+  async _addLowCardWinner(room, username) {
+    try {
+      if (!room || !username) return false;
+      
+      const isRecordingEnabled = await this._getRecordingStatusFromKV(room);
+      if (!isRecordingEnabled || room === DICE_ROOM || !this.env?.QUESTIONS) return false;
+      
+      const key = CONSTANTS.LOWCARD_WINNER_KEY + room;
+      let roomWinners = await this.env.QUESTIONS.get(key, 'json') || {};
+      
+      let currentCount = 0;
+      if (roomWinners[username]) {
+        const valStr = String(roomWinners[username]);
+        currentCount = parseInt(valStr.replace("x", "").replace("X", "")) || 0;
+      }
+      roomWinners[username] = (currentCount + 1) + "x";
+      
+      await this.env.QUESTIONS.put(key, JSON.stringify(roomWinners));
+      this._kvCache.set(key, roomWinners);
+      return true;
+    } catch(e) {
+      return false;
+    }
+  }
+
+  async _broadcastLowCardWinners(room) {
+    try {
+      if (!room) return;
+      const isRecordingEnabled = await this._getRecordingStatusFromKV(room);
+      if (!isRecordingEnabled) return;
+      
+      const winners = await this._getLowCardWinners(room);
+      this._broadcastToRoom(room, ["lowCardWinnerUpdate", {
+        winners: winners,
+        room: room,
+        recording: true
+      }]);
     } catch(e) {}
   }
 
-  // ==================== DICE BROADCAST ====================
+  async _sendWinnersToRoom(room) {
+    try {
+      if (!room) return;
+      const isRecordingEnabled = await this._getRecordingStatusFromKV(room);
+      const winners = await this._getLowCardWinners(room);
+      this._broadcastToRoom(room, ["lowCardWinnerUpdate", {
+        winners: winners,
+        room: room,
+        recording: isRecordingEnabled
+      }]);
+    } catch(e) {}
+  }
+
+  async _handleDiceWinner(username, diceValue) {
+    try {
+      if (this._winnerProcessed) return;
+      if (!this.currentDiceRoll || !this._canSubmitDiceAnswer) return;
+      
+      this._winnerProcessed = true;
+      
+      const points = await this.diceGameSystem.getPoints();
+      points[username] = (points[username] || 0) + 1;
+      await this.diceGameSystem.setPoints(points);
+      
+      this._broadcastToRoom(DICE_ROOM, ["diceWinner", {
+        username: username,
+        totalPoints: points[username] || 0,
+        diceValue: diceValue,
+        round: this._diceRound || 1
+      }]);
+      
+      setTimeout(() => {
+        this._winnerProcessed = false;
+      }, 1000);
+    } catch(e) {}
+  }
+
+  async _getDicePoints() {
+    try {
+      if (!this.env?.QUESTIONS) return {};
+      return await this.diceGameSystem.getPoints();
+    } catch(e) {
+      return {};
+    }
+  }
+
   _sendDiceEndNotificationOnce() {
     try {
       if (this.diceEndNotified) return;
@@ -2418,9 +2014,7 @@ export class GameServer {
 
   _broadcastDiceNotification(type, data) {
     try {
-      if (this._tieActive && !data?.isTieBreaker) {
-        return;
-      }
+      if (this._tieActive && !data?.isTieBreaker) return;
       
       const wsIds = this.wsClients.get(DICE_ROOM);
       if (!wsIds?.size) return;
@@ -2430,36 +2024,20 @@ export class GameServer {
       const remaining = data.remaining !== undefined ? data.remaining : -1;
       
       let key = `dice_${remaining}`;
-      if (remaining === -1) {
-        key = `dice_msg_${message.substring(0, 30)}`;
-      }
-      
-      if (message === "TIME UP") {
-        key = "dice_timeup";
-      }
-      
-      if (data.cooldown) {
-        key = `cooldown_${remaining}`;
-      }
+      if (remaining === -1) key = `dice_msg_${message.substring(0, 30)}`;
+      if (message === "TIME UP") key = "dice_timeup";
+      if (data.cooldown) key = `cooldown_${remaining}`;
       
       if (message !== "TIME UP") {
-        if (this._lastNotificationKey === key && (now - this._lastNotificationTime) < CONSTANTS.NOTIFICATION_THROTTLE_MS) {
-          return;
-        }
-        
-        if (remaining > 0 && this._lastSentRemaining === remaining && !data.cooldown) {
-          return;
-        }
+        if (this._lastNotificationKey === key && (now - this._lastNotificationTime) < 3000) return;
+        if (remaining > 0 && this._lastSentRemaining === remaining && !data.cooldown) return;
       }
       
       this._lastNotificationKey = key;
       this._lastNotificationTime = now;
-      if (remaining > 0) {
-        this._lastSentRemaining = remaining;
-      }
+      if (remaining > 0) this._lastSentRemaining = remaining;
       
       this._broadcastToRoom(DICE_ROOM, ["diceNotification", message]);
-      
     } catch(e) {}
   }
 
@@ -2467,10 +2045,9 @@ export class GameServer {
     try {
       const wsIds = this.wsClients.get(DICE_ROOM);
       if (!wsIds?.size) return;
+      
       const now = Date.now();
-      if (now - this._lastDiceTimeLeftBroadcast < this._diceTimeLeftBroadcastCooldown) {
-        return;
-      }
+      if (now - this._lastDiceTimeLeftBroadcast < this._diceTimeLeftBroadcastCooldown) return;
       
       if (this.currentDiceRoll && this._diceStartTime) {
         const elapsed = (Date.now() - this._diceStartTime) / 1000;
@@ -2506,39 +2083,431 @@ export class GameServer {
         isActive: false
       });
       this._lastDiceTimeLeftBroadcast = now;
-      
     } catch(e) {}
   }
 
-  async _broadcastDiceRoll(diceValue) {
+  _getDiceQuestionRemainingTime() {
     try {
-      if (this._tieActive) {
+      if (!this.currentDiceRoll || !this._diceStartTime) return 0;
+      const elapsed = (Date.now() - this._diceStartTime) / 1000;
+      return Math.max(0, Math.round((CONSTANTS.DICE_TOTAL_TIME_MS / 1000) - elapsed));
+    } catch(e) { return 0; }
+  }
+
+  _getDiceAnswerRemainingTime() {
+    try {
+      if (!this.currentDiceRoll || !this._diceQuestionStartTime) return 0;
+      const elapsed = (Date.now() - this._diceQuestionStartTime) / 1000;
+      return Math.max(0, Math.round((CONSTANTS.DICE_ANSWER_TIME_MS / 1000) - elapsed));
+    } catch(e) { return 0; }
+  }
+
+  _stopDiceTimerNotifications() {
+    try {
+      this._diceNotifiedFlags = {
+        20: false,
+        10: false,
+        5: false,
+        timeup: false
+      };
+      this._lastSentRemaining = -1;
+    } catch(e) {}
+  }
+
+  // ==================== WS HELPER METHODS ====================
+
+  _getWsId(ws) { return ws?._wsId || null; }
+
+  _ensureRoomConsistency(ws) {
+    try {
+      if (!ws) return null;
+      const wsId = this._getWsId(ws);
+      if (!wsId) return null;
+      
+      let room = ws.room || ws.roomname || null;
+      if (!room) room = this.clientRooms.get(wsId) || null;
+      if (!room && ws.username) {
+        const conn = this.userConnections.get(ws.username);
+        if (conn) room = conn.room || null;
+      }
+      
+      if (room) {
+        ws.room = room;
+        ws.roomname = room;
+        if (!this.wsClients.has(room)) this.wsClients.set(room, new Set());
+        if (!this.wsClients.get(room).has(wsId)) {
+          this.wsClients.get(room).add(wsId);
+          this.clientRooms.set(wsId, room);
+          this.wsMap.set(wsId, ws);
+        }
+        return room;
+      }
+      return null;
+    } catch(e) { 
+      return null; 
+    }
+  }
+
+  _addClient(room, ws, username = null, isNewConnection = false) {
+    try {
+      if (!ws) return;
+      const wsId = this._getWsId(ws);
+      if (!wsId) { 
+        this._safeSend(ws, ["gameLowCardError", "Connection error"]); 
+        return; 
+      }
+      
+      if (this.clientRooms.has(wsId)) {
+        const oldRoom = this.clientRooms.get(wsId);
+        if (oldRoom && oldRoom !== room) {
+          this._removeClientFromRoom(oldRoom, wsId);
+        }
+      }
+      
+      if (username) {
+        let conn = this.userConnections.get(username);
+        if (conn) { 
+          conn.room = room; 
+          conn.timestamp = Date.now(); 
+          conn.ws = ws; 
+          conn.wsId = wsId;
+        } else { 
+          this.userConnections.set(username, { 
+            wsId, 
+            ws, 
+            room, 
+            timestamp: Date.now() 
+          }); 
+        }
+      }
+      
+      let clients = this.wsClients.get(room);
+      if (!clients) {
+        clients = new Set();
+        this.wsClients.set(room, clients);
+      }
+      clients.add(wsId);
+      
+      this.clientRooms.set(wsId, room);
+      this.wsMap.set(wsId, ws);
+      ws.room = room;
+      ws.roomname = room;
+      if (username) ws.username = username;
+      
+      if (username) {
+        if (!this.roomViewers.has(room)) {
+          this.roomViewers.set(room, new Set());
+        }
+        this.roomViewers.get(room).add(username);
+      }
+    } catch(e) {}
+  }
+
+  _removeClientFromRoom(room, wsId) {
+    try {
+      if (!room || !wsId) return;
+      const clients = this.wsClients.get(room);
+      if (clients) {
+        clients.delete(wsId);
+        if (clients.size === 0) {
+          this.wsClients.delete(room);
+        }
+      }
+    } catch(e) {}
+  }
+
+  _removeClient(room, ws) {
+    try {
+      if (!ws) return;
+      const wsId = this._getWsId(ws);
+      if (!wsId) return;
+      const username = ws.username;
+      this._diceTimeLeftNotified.delete(wsId);
+      this._nextDiceNotified.delete(wsId);
+      this._diceJoinedNotified.delete(wsId);
+      this._removeClientFromRoom(room, wsId);
+      this.clientRooms.delete(wsId);
+      this.wsMap.delete(wsId);
+      if (username) {
+        const conn = this.userConnections.get(username);
+        if (conn?.wsId === wsId) this.userConnections.delete(username);
+        if (this.roomViewers.has(room)) {
+          this.roomViewers.get(room).delete(username);
+          if (this.roomViewers.get(room).size === 0) this.roomViewers.delete(room);
+        }
+      }
+      ws.room = null;
+      ws.roomname = null;
+      ws._wsId = null;
+      ws.username = null;
+    } catch(e) {}
+  }
+
+  _safeSend(ws, message) {
+    try {
+      if (!ws || ws.readyState !== 1) return false;
+      ws.send(JSON.stringify(message));
+      return true;
+    } catch(e) { return false; }
+  }
+
+  async _broadcastToRoom(room, message) {
+    try {
+      if (this.closing || this.isDestroyed || !room || !message) return;
+      const wsIds = this.wsClients.get(room);
+      if (!wsIds?.size) return;
+      
+      const msgStr = JSON.stringify(message);
+      const wsIdArray = Array.from(wsIds);
+      const BATCH_SIZE = CONSTANTS.BROADCAST_BATCH_SIZE || 5;
+      
+      for (let i = 0; i < wsIdArray.length; i += BATCH_SIZE) {
+        const batch = wsIdArray.slice(i, i + BATCH_SIZE);
+        for (const wsId of batch) {
+          const ws = this.wsMap.get(wsId);
+          if (ws && ws.readyState === 1) {
+            try { ws.send(msgStr); } catch(e) {}
+          }
+        }
+      }
+    } catch(e) {}
+  }
+
+  // ==================== SWITCH ROOM ====================
+
+  async switchRoom(ws, room, username = null) {
+    try {
+      if (this.isDestroyed) { 
+        this._safeSend(ws, ["gameLowCardError", "Server is shutting down"]); 
+        return; 
+      }
+      
+      if (!room || room.trim() === "") { 
+        this._safeSend(ws, ["gameLowCardError", "Invalid room name"]); 
+        return; 
+      }
+      
+      const roomName = room.trim();
+      const wsId = this._getWsId(ws);
+      if (!wsId) { 
+        this._safeSend(ws, ["gameLowCardError", "Connection error"]); 
+        return; 
+      }
+      
+      const currentRoom = ws.room || ws.roomname || this.clientRooms.get(wsId);
+      if (currentRoom === roomName) {
+        this._safeSend(ws, ["switchRoomSuccess", roomName]);
+        this._sendGameStateToClient(ws, roomName);
+        if (roomName === DICE_ROOM) {
+          this._sendDiceNotificationOnSwitch(ws, wsId);
+        }
         return;
       }
       
-      const wsIds = this.wsClients.get(DICE_ROOM);
-      if (!wsIds?.size) return;
-
-      const msgData = {
-        value: diceValue,
-        timestamp: Date.now(),
-        answerTime: CONSTANTS.DICE_ANSWER_TIME_MS / 1000,
-        canAnswerNow: true,
-        message: "♡ clik draw ♡",
-        round: this._diceRound || 1,
-        timerNotifications: [20, 10, 5]
-      };
+      const lockKey = `switch_${wsId}`;
+      if (this._switchLocks.has(lockKey)) {
+        const retryCount = this._switchRetries.get(lockKey) || 0;
+        if (retryCount > 3) {
+          this._switchLocks.delete(lockKey);
+          this._switchRetries.delete(lockKey);
+          this._safeSend(ws, ["switchRoomError", "Switch timeout"]);
+          return;
+        }
+        this._switchRetries.set(lockKey, retryCount + 1);
+        this._safeSend(ws, ["switchRoomSuccess", currentRoom || roomName]);
+        return;
+      }
       
-      this._broadcastToRoom(DICE_ROOM, ["diceRoll", msgData]);
+      this._switchLocks.set(lockKey, Date.now());
+      this._switchRetries.set(lockKey, 0);
       
+      try {
+        if (currentRoom) {
+          this._removeClientFromRoom(currentRoom, wsId);
+        }
+        
+        this._addClient(roomName, ws, username, false);
+        ws.room = roomName;
+        ws.roomname = roomName;
+        if (username) ws.username = username;
+        
+        if (username) {
+          let conn = this.userConnections.get(username);
+          if (conn) { 
+            conn.room = roomName; 
+            conn.wsId = wsId; 
+            conn.ws = ws; 
+            conn.timestamp = Date.now(); 
+          } else { 
+            this.userConnections.set(username, { 
+              wsId, 
+              ws, 
+              room: roomName, 
+              timestamp: Date.now() 
+            }); 
+          }
+        }
+        
+        this._safeSend(ws, ["switchRoomSuccess", roomName]);
+        this._sendGameStateToClient(ws, roomName);
+        
+        if (roomName === DICE_ROOM) {
+          this._sendDiceNotificationOnSwitch(ws, wsId);
+        }
+        
+        this._broadcastToRoom(roomName, ["userJoinedRoom", username, roomName]);
+        if (currentRoom && currentRoom !== roomName) {
+          this._broadcastToRoom(currentRoom, ["userLeftRoom", username, currentRoom]);
+        }
+        
+      } finally {
+        setTimeout(() => {
+          this._switchLocks.delete(lockKey);
+          this._switchRetries.delete(lockKey);
+        }, 2000);
+      }
     } catch(e) {}
   }
 
-  // ==================== LOW CARD GAME ====================
+  _sendGameStateToClient(ws, room) {
+    try {
+      if (!ws || ws.readyState !== 1 || !room) return;
+      
+      const game = this.activeGames.get(room);
+      if (!game || !game._isActive || game._gameEnded) {
+        this._safeSend(ws, ["gameState", {
+          room: room,
+          hasGame: false,
+          gameType: 'lowcard'
+        }]);
+        return;
+      }
+      
+      const activePlayers = this._getActivePlayers(game);
+      const allPlayers = Array.from(game.players.values()).map(p => p.name);
+      const eliminated = Array.from(game.eliminated || []);
+      const submitted = Array.from(game.numbers?.keys() || []);
+      
+      const state = {
+        room: room,
+        hasGame: true,
+        gameType: 'lowcard',
+        isActive: game._isActive,
+        phase: game._phase || 'registration',
+        round: game.round || 1,
+        bet: game.betAmount || 0,
+        host: game.hostName || 'Unknown',
+        registrationOpen: game.registrationOpen || false,
+        players: allPlayers,
+        activePlayers: activePlayers.map(p => p.name),
+        eliminated: eliminated,
+        submitted: submitted,
+        playerCount: game.players.size,
+        activeCount: activePlayers.length,
+        isEvaluating: game._isEvaluating || false,
+        evaluationLocked: game.evaluationLocked || false,
+        drawTimeExpired: game.drawTimeExpired || false
+      };
+      
+      this._safeSend(ws, ["gameState", state]);
+      
+      if (game._phase === 'draw' && ws.username) {
+        const userNumber = game.numbers.get(ws.username);
+        if (userNumber !== undefined) {
+          const userTanda = game.tanda.get(ws.username) || '';
+          this._safeSend(ws, ["gameLowCardPlayerDraw", ws.username, userNumber, userTanda]);
+        }
+      }
+      
+      this._getRecordingStatusFromKV(room).then(isRecording => {
+        if (isRecording !== undefined) {
+          this._safeSend(ws, ["recordingStatus", isRecording]);
+        }
+      }).catch(() => {});
+    } catch(e) {}
+  }
+
+  _sendDiceNotificationOnSwitch(ws, wsId) {
+    try {
+      this._diceTimeLeftNotified.delete(wsId);
+      this._nextDiceNotified.delete(wsId);
+      this._diceJoinedNotified.delete(wsId);
+      
+      const isGameActive = this.currentDiceRoll && this._canSubmitDiceAnswer;
+      
+      if (isGameActive) {
+        const elapsed = (Date.now() - this._diceStartTime) / 1000;
+        const totalTime = CONSTANTS.DICE_TOTAL_TIME_MS / 1000;
+        const remaining = Math.max(0, totalTime - elapsed);
+        const remainingInt = Math.floor(remaining);
+        
+        if (remainingInt > 0) {
+          let displayTime = "";
+          if (remainingInt >= 20) displayTime = "20s remaining";
+          else if (remainingInt >= 10) displayTime = "10s remaining";
+          else if (remainingInt >= 5) displayTime = "5s remaining";
+          else displayTime = `${remainingInt}s remaining`;
+          
+          this._sendDiceNotification(ws, "diceError", {
+            message: displayTime,
+            remaining: remainingInt,
+            isDiceTime: true,
+            isActive: true
+          });
+        }
+      } else {
+        const timeLeft = this._getTimeLeftUntilNextDice();
+        
+        setTimeout(() => {
+          if (!this.closing && !this.isDestroyed && ws && ws.readyState === 1) {
+            this._sendDiceNotification(ws, "diceError", {
+              message: `Dice game ended. Next session in: ${timeLeft.text}`,
+              timeLeft: timeLeft.text,
+              hours: timeLeft.hours,
+              minutes: timeLeft.minutes,
+              remaining: -1,
+              isDiceTime: this._isDiceTime(),
+              isActive: false
+            });
+          }
+        }, 5000);
+        
+        this._diceJoinedNotified.set(wsId, true);
+      }
+      
+      if (this.currentDiceRoll && this._canSubmitDiceAnswer) {
+        this._safeSend(ws, ["diceRoll", {
+          value: this.currentDiceRoll.value,
+          timestamp: this.currentDiceRoll.timestamp,
+          answerTime: CONSTANTS.DICE_ANSWER_TIME_MS / 1000,
+          canAnswerNow: true,
+          round: this._diceRound || 1
+        }]);
+      }
+    } catch(e) {}
+  }
+
+  _sendDiceNotification(ws, type, data) {
+    try {
+      if (!ws || ws.readyState !== 1) return;
+      const message = data.message || "";
+      this._safeSend(ws, ["diceNotification", message]);
+    } catch(e) {}
+  }
+
+  // ==================== LOW CARD GAME CORE ====================
 
   _isGameActuallyRunning(game) { 
     try { 
       return game?._isActive === true && !game?._gameEnded; 
+    } catch(e) { 
+      return false; 
+    } 
+  }
+
+  _isGameValid(game) { 
+    try { 
+      return game?._isActive === true && !game?._gameEnded && game?.players?.size > 0; 
     } catch(e) { 
       return false; 
     } 
@@ -2585,6 +2554,15 @@ export class GameServer {
     } catch(e) { return 5; }
   }
 
+  _safeGetGame(room) {
+    try {
+      if (this.isDestroyed || !room) return null;
+      const game = this.activeGames.get(room);
+      if (game?._isActive && !game?._gameEnded && game?.players) return game;
+      return null;
+    } catch(e) { return null; }
+  }
+
   _scheduleGameCleanup(room, game) {
     try {
       if (!room || !game) return;
@@ -2607,30 +2585,6 @@ export class GameServer {
         } catch(e) {}
       }, CONSTANTS.GAME_CLEANUP_DELAY_MS);
       this._cleanupTimers.set(room, timer);
-    } catch(e) {}
-  }
-
-  _deleteGame(room, game) {
-    try {
-      if (!room || !game) return;
-      if (game?._isActive && !game._gameEnded) return;
-      if (this._cleanupTimers.has(room)) { 
-        clearTimeout(this._cleanupTimers.get(room)); 
-        this._cleanupTimers.delete(room); 
-      }
-      this._roomBroadcastCount.delete(room);
-      this._roomBroadcastReset.delete(room);
-      if (game) {
-        game._gameEnded = true;
-        game._isActive = false;
-        game.playerWsId = null;
-        this._cleanupGame(game);
-      }
-      this.activeGames.delete(room);
-      this._gameLocks.delete(room);
-      this._joinLocks.delete(room);
-      this._gameStartFlags.delete(room);
-      this._broadcastToRoom(room, ["gameLowCardEnd", []]);
     } catch(e) {}
   }
 
@@ -2662,33 +2616,27 @@ export class GameServer {
     } catch(e) {}
   }
 
-  async _forceCleanupGame(room, game) {
+  _deleteGame(room, game) {
     try {
-      if (!game) return;
-      const timers = ['_registrationTimer', '_drawTimer', '_evalTimer', '_safetyTimer'];
-      for (const key of timers) {
-        if (game[key]) { 
-          clearTimeout(game[key]); 
-          clearInterval(game[key]); 
-          game[key] = null; 
-        }
-      }
-      if (game._botTimeouts) { 
-        for (const id of game._botTimeouts) clearTimeout(id); 
-        game._botTimeouts.clear(); 
-      }
-      game._gameEnded = true;
-      game._isActive = false;
-      game._endTime = Date.now();
-      this._broadcastToRoom(room, ["gameLowCardEnd", []]);
-      this.activeGames.delete(room);
+      if (!room || !game) return;
+      if (game?._isActive && !game._gameEnded) return;
       if (this._cleanupTimers.has(room)) { 
         clearTimeout(this._cleanupTimers.get(room)); 
         this._cleanupTimers.delete(room); 
       }
+      this._roomBroadcastCount.delete(room);
+      this._roomBroadcastReset.delete(room);
+      if (game) {
+        game._gameEnded = true;
+        game._isActive = false;
+        game.playerWsId = null;
+        this._cleanupGame(game);
+      }
+      this.activeGames.delete(room);
       this._gameLocks.delete(room);
       this._joinLocks.delete(room);
-      this._gameStartFlags.delete(`start_${room}`);
+      this._gameStartFlags.delete(room);
+      this._broadcastToRoom(room, ["gameLowCardEnd", []]);
     } catch(e) {}
   }
 
@@ -3041,6 +2989,7 @@ export class GameServer {
     } catch(e) {}
   }
 
+  // ==================== EVALUATE ROUND ====================
   async _evaluateRound(room, game) {
     try {
       if (this.isDestroyed || !game?._isActive || game._gameEnded || game._isEvaluating || !game.players) return;
@@ -3332,6 +3281,36 @@ export class GameServer {
     } catch(e) {}
   }
 
+  async _forceCleanupGame(room, game) {
+    try {
+      if (!game) return;
+      const timers = ['_registrationTimer', '_drawTimer', '_evalTimer', '_safetyTimer'];
+      for (const key of timers) {
+        if (game[key]) { 
+          clearTimeout(game[key]); 
+          clearInterval(game[key]); 
+          game[key] = null; 
+        }
+      }
+      if (game._botTimeouts) { 
+        for (const id of game._botTimeouts) clearTimeout(id); 
+        game._botTimeouts.clear(); 
+      }
+      game._gameEnded = true;
+      game._isActive = false;
+      game._endTime = Date.now();
+      this._broadcastToRoom(room, ["gameLowCardEnd", []]);
+      this.activeGames.delete(room);
+      if (this._cleanupTimers.has(room)) { 
+        clearTimeout(this._cleanupTimers.get(room)); 
+        this._cleanupTimers.delete(room); 
+      }
+      this._gameLocks.delete(room);
+      this._joinLocks.delete(room);
+      this._gameStartFlags.delete(`start_${room}`);
+    } catch(e) {}
+  }
+
   async joinGame(ws, username) {
     try {
       if (this.isDestroyed) { 
@@ -3533,6 +3512,344 @@ export class GameServer {
     } catch(e) {}
   }
 
+  getGame(room) { return this.activeGames.get(room); }
+
+  isGameRunning(room) {
+    try {
+      if (this.isDestroyed || !room) return { running: false, message: this.isDestroyed ? "System destroyed" : "Invalid room" };
+      const game = this.activeGames.get(room);
+      if (!game?.players) return { running: false, message: "No game in this room" };
+      return { running: game._isActive && !game._gameEnded, message: "Game is " + (game._isActive && !game._gameEnded ? "running" : "not active") };
+    } catch(e) {
+      return { running: false, message: "Error checking game" };
+    }
+  }
+
+  _ensureSingleConnection(room, username, newWs, newWsId) {
+    try {
+      const game = this.activeGames.get(room);
+      if (!game) return newWsId;
+      const existingWsId = game.playerWsId?.get(username);
+      if (existingWsId && existingWsId !== newWsId) {
+        const oldWs = this.wsMap.get(existingWsId);
+        if (oldWs) {
+          try { oldWs.close(1000, "Duplicate connection"); } catch(e) {}
+          this._removeClient(room, oldWs);
+        }
+        if (game.playerWsId) game.playerWsId.set(username, newWsId);
+      }
+      return newWsId;
+    } catch(e) { return newWsId; }
+  }
+
+  _shuffleArray(array) {
+    try {
+      if (!array?.length) return array || [];
+      const arr = array.length > CONSTANTS.MAX_ARRAY_SIZE ? array.slice(0, CONSTANTS.MAX_ARRAY_SIZE) : [...array];
+      for (let i = arr.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [arr[i], arr[j]] = [arr[j], arr[i]];
+      }
+      return arr;
+    } catch(e) { return array || []; }
+  }
+
+  // ==================== EVENT HANDLING ====================
+
+  async handleEvent(ws, data) {
+    try {
+      if (this.isDestroyed || !ws || !data?.[0]) return;
+      this._eventQueue.push({ ws, data });
+      if (!this._isProcessingQueue) {
+        await this._processEventQueue();
+      }
+    } catch(e) {}
+  }
+
+  async _processEventQueue() {
+    try {
+      if (this._isProcessingQueue || this._eventQueue.length === 0) return;
+      if (this._eventQueue.length > CONSTANTS.MAX_EVENT_QUEUE_SIZE) {
+        this._eventQueue.splice(0, this._eventQueue.length - CONSTANTS.MAX_EVENT_QUEUE_SIZE);
+      }
+      this._isProcessingQueue = true;
+      const batchSize = CONSTANTS.MAX_EVENTS_PER_TICK;
+      const batch = this._eventQueue.splice(0, batchSize);
+      for (const item of batch) {
+        try {
+          await this._processEventItem(item.ws, item.data);
+        } catch(e) {
+          this._handleError('processEvent', e);
+        }
+      }
+      if (this._eventQueue.length > 0) {
+        setTimeout(() => {
+          if (!this.closing && !this.isDestroyed) {
+            this._processEventQueue();
+          }
+        }, 1);
+      }
+    } catch(e) {
+      this._handleError('processQueue', e);
+    } finally {
+      this._isProcessingQueue = false;
+    }
+  }
+
+  async _processEventItem(ws, data) {
+    try {
+      if (this.isDestroyed || !ws || !data || !data[0]) return;
+      await this._handleEventInternal(ws, data);
+    } catch(e) {}
+  }
+
+  async _handleEventInternal(ws, data) {
+    try {
+      if (this.isDestroyed || !ws || !data || !data[0]) return;
+      const evt = data[0];
+
+      if (evt === "switchRoom") {
+        const [_, room, username] = data;
+        await this.switchRoom(ws, room, username);
+        return;
+      }
+
+      if (evt === "submitDiceAnswer") {
+        const [_, username, guess] = data;
+        await this.submitDiceAnswer(ws, username, guess);
+        return;
+      }
+
+      if (evt === "getDiceLastWeekWinner") {
+        try {
+          const winner = await this.diceGameSystem.getLastWeekWinner();
+          if (winner && winner.username) {
+            this._safeSend(ws, ["diceLastWeekWinner", winner.username, winner.score || 0, winner.week || ""]);
+          } else {
+            this._safeSend(ws, ["diceLastWeekWinner", "", 0, ""]);
+          }
+        } catch(e) {
+          this._safeSend(ws, ["diceLastWeekWinner", "", 0, ""]);
+        }
+        return;
+      }
+
+      if (evt === "getDiceLeaderboard") {
+        try {
+          let limit = data.length > 1 && typeof data[1] === 'number' ? Math.min(data[1], 30) : 10;
+          const points = await this.env.QUESTIONS.get(CONSTANTS.DICE_POINT_KEY, 'json') || {};
+          const sorted = Object.entries(points)
+            .sort((a, b) => b[1] - a[1])
+            .slice(0, limit);
+          const result = sorted.map(([username, score]) => `${username}|${score}`);
+          this._safeSend(ws, ["diceLeaderboard", result]);
+        } catch(e) {
+          this._safeSend(ws, ["diceLeaderboard", []]);
+        }
+        return;
+      }
+
+      if (evt === "deleteDiceLastWeekWinner") {
+        try {
+          if (this.env?.QUESTIONS) {
+            const success = await this.diceGameSystem.deleteLastWeekWinner();
+            if (success) {
+              this._safeSend(ws, ["diceLastWeekWinnerDeleted", true, "Last week winner deleted successfully"]);
+              this._broadcastToRoom(DICE_ROOM, ["diceNotification", "Last week winner data has been deleted"]);
+            } else {
+              this._safeSend(ws, ["diceLastWeekWinnerDeleted", false, "Failed to delete"]);
+            }
+          } else {
+            this._safeSend(ws, ["diceLastWeekWinnerDeleted", false, "KV not available"]);
+          }
+        } catch(e) {
+          this._safeSend(ws, ["diceLastWeekWinnerDeleted", false, e.message]);
+        }
+        return;
+      }
+
+      if (evt === "getDiceNotification") {
+        const remaining = this._getDiceQuestionRemainingTime();
+        const timeLeft = this._getTimeLeftUntilNextDice();
+        const answerRemaining = this._getDiceAnswerRemainingTime();
+        const notification = {
+          type: "diceError",
+          timestamp: Date.now(),
+          diceValue: this.currentDiceRoll?.value || null,
+          remaining: remaining,
+          data: {
+            isDiceTime: this._isDiceTime(),
+            isActive: !!this.currentDiceRoll,
+            hasWinner: this.diceHasWinner,
+            winner: this.diceWinner,
+            timeLeft: timeLeft.text,
+            canSubmit: this._canSubmitDiceAnswer,
+            answerTimeLeft: this._canSubmitDiceAnswer ? answerRemaining : 0,
+            totalTimeLeft: Math.max(0, Math.round((CONSTANTS.DICE_TOTAL_TIME_MS - (Date.now() - this._diceStartTime)) / 1000)),
+            round: this._diceRound || 1
+          }
+        };
+        this._safeSend(ws, ["diceNotification", notification]);
+        return;
+      }
+
+      if (evt === "getDiceStatus") {
+        const isActive = !!this.currentDiceRoll && this._canSubmitDiceAnswer;
+        this._safeSend(ws, ["diceStatus", isActive, this._diceRound || 1]);
+        return;
+      }
+
+      if (evt === "getCachedResetStatus") {
+        try {
+          const now = new Date();
+          const currentWeek = this._generateCurrentWeek(now);
+          const lastResetWeek = await this._getCachedResetWeek();
+          
+          this._safeSend(ws, ["cachedResetStatus", {
+            currentWeek: currentWeek,
+            lastResetWeek: lastResetWeek || 'never',
+            needsReset: lastResetWeek !== currentWeek,
+            fromCache: true,
+            timestamp: Date.now()
+          }]);
+        } catch(e) {
+          this._safeSend(ws, ["cachedResetStatus", { error: e.message }]);
+        }
+        return;
+      }
+
+      if (evt === "startRecordingWinners") {
+        const roomName = data[1];
+        if (!roomName) {
+          this._safeSend(ws, ["recordingError", "Room name required"]);
+          return;
+        }
+        const success = await this._startRecordingWinners(roomName);
+        this._safeSend(ws, ["startRecordingResult", {
+          success: success,
+          message: success ? "Recording enabled" : "Failed to enable recording"
+        }]);
+        return;
+      }
+
+      if (evt === "stopRecordingWinners") {
+        const roomName = data[1];
+        if (!roomName) {
+          this._safeSend(ws, ["recordingError", "Room name required"]);
+          return;
+        }
+        const success = await this._stopRecordingWinners(roomName);
+        this._safeSend(ws, ["stopRecordingResult", {
+          success: success,
+          message: success ? "Recording stopped" : "Failed to stop recording"
+        }]);
+        return;
+      }
+
+      if (evt === "getRecordingStatus") {
+        const roomName = data[1];
+        if (!roomName) {
+          this._safeSend(ws, ["recordingError", "Room name required"]);
+          return;
+        }
+        const isRecordingEnabled = await this._getRecordingStatusFromKV(roomName);
+        this._safeSend(ws, ["recordingStatus", isRecordingEnabled]);
+        return;
+      }
+
+      if (evt === "sendWinnersToRoom") {
+        const room = data[1];
+        if (!room) {
+          this._safeSend(ws, ["recordingError", "Room name required"]);
+          return;
+        }
+        await this._sendWinnersToRoom(room);
+        this._safeSend(ws, ["sendWinnersResult", {
+          success: true,
+          message: "Winners data sent to room"
+        }]);
+        return;
+      }
+
+      if (evt === "getRoomWinners") {
+        const room = data[1] || ws.room || ws.roomname || this.clientRooms.get(ws._wsId);
+        if (!room) {
+          this._safeSend(ws, ["recordingError", "Room name required"]);
+          return;
+        }
+        const isRecordingEnabled = await this._getRecordingStatusFromKV(room);
+        const winners = await this._getLowCardWinners(room);
+        this._broadcastToRoom(room, ["lowCardWinnerUpdate", {
+          winners: winners,
+          room: room,
+          recording: isRecordingEnabled
+        }]);
+        this._safeSend(ws, ["sendWinnersResult", {
+          success: true,
+          message: "Winners updated to room"
+        }]);
+        return;
+      }
+
+      if (evt === "lowCardWinnerUpdate") {
+        const room = data[1] || ws.room || ws.roomname || this.clientRooms.get(ws._wsId);
+        if (!room) {
+          this._safeSend(ws, ["recordingError", "Room name required"]);
+          return;
+        }
+        await this._broadcastLowCardWinners(room);
+        this._safeSend(ws, ["sendWinnersResult", {
+          success: true,
+          message: "Winners refreshed"
+        }]);
+        return;
+      }
+
+      if (evt === "startGameWithRecording") {
+        const [_, room, bet, username] = data;
+        await this._startGameWithRecording(ws, room, bet, username);
+        return;
+      }
+
+      const room = ws.room || ws.roomname || this.clientRooms.get(ws._wsId);
+      
+      if (!room) {
+        this._safeSend(ws, ["gameLowCardError", "Please switch to a room first"]);
+        return;
+      }
+      
+      if (room === DICE_ROOM) {
+        this._safeSend(ws, ["gameLowCardError", "Cannot start game in Quiz room"]);
+        return;
+      }
+
+      switch (evt) {
+        case "gameLowCardStart":
+          await this.startGame(ws, data[1], data[2]);
+          break;
+        case "gameLowCardJoin":
+          await this.joinGame(ws, data[1]);
+          break;
+        case "gameLowCardNumber":
+          await this.submitNumber(ws, data[1], data[2] || "", data[3]);
+          break;
+        case "gameLowCardLeave":
+          await this.leaveGame(ws, data[1]);
+          break;
+        case "checkGameRunning":
+          await this.checkGameRunning(ws, data[1]);
+          break;
+        case "getGameState":
+          const targetRoom = data[1] || room;
+          this._sendGameStateToClient(ws, targetRoom);
+          break;
+        default:
+          break;
+      }
+      
+    } catch(e) {}
+  }
+
   async _startGameWithRecording(ws, room, bet, username) {
     try {
       if (!room || !username) {
@@ -3713,753 +4030,20 @@ export class GameServer {
     } catch(e) {}
   }
 
-  _performHealthCheck() {
+  _startWeeklyResetChecker() {}
+
+  _setupErrorHandlers() {
     try {
-      const now = Date.now();
-      this._lastHeartbeat = now;
-      if (this._isDiceTime() && this.currentDiceRoll && this._diceStartTime) {
-        const elapsed = (now - this._diceStartTime) / 1000;
-        if (elapsed > (CONSTANTS.DICE_TOTAL_TIME_MS / 1000) + 30) {
-          this.currentDiceRoll = null;
-          this._diceTimeout = null;
-          this._isShowingDice = false;
-          this._canSubmitDiceAnswer = false;
-          this._diceRemainingShown = false;
-          this._diceTimeUpShown = false;
-          this._stopDiceTimerNotifications();
-        }
+      const self = this;
+      if (typeof process !== 'undefined' && process.on) {
+        process.on('unhandledRejection', (reason) => {
+          self._handleError('unhandledRejection', reason);
+        });
+        process.on('uncaughtException', (error) => {
+          self._handleError('uncaughtException', error);
+        });
       }
     } catch(e) {}
-  }
-
-  // ==================== WS HELPERS ====================
-
-  _getWsId(ws) { return ws?._wsId || null; }
-
-  _ensureRoomConsistency(ws) {
-    try {
-      if (!ws) return null;
-      const wsId = this._getWsId(ws);
-      if (!wsId) return null;
-      
-      let room = ws.room || ws.roomname || null;
-      
-      if (!room) {
-        room = this.clientRooms.get(wsId) || null;
-      }
-      
-      if (!room && ws.username) {
-        const conn = this.userConnections.get(ws.username);
-        if (conn) room = conn.room || null;
-      }
-      
-      if (room) {
-        ws.room = room;
-        ws.roomname = room;
-        
-        if (!this.wsClients.has(room)) {
-          this.wsClients.set(room, new Set());
-        }
-        
-        if (!this.wsClients.get(room).has(wsId)) {
-          this.wsClients.get(room).add(wsId);
-          this.clientRooms.set(wsId, room);
-          this.wsMap.set(wsId, ws);
-        }
-        
-        return room;
-      }
-      
-      return null;
-    } catch(e) { 
-      return null; 
-    }
-  }
-
-  _addClient(room, ws, username = null, isNewConnection = false) {
-    try {
-      if (!ws) return;
-      const wsId = this._getWsId(ws);
-      if (!wsId) { 
-        this._safeSend(ws, ["gameLowCardError", "Connection error"]); 
-        return; 
-      }
-      
-      if (this.clientRooms.has(wsId)) {
-        const oldRoom = this.clientRooms.get(wsId);
-        if (oldRoom && oldRoom !== room) {
-          this._removeClientFromRoom(oldRoom, wsId);
-        }
-      }
-      
-      if (username) {
-        let conn = this.userConnections.get(username);
-        if (conn) { 
-          conn.room = room; 
-          conn.timestamp = Date.now(); 
-          conn.ws = ws; 
-          conn.wsId = wsId;
-        } else { 
-          this.userConnections.set(username, { 
-            wsId, 
-            ws, 
-            room, 
-            timestamp: Date.now() 
-          }); 
-        }
-      }
-      
-      let clients = this.wsClients.get(room);
-      if (!clients) {
-        clients = new Set();
-        this.wsClients.set(room, clients);
-      }
-      clients.add(wsId);
-      
-      this.clientRooms.set(wsId, room);
-      this.wsMap.set(wsId, ws);
-      ws.room = room;
-      ws.roomname = room;
-      if (username) ws.username = username;
-      
-      if (username) {
-        if (!this.roomViewers.has(room)) {
-          this.roomViewers.set(room, new Set());
-        }
-        this.roomViewers.get(room).add(username);
-      }
-      
-    } catch(e) {}
-  }
-
-  _removeClientFromRoom(room, wsId) {
-    try {
-      if (!room || !wsId) return;
-      const clients = this.wsClients.get(room);
-      if (clients) {
-        clients.delete(wsId);
-        if (clients.size === 0) {
-          this.wsClients.delete(room);
-        }
-      }
-    } catch(e) {}
-  }
-
-  _removeClient(room, ws) {
-    try {
-      if (!ws) return;
-      const wsId = this._getWsId(ws);
-      if (!wsId) return;
-      const username = ws.username;
-      this._diceTimeLeftNotified.delete(wsId);
-      this._nextDiceNotified.delete(wsId);
-      this._diceJoinedNotified.delete(wsId);
-      this._removeClientFromRoom(room, wsId);
-      this.clientRooms.delete(wsId);
-      this.wsMap.delete(wsId);
-      if (username) {
-        const conn = this.userConnections.get(username);
-        if (conn?.wsId === wsId) this.userConnections.delete(username);
-        if (this.roomViewers.has(room)) {
-          this.roomViewers.get(room).delete(username);
-          if (this.roomViewers.get(room).size === 0) this.roomViewers.delete(room);
-        }
-      }
-      ws.room = null;
-      ws.roomname = null;
-      ws._wsId = null;
-      ws.username = null;
-    } catch(e) {}
-  }
-
-  async switchRoom(ws, room, username = null) {
-    try {
-      if (this.isDestroyed) { 
-        this._safeSend(ws, ["gameLowCardError", "Server is shutting down"]); 
-        return; 
-      }
-      
-      if (!room || room.trim() === "") { 
-        this._safeSend(ws, ["gameLowCardError", "Invalid room name"]); 
-        return; 
-      }
-      
-      const roomName = room.trim();
-      const wsId = this._getWsId(ws);
-      if (!wsId) { 
-        this._safeSend(ws, ["gameLowCardError", "Connection error"]); 
-        return; 
-      }
-      
-      const currentRoom = ws.room || ws.roomname || this.clientRooms.get(wsId);
-      if (currentRoom === roomName) {
-        this._safeSend(ws, ["switchRoomSuccess", roomName]);
-        this._sendGameStateToClient(ws, roomName);
-        
-        if (roomName === DICE_ROOM) {
-          this._sendDiceNotificationOnSwitch(ws, wsId);
-        }
-        
-        return;
-      }
-      
-      const lockKey = `switch_${wsId}`;
-      if (this._switchLocks.has(lockKey)) {
-        const retryCount = this._switchRetries.get(lockKey) || 0;
-        if (retryCount > 3) {
-          this._switchLocks.delete(lockKey);
-          this._switchRetries.delete(lockKey);
-          this._safeSend(ws, ["switchRoomError", "Switch timeout"]);
-          return;
-        }
-        this._switchRetries.set(lockKey, retryCount + 1);
-        this._safeSend(ws, ["switchRoomSuccess", currentRoom || roomName]);
-        return;
-      }
-      
-      this._switchLocks.set(lockKey, Date.now());
-      this._switchRetries.set(lockKey, 0);
-      
-      try {
-        if (currentRoom) {
-          this._removeClientFromRoom(currentRoom, wsId);
-        }
-        
-        this._addClient(roomName, ws, username, false);
-        ws.room = roomName;
-        ws.roomname = roomName;
-        if (username) ws.username = username;
-        
-        if (username) {
-          let conn = this.userConnections.get(username);
-          if (conn) { 
-            conn.room = roomName; 
-            conn.wsId = wsId; 
-            conn.ws = ws; 
-            conn.timestamp = Date.now(); 
-          } else { 
-            this.userConnections.set(username, { 
-              wsId, 
-              ws, 
-              room: roomName, 
-              timestamp: Date.now() 
-            }); 
-          }
-        }
-        
-        this._safeSend(ws, ["switchRoomSuccess", roomName]);
-        this._sendGameStateToClient(ws, roomName);
-        
-        if (roomName === DICE_ROOM) {
-          this._sendDiceNotificationOnSwitch(ws, wsId);
-        }
-        
-        this._broadcastToRoom(roomName, ["userJoinedRoom", username, roomName]);
-        if (currentRoom && currentRoom !== roomName) {
-          this._broadcastToRoom(currentRoom, ["userLeftRoom", username, currentRoom]);
-        }
-        
-      } finally {
-        setTimeout(() => {
-          this._switchLocks.delete(lockKey);
-          this._switchRetries.delete(lockKey);
-        }, 2000);
-      }
-    } catch(e) {}
-  }
-
-  _sendGameStateToClient(ws, room) {
-    try {
-      if (!ws || ws.readyState !== 1 || !room) return;
-      
-      const game = this.activeGames.get(room);
-      if (!game || !game._isActive || game._gameEnded) {
-        this._safeSend(ws, ["gameState", {
-          room: room,
-          hasGame: false,
-          gameType: 'lowcard'
-        }]);
-        return;
-      }
-      
-      const activePlayers = this._getActivePlayers(game);
-      const allPlayers = Array.from(game.players.values()).map(p => p.name);
-      const eliminated = Array.from(game.eliminated || []);
-      const submitted = Array.from(game.numbers?.keys() || []);
-      
-      const state = {
-        room: room,
-        hasGame: true,
-        gameType: 'lowcard',
-        isActive: game._isActive,
-        phase: game._phase || 'registration',
-        round: game.round || 1,
-        bet: game.betAmount || 0,
-        host: game.hostName || 'Unknown',
-        registrationOpen: game.registrationOpen || false,
-        players: allPlayers,
-        activePlayers: activePlayers.map(p => p.name),
-        eliminated: eliminated,
-        submitted: submitted,
-        playerCount: game.players.size,
-        activeCount: activePlayers.length,
-        isEvaluating: game._isEvaluating || false,
-        evaluationLocked: game.evaluationLocked || false,
-        drawTimeExpired: game.drawTimeExpired || false
-      };
-      
-      this._safeSend(ws, ["gameState", state]);
-      
-      if (game._phase === 'draw' && ws.username) {
-        const userNumber = game.numbers.get(ws.username);
-        if (userNumber !== undefined) {
-          const userTanda = game.tanda.get(ws.username) || '';
-          this._safeSend(ws, ["gameLowCardPlayerDraw", ws.username, userNumber, userTanda]);
-        }
-      }
-      
-      this._getRecordingStatusFromKV(room).then(isRecording => {
-        if (isRecording !== undefined) {
-          this._safeSend(ws, ["recordingStatus", isRecording]);
-        }
-      }).catch(() => {});
-      
-    } catch(e) {}
-  }
-
-  _sendDiceNotificationOnSwitch(ws, wsId) {
-    try {
-      this._diceTimeLeftNotified.delete(wsId);
-      this._nextDiceNotified.delete(wsId);
-      this._diceJoinedNotified.delete(wsId);
-      
-      const isGameActive = this.currentDiceRoll && this._canSubmitDiceAnswer;
-      
-      if (isGameActive) {
-        const elapsed = (Date.now() - this._diceStartTime) / 1000;
-        const totalTime = CONSTANTS.DICE_TOTAL_TIME_MS / 1000;
-        const remaining = Math.max(0, totalTime - elapsed);
-        const remainingInt = Math.floor(remaining);
-        
-        if (remainingInt > 0) {
-          let displayTime = "";
-          if (remainingInt >= 20) {
-            displayTime = "20s remaining";
-          } else if (remainingInt >= 10) {
-            displayTime = "10s remaining";
-          } else if (remainingInt >= 5) {
-            displayTime = "5s remaining";
-          } else {
-            displayTime = `${remainingInt}s remaining`;
-          }
-          
-          this._sendDiceNotification(ws, "diceError", {
-            message: displayTime,
-            remaining: remainingInt,
-            isDiceTime: true,
-            isActive: true
-          });
-        }
-      } else {
-        const timeLeft = this._getTimeLeftUntilNextDice();
-        
-        setTimeout(() => {
-          if (!this.closing && !this.isDestroyed && ws && ws.readyState === 1) {
-            this._sendDiceNotification(ws, "diceError", {
-              message: `Dice game ended. Next session in: ${timeLeft.text}`,
-              timeLeft: timeLeft.text,
-              hours: timeLeft.hours,
-              minutes: timeLeft.minutes,
-              remaining: -1,
-              isDiceTime: this._isDiceTime(),
-              isActive: false
-            });
-          }
-        }, 5000);
-        
-        this._diceJoinedNotified.set(wsId, true);
-      }
-      
-      if (this.currentDiceRoll && this._canSubmitDiceAnswer) {
-        this._safeSend(ws, ["diceRoll", {
-          value: this.currentDiceRoll.value,
-          timestamp: this.currentDiceRoll.timestamp,
-          answerTime: CONSTANTS.DICE_ANSWER_TIME_MS / 1000,
-          canAnswerNow: true,
-          round: this._diceRound || 1
-        }]);
-      }
-    } catch(e) {}
-  }
-
-  _sendDiceNotification(ws, type, data) {
-    try {
-      if (!ws || ws.readyState !== 1) return;
-      const message = data.message || "";
-      this._safeSend(ws, ["diceNotification", message]);
-    } catch(e) {}
-  }
-
-  _sendDiceErrorWithTime(ws, errorType, customMessage = null) {
-    try {
-      if (!ws || ws.readyState !== 1) return false;
-      const timeLeft = this._getTimeLeftUntilNextDice();
-      let message = "";
-      
-      switch(errorType) {
-        case "NOT_DICE_TIME":
-          message = `Dice game will start in ${timeLeft.text}`;
-          break;
-        case "DICE_DISABLED": 
-          message = `Dice game is disabled. Next session: ${timeLeft.text}`; 
-          break;
-        case "DICE_ENDED":
-          message = `Dice game ended. Next session: ${timeLeft.text}`;
-          break;
-        case "DICE_NOT_STARTED": 
-          message = `Dice game not started. Next session: ${timeLeft.text}`; 
-          break;
-        default: 
-          message = customMessage || `Next dice game: ${timeLeft.text}`;
-      }
-      
-      this._sendDiceNotification(ws, "diceError", {
-        message: message,
-        timeLeft: timeLeft.text,
-        remaining: -1,
-        errorType: errorType,
-        isDiceTime: this._isDiceTime()
-      });
-      
-      return true;
-    } catch(e) { return false; }
-  }
-
-  _safeSend(ws, message) {
-    try {
-      if (!ws || ws.readyState !== 1) return false;
-      ws.send(JSON.stringify(message));
-      return true;
-    } catch(e) { return false; }
-  }
-
-  _broadcastToRoom(room, message) {
-    try {
-      if (this.closing || this.isDestroyed || !room || !message) return;
-      
-      // Gunakan buffer untuk optimasi
-      this._bufferBroadcast(room, message);
-      
-    } catch(e) {}
-  }
-
-  _ensureSingleConnection(room, username, newWs, newWsId) {
-    try {
-      const game = this.activeGames.get(room);
-      if (!game) return newWsId;
-      const existingWsId = game.playerWsId?.get(username);
-      if (existingWsId && existingWsId !== newWsId) {
-        const oldWs = this.wsMap.get(existingWsId);
-        if (oldWs) {
-          try { oldWs.close(1000, "Duplicate connection"); } catch(e) {}
-          this._removeClient(room, oldWs);
-        }
-        if (game.playerWsId) game.playerWsId.set(username, newWsId);
-      }
-      return newWsId;
-    } catch(e) { return newWsId; }
-  }
-
-  // ==================== EVENT HANDLING ====================
-
-  async handleEvent(ws, data) {
-    try {
-      if (this.isDestroyed || !ws || !data?.[0]) return;
-      await this._handleEventInternal(ws, data);
-    } catch(e) {}
-  }
-
-  async _handleEventInternal(ws, data) {
-    try {
-      if (this.isDestroyed || !ws || !data || !data[0]) return;
-      const evt = data[0];
-
-      if (evt === "switchRoom") {
-        const [_, room, username] = data;
-        await this.switchRoom(ws, room, username);
-        return;
-      }
-
-      if (evt === "submitDiceAnswer") {
-        const [_, username, guess] = data;
-        await this.submitDiceAnswer(ws, username, guess);
-        return;
-      }
-
-      if (evt === "getDiceLastWeekWinner") {
-        try {
-          const winner = await this.diceGameSystem.getLastWeekWinner();
-          if (winner && winner.username) {
-            this._safeSend(ws, ["diceLastWeekWinner", winner.username, winner.score || 0, winner.week || ""]);
-          } else {
-            this._safeSend(ws, ["diceLastWeekWinner", "", 0, ""]);
-          }
-        } catch(e) {
-          this._safeSend(ws, ["diceLastWeekWinner", "", 0, ""]);
-        }
-        return;
-      }
-
-      if (evt === "getDiceLeaderboard") {
-        try {
-          let limit = data.length > 1 && typeof data[1] === 'number' ? Math.min(data[1], 30) : 10;
-          
-          // Gunakan cache
-          if (this._leaderboardCache.data && 
-              (Date.now() - this._leaderboardCache.timestamp) < CONSTANTS.LEADERBOARD_CACHE_TTL_MS) {
-            const result = this._leaderboardCache.data.slice(0, limit);
-            this._safeSend(ws, ["diceLeaderboard", result]);
-            return;
-          }
-          
-          const points = await this.env.QUESTIONS.get(CONSTANTS.DICE_POINT_KEY, 'json') || {};
-          const sorted = Object.entries(points)
-            .sort((a, b) => b[1] - a[1])
-            .slice(0, limit);
-          const result = sorted.map(([username, score]) => `${username}|${score}`);
-          
-          this._leaderboardCache.data = sorted.map(([username, score]) => `${username}|${score}`);
-          this._leaderboardCache.timestamp = Date.now();
-          
-          this._safeSend(ws, ["diceLeaderboard", result]);
-        } catch(e) {
-          this._safeSend(ws, ["diceLeaderboard", []]);
-        }
-        return;
-      }
-
-      if (evt === "deleteDiceLastWeekWinner") {
-        try {
-          if (this.env?.QUESTIONS) {
-            const success = await this.diceGameSystem.deleteLastWeekWinner();
-            if (success) {
-              this._safeSend(ws, ["diceLastWeekWinnerDeleted", true, "Last week winner deleted successfully"]);
-              this._broadcastToRoom(DICE_ROOM, ["diceNotification", "Last week winner data has been deleted"]);
-            } else {
-              this._safeSend(ws, ["diceLastWeekWinnerDeleted", false, "Failed to delete"]);
-            }
-          } else {
-            this._safeSend(ws, ["diceLastWeekWinnerDeleted", false, "KV not available"]);
-          }
-        } catch(e) {
-          this._safeSend(ws, ["diceLastWeekWinnerDeleted", false, e.message]);
-        }
-        return;
-      }
-
-      if (evt === "getDiceNotification") {
-        const remaining = this._getDiceQuestionRemainingTime();
-        const timeLeft = this._getTimeLeftUntilNextDice();
-        const answerRemaining = this._getDiceAnswerRemainingTime();
-        const notification = {
-          type: "diceError",
-          timestamp: Date.now(),
-          diceValue: this.currentDiceRoll?.value || null,
-          remaining: remaining,
-          data: {
-            isDiceTime: this._isDiceTime(),
-            isActive: !!this.currentDiceRoll,
-            hasWinner: this.diceHasWinner,
-            winner: this.diceWinner,
-            timeLeft: timeLeft.text,
-            canSubmit: this._canSubmitDiceAnswer,
-            answerTimeLeft: this._canSubmitDiceAnswer ? answerRemaining : 0,
-            totalTimeLeft: Math.max(0, Math.round((CONSTANTS.DICE_TOTAL_TIME_MS - (Date.now() - this._diceStartTime)) / 1000)),
-            round: this._diceRound || 1
-          }
-        };
-        this._safeSend(ws, ["diceNotification", notification]);
-        return;
-      }
-
-      if (evt === "getDiceStatus") {
-        const isActive = !!this.currentDiceRoll && this._canSubmitDiceAnswer;
-        this._safeSend(ws, ["diceStatus", isActive, this._diceRound || 1]);
-        return;
-      }
-
-      if (evt === "getCachedResetStatus") {
-        try {
-          const now = new Date();
-          const currentWeek = this._generateCurrentWeek(now);
-          const lastResetWeek = await this._getCachedResetWeek();
-          const cacheAge = this._cachedResetWeekTimestamp ? 
-            Math.round((Date.now() - this._cachedResetWeekTimestamp) / 1000) : 0;
-          
-          this._safeSend(ws, ["cachedResetStatus", {
-            currentWeek: currentWeek,
-            lastResetWeek: lastResetWeek || 'never',
-            needsReset: lastResetWeek !== currentWeek,
-            cacheAge: cacheAge + 's',
-            fromCache: true,
-            timestamp: Date.now()
-          }]);
-        } catch(e) {
-          this._safeSend(ws, ["cachedResetStatus", { error: e.message }]);
-        }
-        return;
-      }
-
-      if (evt === "startRecordingWinners") {
-        const roomName = data[1];
-        if (!roomName) {
-          this._safeSend(ws, ["recordingError", "Room name required"]);
-          return;
-        }
-        
-        const success = await this._startRecordingWinners(roomName);
-        
-        this._safeSend(ws, ["startRecordingResult", {
-          success: success,
-          message: success ? "Recording enabled" : "Failed to enable recording"
-        }]);
-        return;
-      }
-
-      if (evt === "stopRecordingWinners") {
-        const roomName = data[1];
-        if (!roomName) {
-          this._safeSend(ws, ["recordingError", "Room name required"]);
-          return;
-        }
-        
-        const success = await this._stopRecordingWinners(roomName);
-        
-        this._safeSend(ws, ["stopRecordingResult", {
-          success: success,
-          message: success ? "Recording stopped" : "Failed to stop recording"
-        }]);
-        return;
-      }
-
-      if (evt === "getRecordingStatus") {
-        const roomName = data[1];
-        if (!roomName) {
-          this._safeSend(ws, ["recordingError", "Room name required"]);
-          return;
-        }
-        
-        const isRecordingEnabled = await this._getRecordingStatusFromKV(roomName);
-        this._safeSend(ws, ["recordingStatus", isRecordingEnabled]);
-        return;
-      }
-
-      if (evt === "sendWinnersToRoom") {
-        const room = data[1];
-        if (!room) {
-          this._safeSend(ws, ["recordingError", "Room name required"]);
-          return;
-        }
-        
-        await this._sendWinnersToRoom(room);
-        
-        this._safeSend(ws, ["sendWinnersResult", {
-          success: true,
-          message: "Winners data sent to room"
-        }]);
-        return;
-      }
-
-      if (evt === "getRoomWinners") {
-        const room = data[1] || ws.room || ws.roomname || this.clientRooms.get(ws._wsId);
-        if (!room) {
-          this._safeSend(ws, ["recordingError", "Room name required"]);
-          return;
-        }
-        
-        const isRecordingEnabled = await this._getRecordingStatusFromKV(room);
-        const winners = await this._getLowCardWinners(room);
-        
-        this._broadcastToRoom(room, ["lowCardWinnerUpdate", {
-          winners: winners,
-          room: room,
-          recording: isRecordingEnabled
-        }]);
-        
-        this._safeSend(ws, ["sendWinnersResult", {
-          success: true,
-          message: "Winners updated to room"
-        }]);
-        return;
-      }
-
-      if (evt === "lowCardWinnerUpdate") {
-        const room = data[1] || ws.room || ws.roomname || this.clientRooms.get(ws._wsId);
-        if (!room) {
-          this._safeSend(ws, ["recordingError", "Room name required"]);
-          return;
-        }
-        
-        await this._broadcastLowCardWinners(room);
-        
-        this._safeSend(ws, ["sendWinnersResult", {
-          success: true,
-          message: "Winners refreshed"
-        }]);
-        return;
-      }
-
-      if (evt === "startGameWithRecording") {
-        const [_, room, bet, username] = data;
-        await this._startGameWithRecording(ws, room, bet, username);
-        return;
-      }
-
-      const room = ws.room || ws.roomname || this.clientRooms.get(ws._wsId);
-      
-      if (!room) {
-        this._safeSend(ws, ["gameLowCardError", "Please switch to a room first"]);
-        return;
-      }
-      
-      if (room === DICE_ROOM) {
-        this._safeSend(ws, ["gameLowCardError", "Cannot start game in Quiz room"]);
-        return;
-      }
-
-      switch (evt) {
-        case "gameLowCardStart":
-          await this.startGame(ws, data[1], data[2]);
-          break;
-        case "gameLowCardJoin":
-          await this.joinGame(ws, data[1]);
-          break;
-        case "gameLowCardNumber":
-          await this.submitNumber(ws, data[1], data[2] || "", data[3]);
-          break;
-        case "gameLowCardLeave":
-          await this.leaveGame(ws, data[1]);
-          break;
-        case "checkGameRunning":
-          await this.checkGameRunning(ws, data[1]);
-          break;
-        case "getGameState":
-          const targetRoom = data[1] || room;
-          this._sendGameStateToClient(ws, targetRoom);
-          break;
-        default:
-          break;
-      }
-      
-    } catch(e) {}
-  }
-
-  _getDiceQuestionRemainingTime() {
-    try {
-      if (!this.currentDiceRoll || !this._diceStartTime) return 0;
-      const elapsed = (Date.now() - this._diceStartTime) / 1000;
-      return Math.max(0, Math.round((CONSTANTS.DICE_TOTAL_TIME_MS / 1000) - elapsed));
-    } catch(e) { return 0; }
   }
 
   _handleError(type, error) {
@@ -4484,11 +4068,59 @@ export class GameServer {
     } catch(e) {}
   }
 
+  _startHealthCheck() {}
+
+  _performHealthCheck() {
+    try {
+      const now = Date.now();
+      this._lastHeartbeat = now;
+      if (this._isProcessingQueue && this._eventQueue.length > 0) {
+        const queueAge = now - (this._lastHeartbeat || now);
+        if (queueAge > 30000) {
+          this._isProcessingQueue = false;
+          this._eventQueue = [];
+        }
+      }
+      if (this._isDiceTime() && this.currentDiceRoll && this._diceStartTime) {
+        const elapsed = (now - this._diceStartTime) / 1000;
+        if (elapsed > (CONSTANTS.DICE_TOTAL_TIME_MS / 1000) + 30) {
+          this.currentDiceRoll = null;
+          this._diceTimeout = null;
+          this._isShowingDice = false;
+          this._canSubmitDiceAnswer = false;
+          this._diceRemainingShown = false;
+          this._diceTimeUpShown = false;
+          this._stopDiceTimerNotifications();
+        }
+      }
+      const deadConnections = [];
+      for (const [wsId, ws] of this.wsMap) {
+        if (!ws || ws.readyState !== 1) {
+          deadConnections.push(wsId);
+        }
+      }
+      for (const wsId of deadConnections) {
+        try {
+          const ws = this.wsMap.get(wsId);
+          if (ws) {
+            const room = this.clientRooms.get(wsId);
+            if (room) this._removeClientFromRoom(room, wsId);
+            this.clientRooms.delete(wsId);
+            this.wsMap.delete(wsId);
+          }
+        } catch(e) {}
+      }
+    } catch(e) {}
+  }
+
   _forceRecovery() {
     try {
       if (this.closing || this.isDestroyed) return;
       if (this._recoveryAttempts >= this._maxRecoveryAttempts) return;
       this._resetCriticalState();
+      this._cleanupResources();
+      
+      this._startWeeklyResetChecker();
       
       if (!this._initialized && !this._initializing) {
         this._initAsync();
@@ -4496,6 +4128,7 @@ export class GameServer {
       if (this._isDiceTime()) {
         this.diceAutoEnabled = true;
       }
+      this._broadcastToRoom(DICE_ROOM, ["diceNotification", "Server has recovered"]);
     } catch(e) {}
   }
 
@@ -4530,14 +4163,29 @@ export class GameServer {
       this._tieBreakers.clear();
       this._tieRound = 0;
       this._processingTieResults = false;
-      if (this._tieTimer) {
-        clearTimeout(this._tieTimer);
-        this._tieTimer = null;
+      if (this._tieTimer) clearTimeout(this._tieTimer);
+      if (this._tieInterval) clearInterval(this._tieInterval);
+      
+      if (this._eventQueue) {
+        this._eventQueue = [];
       }
-      if (this._tieInterval) {
-        clearInterval(this._tieInterval);
-        this._tieInterval = null;
-      }
+    } catch(e) {}
+  }
+
+  _cleanupResources() {
+    try {
+      if (this._diceTimeout) clearTimeout(this._diceTimeout);
+      if (this._diceBreakTimeout) clearTimeout(this._diceBreakTimeout);
+      if (this._diceStartTimeout) clearTimeout(this._diceStartTimeout);
+      if (this.diceTimer) clearInterval(this.diceTimer);
+      if (this.diceAutoTimer) clearInterval(this.diceAutoTimer);
+      if (this._diceKeepAliveInterval) clearInterval(this._diceKeepAliveInterval);
+      if (this._diceAutoCheckInterval) clearInterval(this._diceAutoCheckInterval);
+      if (this._diceTimeUpCooldownTimer) clearTimeout(this._diceTimeUpCooldownTimer);
+      this._stopDiceTimerNotifications();
+      
+      if (this._tieTimer) clearTimeout(this._tieTimer);
+      if (this._tieInterval) clearInterval(this._tieInterval);
     } catch(e) {}
   }
 
@@ -4548,39 +4196,38 @@ export class GameServer {
       this.isDestroyed = true;
       this.closing = true;
       
-      if (this._masterInterval) {
-        clearInterval(this._masterInterval);
-        this._masterInterval = null;
+      if (this._mainInterval) {
+        clearInterval(this._mainInterval);
+        this._mainInterval = null;
       }
       
-      if (this._bufferFlushTimer) {
-        clearInterval(this._bufferFlushTimer);
-        this._bufferFlushTimer = null;
+      if (this._diceKeepAliveInterval) {
+        clearInterval(this._diceKeepAliveInterval);
+        this._diceKeepAliveInterval = null;
       }
-      
+      if (this._healthCheckInterval) {
+        clearInterval(this._healthCheckInterval);
+        this._healthCheckInterval = null;
+      }
       if (this._weeklyResetInterval) {
         clearInterval(this._weeklyResetInterval);
         this._weeklyResetInterval = null;
       }
-      
       if (this._diceAutoCheckInterval) {
         clearInterval(this._diceAutoCheckInterval);
         this._diceAutoCheckInterval = null;
       }
-      
       if (this._diceTimeUpCooldownTimer) {
         clearTimeout(this._diceTimeUpCooldownTimer);
         this._diceTimeUpCooldownTimer = null;
       }
       
       this._cachedResetWeek = null;
-      this._cachedResetWeekTimestamp = 0;
       this._cachedLastWeekWinner = null;
-      this._cachedLastWeekWinnerTimestamp = 0;
+      this._cachedPoints = null;
       this._recordingEnabled.clear();
       
       if (this._kvCache) {
-        this._kvCache.stopCleanup();
         this._kvCache.clear();
       }
       
@@ -4621,12 +4268,14 @@ export class GameServer {
             status: "ok",
             uptime: Date.now() - this._startTime,
             restartCount: this._restartCount,
+            isRestarting: this._isRestarting,
             isRecovering: this._isRecovering,
             diceActive: !!this.currentDiceRoll,
             diceRound: this._diceRound || 0,
             diceCooldown: this._diceTimeUpCooldown,
             gamesRunning: this.activeGames.size,
             wsConnections: this.wsMap.size,
+            eventQueueSize: this._eventQueue?.length || 0,
             errorCount: this._errorCount,
             timestamp: Date.now(),
             diceSchedule: QUIZ_SCHEDULE.SESSIONS.map(s => `${s.start}:00-${s.end}:00`),
@@ -4641,7 +4290,7 @@ export class GameServer {
             headers: { 'Content-Type': 'application/json' }
           });
         } catch(e) {
-          return new Response(JSON.stringify({ status: "degraded" }), {
+          return new Response(JSON.stringify({ status: "degraded", error: e.message }), {
             status: 500,
             headers: { 'Content-Type': 'application/json' }
           });
@@ -4669,6 +4318,9 @@ export class GameServer {
           server.roomname = null;
           server._createdAt = Date.now();
           server.username = null;
+          server._cf = req.cf || {};
+          server._country = req.cf?.country || 'US';
+          server._language = 'en';
           
           try { 
             this.state.acceptWebSocket(server); 
@@ -4711,17 +4363,13 @@ export class GameServer {
   webSocketClose(ws) {
     try {
       if (!ws) return;
-      
       ws._closing = true;
       
       const wsId = ws._wsId;
       const username = ws.username;
       const room = ws.room || ws.roomname || this.clientRooms.get(wsId);
       
-      if (room) {
-        this._removeClientFromRoom(room, wsId);
-      }
-      
+      if (room) this._removeClientFromRoom(room, wsId);
       if (wsId) {
         this.clientRooms.delete(wsId);
         this.wsMap.delete(wsId);
@@ -4729,21 +4377,15 @@ export class GameServer {
         this._nextDiceNotified.delete(wsId);
         this._diceJoinedNotified.delete(wsId);
       }
-      
       if (username) {
         const conn = this.userConnections.get(username);
-        if (conn?.wsId === wsId) {
-          this.userConnections.delete(username);
-        }
+        if (conn?.wsId === wsId) this.userConnections.delete(username);
       }
-      
       if (room && username) {
         const viewers = this.roomViewers.get(room);
         if (viewers) {
           viewers.delete(username);
-          if (viewers.size === 0) {
-            this.roomViewers.delete(room);
-          }
+          if (viewers.size === 0) this.roomViewers.delete(room);
         }
       }
       
@@ -4752,23 +4394,24 @@ export class GameServer {
       ws._wsId = null;
       ws.username = null;
       ws._closing = true;
+      
+      const clients = this.wsClients.get(DICE_ROOM);
+      if (clients?.size > 0) {
+        this.ensureDiceRunning();
+      }
     } catch(e) {}
   }
 
   async webSocketError(ws) {
     try {
       if (!ws) return;
-      
       ws._closing = true;
       
       const wsId = ws._wsId;
       const username = ws.username;
       const room = ws.room || ws.roomname || this.clientRooms.get(wsId);
       
-      if (room) {
-        this._removeClientFromRoom(room, wsId);
-      }
-      
+      if (room) this._removeClientFromRoom(room, wsId);
       if (wsId) {
         this.clientRooms.delete(wsId);
         this.wsMap.delete(wsId);
@@ -4776,21 +4419,15 @@ export class GameServer {
         this._nextDiceNotified.delete(wsId);
         this._diceJoinedNotified.delete(wsId);
       }
-      
       if (username) {
         const conn = this.userConnections.get(username);
-        if (conn?.wsId === wsId) {
-          this.userConnections.delete(username);
-        }
+        if (conn?.wsId === wsId) this.userConnections.delete(username);
       }
-      
       if (room && username) {
         const viewers = this.roomViewers.get(room);
         if (viewers) {
           viewers.delete(username);
-          if (viewers.size === 0) {
-            this.roomViewers.delete(room);
-          }
+          if (viewers.size === 0) this.roomViewers.delete(room);
         }
       }
       
@@ -4813,5 +4450,197 @@ export class GameServer {
       this._handleError('webSocketMessage', e);
       this._safeSend(ws, ["gameLowCardError", "Server is recovering"]);
     }
+  }
+
+  // ==================== INIT METHODS ====================
+
+  async _initAsync() {
+    try {
+      if (this._initializing) return;
+      if (this._initialized && !this._isRecovering) return;
+      this._initializing = true;
+      
+      await this.diceGameSystem.loadScores();
+      await this._initDice();
+      
+      this._startWeeklyResetChecker();
+      
+      setTimeout(() => {
+        if (!this.closing && !this.isDestroyed) {
+          if (this._isDiceTime()) {
+            const clients = this.wsClients.get(DICE_ROOM);
+            if (clients && clients.size > 0) {
+              this.diceAutoEnabled = true;
+              this._broadcastDiceNotification("diceError", {
+                message: "Dice game is starting now",
+                isDiceTime: true,
+                remaining: -1,
+                timestamp: Date.now()
+              });
+              
+              setTimeout(() => {
+                if (!this.closing && !this.isDestroyed) {
+                  this.forceStartDice();
+                }
+              }, CONSTANTS.DICE_AUTO_START_DELAY_MS || 3000);
+            }
+          }
+        }
+      }, 2000);
+      
+      this._initialized = true;
+      this._initializing = false;
+      this._errorCount = 0;
+      this._isRecovering = false;
+      this._diceInitAttempts = 0;
+    } catch(e) {
+      this._initializing = false;
+      this._handleError('initAsync', e);
+      if (this._diceInitAttempts < this._maxDiceInitAttempts && !this.closing && !this.isDestroyed) {
+        this._diceInitAttempts++;
+        setTimeout(() => {
+          if (!this.closing && !this.isDestroyed) {
+            this._initAsync();
+          }
+        }, 5000 * this._diceInitAttempts);
+      }
+    }
+  }
+
+  async _initDice(retryCount = 0) {
+    try {
+      await this.diceGameSystem.loadScores();
+      return true;
+    } catch(e) {
+      if (retryCount < CONSTANTS.MAX_RETRY_INIT_QUIZ && !this.closing && !this.isDestroyed) {
+        setTimeout(() => this._initDice(retryCount + 1), 5000);
+      }
+      return false;
+    }
+  }
+
+  _startDiceKeepAlive() {}
+
+  _clearDiceData() {
+    try {
+      if (this._diceTimeUpCooldownTimer) clearTimeout(this._diceTimeUpCooldownTimer);
+      this._stopDiceTimerNotifications();
+      
+      this.currentDiceRoll = null;
+      this._diceStartTime = null;
+      this.diceAnswered = new Set();
+      this.diceHasWinner = false;
+      this.diceWinner = null;
+      this._isShowingDice = false;
+      this._winnerProcessed = false;
+      this._canSubmitDiceAnswer = false;
+      this._diceQuestionStartTime = null;
+      this._diceOutOfTimeShown = false;
+      this._diceRemainingShown = false;
+      this._diceTimeUpShown = false;
+      this._lastSentRemaining = -1;
+      this._diceTimeUpCooldown = false;
+      this._diceNotifiedFlags = {
+        20: false,
+        10: false,
+        5: false,
+        timeup: false
+      };
+      
+      if (this._diceTimeout) clearTimeout(this._diceTimeout);
+      if (this._diceBreakTimeout) clearTimeout(this._diceBreakTimeout);
+      if (this._diceStartTimeout) clearTimeout(this._diceStartTimeout);
+      
+      this._playerAnswers = new Map();
+      this._tiePlayers = [];
+      this._tieAnswers = new Map();
+      this._tieActive = false;
+      this._tieBreakers.clear();
+      this._tieRound = 0;
+      this._processingTieResults = false;
+      if (this._tieTimer) clearTimeout(this._tieTimer);
+      if (this._tieInterval) clearInterval(this._tieInterval);
+      
+      this._broadcastDiceNotification("diceError", {
+        message: "Dice game has ended",
+        remaining: -1,
+        clearUI: true
+      });
+    } catch(e) {}
+  }
+
+  async startDiceWithDelay(delayMs) {
+    try {
+      if (this._diceStartTimeout) return;
+      this._diceStartTimeout = setTimeout(() => {
+        try {
+          if (this.closing || this.isDestroyed) { 
+            this._diceStartTimeout = null; 
+            return; 
+          }
+          this._diceStartTimeout = null;
+          if (!this.currentDiceRoll && this.diceAutoEnabled && !this._isShowingDice && !this._diceTimeUpCooldown) {
+            this.forceStartDice();
+          }
+        } catch(e) {}
+      }, delayMs);
+    } catch(e) {}
+  }
+
+  async _checkDiceAutoStatus() {
+    try {
+      const isDiceTime = this._isDiceTime();
+      if (isDiceTime) {
+        this._diceOutOfTimeShown = false;
+        this._diceRemainingShown = false;
+        this._diceTimeUpShown = false;
+        this._diceJoinedNotified.clear();
+        
+        this.diceEndedToday = false;
+        this.diceEndMessageShown = false;
+        this.diceEndNotified = false;
+        this._nextDiceNotified.clear();
+        
+        if (!this.diceAutoEnabled) {
+          this.diceAutoEnabled = true;
+          const wsIds = this.wsClients.get(DICE_ROOM);
+          if (wsIds?.size > 0) {
+            let hasUnnotified = false;
+            for (const wsId of wsIds) {
+              if (!this._diceTimeLeftNotified.has(wsId) && !this._nextDiceNotified.has(wsId)) {
+                hasUnnotified = true;
+                break;
+              }
+            }
+            if (hasUnnotified) {
+              this._broadcastDiceTimeLeft();
+            }
+          }
+          await this.startDiceWithDelay(CONSTANTS.QUIZ_START_DELAY_MS);
+          if (!this._diceStartTimeout && !this._isShowingDice && !this._diceTimeUpCooldown) {
+            this.forceStartDice();
+          }
+        } else if (!this.currentDiceRoll && !this._diceTimeout && !this._diceStartTimeout && !this._isShowingDice && !this._diceTimeUpCooldown) {
+          const clients = this.wsClients.get(DICE_ROOM);
+          if (clients?.size > 0) {
+            await this._showDiceQuestion();
+          }
+        }
+        return false;
+      } else {
+        if (this.diceAutoEnabled && !this.diceEndNotified) {
+          this.diceAutoEnabled = false;
+          this.diceEndedToday = true;
+          this.diceEndMessageShown = false;
+          await this.resetDice();
+          this._clearDiceData();
+          this._diceTimeLeftNotified.clear();
+          this._nextDiceNotified.clear();
+          this._diceJoinedNotified.clear();
+          this._sendDiceEndNotificationOnce();
+        }
+        return true;
+      }
+    } catch(e) { return true; }
   }
 }

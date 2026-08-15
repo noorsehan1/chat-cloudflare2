@@ -1,9 +1,11 @@
- // ==================== GAME-SERVER-FIXED.js ====================
+// ==================== GAME-SERVER-FIXED.js ====================
 // ✅ HANYA 1 INTERVAL - TANPA RECURSIVE TIMEOUT
 // ✅ TANPA CPU PROTECTION
 // ✅ RESET WINNER HANYA SAAT getDiceLastWeekWinner DIPANGGIL
 // ✅ ASYNC DIPINDAHKAN DARI CONSTRUCTOR
 // ✅ EVENT QUEUE DIBATASI
+// ✅ SEMUA TIMER CLEANUP DI DESTROY
+// ✅ TIE BREAKER AMAN
 
 const CONSTANTS = {
   MAX_LOWCARD_GAMES: 10,
@@ -410,6 +412,9 @@ export class GameServer {
       this._diceTaskRunning = false;
       this._lastRemaining = -1;
 
+      // ==================== ✅ SEMUA TIMER DISIMPAN ====================
+      this._allTimers = new Set();
+
       // ==================== ✅ 1 INTERVAL SAJA ====================
       this._tickCount = 0;
       this._mainInterval = setInterval(() => {
@@ -421,6 +426,7 @@ export class GameServer {
         this._tickCount++;
         this._doTick();
       }, 10000);
+      this._allTimers.add(this._mainInterval);
 
       // ==================== ✅ INIT SYNC (CEPAT) ====================
       this._initSync();
@@ -429,13 +435,30 @@ export class GameServer {
       this._loadKVData();
 
       // ==================== ✅ START DICE (HANYA 1 TIMEOUT) ====================
-      setTimeout(() => {
+      const startDiceTimer = setTimeout(() => {
         if (!this.closing && !this.isDestroyed && !this._isShowingDice) {
           this.forceStartDice();
         }
       }, 2000);
+      this._allTimers.add(startDiceTimer);
 
     } catch(e) {}
+  }
+
+  // ==================== ✅ TRACK TIMER ====================
+  _trackTimer(timer) {
+    if (timer) {
+      this._allTimers.add(timer);
+    }
+    return timer;
+  }
+
+  _clearTimer(timer) {
+    if (timer) {
+      clearTimeout(timer);
+      clearInterval(timer);
+      this._allTimers.delete(timer);
+    }
   }
 
   // ==================== ✅ INIT SYNC ====================
@@ -929,7 +952,7 @@ export class GameServer {
       cooldown: true
     });
     
-    this._diceTimeUpCooldownTimer = setTimeout(() => {
+    this._diceTimeUpCooldownTimer = this._trackTimer(setTimeout(() => {
       this._diceTimeUpCooldownTimer = null;
       this._diceTimeUpCooldown = false;
       
@@ -944,7 +967,7 @@ export class GameServer {
       this._lastNotificationTime = 0;
       
       this._showDiceQuestionSilent();
-    }, 15000);
+    }, 15000));
   }
 
   async _showDiceQuestion() {
@@ -1000,10 +1023,10 @@ export class GameServer {
         
         this._startDiceTimerNotifications();
         
-        if (this._diceTimeout) clearTimeout(this._diceTimeout);
-        if (this._diceBreakTimeout) clearTimeout(this._diceBreakTimeout);
+        this._clearTimer(this._diceTimeout);
+        this._clearTimer(this._diceBreakTimeout);
         
-        this._diceTimeout = setTimeout(async () => {
+        this._diceTimeout = this._trackTimer(setTimeout(async () => {
           try {
             if (this.closing || this.isDestroyed) {
               this._diceTimeout = null;
@@ -1084,7 +1107,7 @@ export class GameServer {
             this._startTimeUpCooldown();
             
           } catch(e) {}
-        }, CONSTANTS.DICE_TOTAL_TIME_MS);
+        }, CONSTANTS.DICE_TOTAL_TIME_MS));
         
       } catch(e) {
         this._isShowingDice = false;
@@ -1141,10 +1164,10 @@ export class GameServer {
         
         this._startDiceTimerNotifications();
         
-        if (this._diceTimeout) clearTimeout(this._diceTimeout);
-        if (this._diceBreakTimeout) clearTimeout(this._diceBreakTimeout);
+        this._clearTimer(this._diceTimeout);
+        this._clearTimer(this._diceBreakTimeout);
         
-        this._diceTimeout = setTimeout(async () => {
+        this._diceTimeout = this._trackTimer(setTimeout(async () => {
           try {
             if (this.closing || this.isDestroyed) {
               this._diceTimeout = null;
@@ -1217,7 +1240,7 @@ export class GameServer {
             this._startTimeUpCooldown();
             
           } catch(e) {}
-        }, CONSTANTS.DICE_TOTAL_TIME_MS);
+        }, CONSTANTS.DICE_TOTAL_TIME_MS));
         
       } catch(e) {
         this._isShowingDice = false;
@@ -1350,14 +1373,8 @@ export class GameServer {
     const data = this._tieBreakers.get(id);
     if (!data) return;
     
-    if (this._tieTimer) {
-      clearTimeout(this._tieTimer);
-      this._tieTimer = null;
-    }
-    if (this._tieInterval) {
-      clearInterval(this._tieInterval);
-      this._tieInterval = null;
-    }
+    this._clearTimer(this._tieTimer);
+    this._clearTimer(this._tieInterval);
     
     this._tieRound++;
     this._tiePlayers = [...players];
@@ -1380,21 +1397,15 @@ export class GameServer {
   }
 
   _startTieTimer(room, id, players) {
-    if (this._tieTimer) {
-      clearTimeout(this._tieTimer);
-      this._tieTimer = null;
-    }
-    if (this._tieInterval) {
-      clearInterval(this._tieInterval);
-      this._tieInterval = null;
-    }
+    this._clearTimer(this._tieTimer);
+    this._clearTimer(this._tieInterval);
     
     let timeLeft = CONSTANTS.TIE_BREAKER_TIME_LIMIT || 20;
     let notified10 = false;
     let notified5 = false;
     let isProcessed = false;
     
-    this._tieInterval = setInterval(() => {
+    this._tieInterval = this._trackTimer(setInterval(() => {
       timeLeft--;
       
       if (timeLeft === 10 && !notified10) {
@@ -1413,7 +1424,7 @@ export class GameServer {
       
       if (timeLeft <= 0 && !isProcessed) {
         isProcessed = true;
-        clearInterval(this._tieInterval);
+        this._clearTimer(this._tieInterval);
         this._tieInterval = null;
         
         this._canSubmitDiceAnswer = false;
@@ -1429,15 +1440,13 @@ export class GameServer {
           this._startCooldownAfterTieBreaker();
         }
       }
-    }, 1000);
+    }, 1000));
     
-    this._tieTimer = setTimeout(() => {
+    this._tieTimer = this._trackTimer(setTimeout(() => {
       if (!isProcessed) {
         isProcessed = true;
-        if (this._tieInterval) {
-          clearInterval(this._tieInterval);
-          this._tieInterval = null;
-        }
+        this._clearTimer(this._tieInterval);
+        this._tieInterval = null;
         
         this._canSubmitDiceAnswer = false;
         this._isShowingDice = false;
@@ -1452,7 +1461,7 @@ export class GameServer {
           this._startCooldownAfterTieBreaker();
         }
       }
-    }, (CONSTANTS.TIE_BREAKER_TIME_LIMIT || 20) * 1000 + 2000);
+    }, (CONSTANTS.TIE_BREAKER_TIME_LIMIT || 20) * 1000 + 2000));
   }
 
   async _processTieResults(room, id, players) {
@@ -1515,7 +1524,7 @@ export class GameServer {
       data.status = 'waiting';
       data.tieValue = highest;
       
-      setTimeout(() => {
+      const nextRoundTimer = setTimeout(() => {
         if (this._tieActive && this._tiePlayers.length > 1) {
           this._runTieRound(room, id, this._tiePlayers);
         } else if (this._tiePlayers.length === 1) {
@@ -1523,6 +1532,7 @@ export class GameServer {
           this._processSingleWinner(room, id, winner);
         }
       }, 2000);
+      this._trackTimer(nextRoundTimer);
       
       return;
     }
@@ -1561,12 +1571,9 @@ export class GameServer {
     
     this._diceTimeUpCooldown = true;
     
-    if (this._diceTimeUpCooldownTimer) {
-      clearTimeout(this._diceTimeUpCooldownTimer);
-      this._diceTimeUpCooldownTimer = null;
-    }
+    this._clearTimer(this._diceTimeUpCooldownTimer);
     
-    this._diceTimeUpCooldownTimer = setTimeout(() => {
+    this._diceTimeUpCooldownTimer = this._trackTimer(setTimeout(() => {
       this._diceTimeUpCooldownTimer = null;
       this._diceTimeUpCooldown = false;
       
@@ -1581,7 +1588,7 @@ export class GameServer {
       this._lastNotificationTime = 0;
       
       this._showDiceQuestionSilent();
-    }, CONSTANTS.TIE_BREAKER_COOLDOWN || 15000);
+    }, CONSTANTS.TIE_BREAKER_COOLDOWN || 15000));
   }
 
   _resetTieBreakerState(id) {
@@ -1598,14 +1605,10 @@ export class GameServer {
     this.diceAnswered = new Set();
     this._processingTieResults = false;
     
-    if (this._tieTimer) {
-      clearTimeout(this._tieTimer);
-      this._tieTimer = null;
-    }
-    if (this._tieInterval) {
-      clearInterval(this._tieInterval);
-      this._tieInterval = null;
-    }
+    this._clearTimer(this._tieTimer);
+    this._clearTimer(this._tieInterval);
+    this._tieTimer = null;
+    this._tieInterval = null;
   }
 
   _getActiveTieBreakerId() {
@@ -1651,22 +1654,17 @@ export class GameServer {
         }]);
         
         if (this._tieAnswers.size === this._tiePlayers.length) {
-          if (this._tieTimer) {
-            clearTimeout(this._tieTimer);
-            this._tieTimer = null;
-          }
-          if (this._tieInterval) {
-            clearInterval(this._tieInterval);
-            this._tieInterval = null;
-          }
+          this._clearTimer(this._tieTimer);
+          this._clearTimer(this._tieInterval);
           this._canSubmitDiceAnswer = false;
           this._isShowingDice = false;
           
           const tieId = this._getActiveTieBreakerId();
           if (tieId) {
-            setTimeout(async () => {
+            const processTimer = setTimeout(async () => {
               await this._processTieResults(DICE_ROOM, tieId, this._tiePlayers);
             }, 500);
+            this._trackTimer(processTimer);
           } else {
             this._resetTieBreakerState(null);
             this._startCooldownAfterTieBreaker();
@@ -1716,7 +1714,7 @@ export class GameServer {
   async startDiceWithDelay(delayMs) {
     try {
       if (this._diceStartTimeout) return;
-      this._diceStartTimeout = setTimeout(() => {
+      this._diceStartTimeout = this._trackTimer(setTimeout(() => {
         try {
           if (this.closing || this.isDestroyed) { 
             this._diceStartTimeout = null; 
@@ -1727,19 +1725,16 @@ export class GameServer {
             this.forceStartDice();
           }
         } catch(e) {}
-      }, delayMs);
+      }, delayMs));
     } catch(e) {}
   }
 
   async resetDice() {
     try {
-      if (this._diceTimeout) clearTimeout(this._diceTimeout);
-      if (this._diceBreakTimeout) clearTimeout(this._diceBreakTimeout);
-      if (this._diceStartTimeout) clearTimeout(this._diceStartTimeout);
-      if (this._diceTimeUpCooldownTimer) {
-        clearTimeout(this._diceTimeUpCooldownTimer);
-        this._diceTimeUpCooldownTimer = null;
-      }
+      this._clearTimer(this._diceTimeout);
+      this._clearTimer(this._diceBreakTimeout);
+      this._clearTimer(this._diceStartTimeout);
+      this._clearTimer(this._diceTimeUpCooldownTimer);
       
       this._stopDiceTimerNotifications();
       
@@ -1776,23 +1771,18 @@ export class GameServer {
       this._tieBreakers.clear();
       this._tieRound = 0;
       this._processingTieResults = false;
-      if (this._tieTimer) {
-        clearTimeout(this._tieTimer);
-        this._tieTimer = null;
-      }
-      if (this._tieInterval) {
-        clearInterval(this._tieInterval);
-        this._tieInterval = null;
-      }
+      
+      this._clearTimer(this._tieTimer);
+      this._clearTimer(this._tieInterval);
+      this._tieTimer = null;
+      this._tieInterval = null;
+      
     } catch(e) {}
   }
 
   _clearDiceData() {
     try {
-      if (this._diceTimeUpCooldownTimer) {
-        clearTimeout(this._diceTimeUpCooldownTimer);
-        this._diceTimeUpCooldownTimer = null;
-      }
+      this._clearTimer(this._diceTimeUpCooldownTimer);
       
       this.currentDiceRoll = null;
       this._diceStartTime = null;
@@ -1817,18 +1807,12 @@ export class GameServer {
       
       this._stopDiceTimerNotifications();
       
-      if (this._diceTimeout) {
-        clearTimeout(this._diceTimeout);
-        this._diceTimeout = null;
-      }
-      if (this._diceBreakTimeout) {
-        clearTimeout(this._diceBreakTimeout);
-        this._diceBreakTimeout = null;
-      }
-      if (this._diceStartTimeout) {
-        clearTimeout(this._diceStartTimeout);
-        this._diceStartTimeout = null;
-      }
+      this._clearTimer(this._diceTimeout);
+      this._clearTimer(this._diceBreakTimeout);
+      this._clearTimer(this._diceStartTimeout);
+      this._diceTimeout = null;
+      this._diceBreakTimeout = null;
+      this._diceStartTimeout = null;
       
       this._playerAnswers = new Map();
       this._tiePlayers = [];
@@ -1837,14 +1821,11 @@ export class GameServer {
       this._tieBreakers.clear();
       this._tieRound = 0;
       this._processingTieResults = false;
-      if (this._tieTimer) {
-        clearTimeout(this._tieTimer);
-        this._tieTimer = null;
-      }
-      if (this._tieInterval) {
-        clearInterval(this._tieInterval);
-        this._tieInterval = null;
-      }
+      
+      this._clearTimer(this._tieTimer);
+      this._clearTimer(this._tieInterval);
+      this._tieTimer = null;
+      this._tieInterval = null;
       
       this._broadcastDiceNotification("diceError", {
         message: "Dice game has ended",
@@ -2391,10 +2372,11 @@ export class GameServer {
         }
         
       } finally {
-        setTimeout(() => {
+        const unlockTimer = setTimeout(() => {
           this._switchLocks.delete(lockKey);
           this._switchRetries.delete(lockKey);
         }, 2000);
+        this._trackTimer(unlockTimer);
       }
     } catch(e) {}
   }
@@ -2488,7 +2470,7 @@ export class GameServer {
       } else {
         const timeLeft = this._getTimeLeftUntilNextDice();
         
-        setTimeout(() => {
+        const notifTimer = setTimeout(() => {
           if (!this.closing && !this.isDestroyed && ws && ws.readyState === 1) {
             this._sendDiceNotification(ws, "diceError", {
               message: `Dice game ended. Next session in: ${timeLeft.text}`,
@@ -2501,6 +2483,7 @@ export class GameServer {
             });
           }
         }, 5000);
+        this._trackTimer(notifTimer);
         
         this._diceJoinedNotified.set(wsId, true);
       }
@@ -2581,11 +2564,11 @@ export class GameServer {
       if (!room || !game) return;
       if (this._cleanupTimers.has(room)) {
         const oldTimer = this._cleanupTimers.get(room);
-        if (oldTimer) clearTimeout(oldTimer);
+        this._clearTimer(oldTimer);
         this._cleanupTimers.delete(room);
       }
       if (!game._gameEnded) return;
-      const timer = setTimeout(() => {
+      const timer = this._trackTimer(setTimeout(() => {
         try {
           const currentGame = this.activeGames.get(room);
           if (currentGame?._isActive && !currentGame._gameEnded) { 
@@ -2596,7 +2579,7 @@ export class GameServer {
           const gameToDelete = this.activeGames.get(room);
           if (gameToDelete) this._deleteGame(room, gameToDelete);
         } catch(e) {}
-      }, CONSTANTS.GAME_CLEANUP_DELAY_MS);
+      }, CONSTANTS.GAME_CLEANUP_DELAY_MS));
       this._cleanupTimers.set(room, timer);
     } catch(e) {}
   }
@@ -2606,7 +2589,7 @@ export class GameServer {
       if (!room || !game) return;
       if (game?._isActive && !game._gameEnded) return;
       if (this._cleanupTimers.has(room)) { 
-        clearTimeout(this._cleanupTimers.get(room)); 
+        this._clearTimer(this._cleanupTimers.get(room));
         this._cleanupTimers.delete(room); 
       }
       if (game) {
@@ -2629,13 +2612,14 @@ export class GameServer {
       const timers = ['_registrationTimer', '_drawTimer', '_evalTimer', '_safetyTimer'];
       for (const key of timers) {
         if (game[key]) { 
-          clearTimeout(game[key]); 
-          clearInterval(game[key]); 
+          this._clearTimer(game[key]);
           game[key] = null; 
         }
       }
       if (game._botTimeouts) {
-        for (const id of game._botTimeouts) clearTimeout(id);
+        for (const id of game._botTimeouts) {
+          this._clearTimer(id);
+        }
         game._botTimeouts.clear();
         game._botTimeouts = null;
       }
@@ -2682,7 +2666,7 @@ export class GameServer {
         .slice(0, CONSTANTS.MAX_BOT_DRAWS_PER_ROUND);
       for (const botId of notDrawn) {
         const delay = this._getRandomDrawDelay();
-        const timeout = setTimeout(() => {
+        const timeout = this._trackTimer(setTimeout(() => {
           try {
             const currentGame = this.activeGames.get(room);
             if (this._isGameActuallyRunning(currentGame) && !currentGame.drawTimeExpired &&
@@ -2691,7 +2675,7 @@ export class GameServer {
             }
             currentGame?._botTimeouts?.delete(timeout);
           } catch(e) {}
-        }, delay);
+        }, delay));
         game._botTimeouts.add(timeout);
       }
     } catch(e) {}
@@ -2711,11 +2695,12 @@ export class GameServer {
       if (game.numbers.size === activeIds.length && !game.evaluationLocked && !game.drawTimeExpired && this._isGameActuallyRunning(game)) {
         game.evaluationLocked = true;
         this._broadcastToRoom(room, ["gameLowCardWait", "wait results"]);
-        game._evalTimer = setTimeout(() => { 
+        const evalTimer = this._trackTimer(setTimeout(() => { 
           try { 
             this._evaluateRound(room, game); 
           } catch(e) {} 
-        }, CONSTANTS.EVALUATION_DELAY_MS);
+        }, CONSTANTS.EVALUATION_DELAY_MS));
+        game._evalTimer = evalTimer;
       }
     } catch(e) {}
   }
@@ -2737,14 +2722,14 @@ export class GameServer {
     try {
       if (!this._isGameActuallyRunning(game) || !game.registrationOpen) return;
       if (game._registrationTimer) { 
-        clearInterval(game._registrationTimer); 
+        this._clearTimer(game._registrationTimer);
         game._registrationTimer = null; 
       }
       let timeLeft = 20;
-      const timer = setInterval(() => {
+      const timer = this._trackTimer(setInterval(() => {
         try {
           if (!this._isGameActuallyRunning(game) || !game.registrationOpen || timeLeft < 0) {
-            clearInterval(timer);
+            this._clearTimer(timer);
             if (game._registrationTimer === timer) game._registrationTimer = null;
             return;
           }
@@ -2752,17 +2737,17 @@ export class GameServer {
             this._broadcastToRoom(room, ["gameLowCardTimeLeft", `${timeLeft}s`]);
           }
           if (timeLeft === 0) {
-            clearInterval(timer);
+            this._clearTimer(timer);
             game._registrationTimer = null;
             this._broadcastToRoom(room, ["gameLowCardTimeLeft", "TIME UP"]);
             this._closeRegistration(room, game);
           }
           timeLeft--;
         } catch(e) { 
-          clearInterval(timer); 
+          this._clearTimer(timer); 
           if (game._registrationTimer === timer) game._registrationTimer = null; 
         }
-      }, 1000);
+      }, 1000));
       game._registrationTimer = timer;
     } catch(e) {}
   }
@@ -2772,7 +2757,7 @@ export class GameServer {
       if (!this._isGameActuallyRunning(game) || !game.registrationOpen) return;
       game.registrationOpen = false;
       if (game._registrationTimer) { 
-        clearInterval(game._registrationTimer); 
+        this._clearTimer(game._registrationTimer);
         game._registrationTimer = null; 
       }
       const humanPlayers = Array.from(game.players.keys()).filter(id => !id.startsWith('BOT_'));
@@ -2806,15 +2791,17 @@ export class GameServer {
     try {
       if (!this._isGameActuallyRunning(game)) return;
       if (game._drawTimer) { 
-        clearInterval(game._drawTimer); 
+        this._clearTimer(game._drawTimer);
         game._drawTimer = null; 
       }
       if (game._evalTimer) { 
-        clearTimeout(game._evalTimer); 
+        this._clearTimer(game._evalTimer);
         game._evalTimer = null; 
       }
       if (game._botTimeouts) { 
-        for (const id of game._botTimeouts) clearTimeout(id); 
+        for (const id of game._botTimeouts) {
+          this._clearTimer(id);
+        }
         game._botTimeouts.clear(); 
       }
       const activePlayers = this._getActivePlayers(game);
@@ -2874,14 +2861,14 @@ export class GameServer {
     try {
       if (!this._isGameActuallyRunning(game)) return;
       if (game._drawTimer) { 
-        clearInterval(game._drawTimer); 
+        this._clearTimer(game._drawTimer);
         game._drawTimer = null; 
       }
       let timeLeft = 20;
-      const timer = setInterval(() => {
+      const timer = this._trackTimer(setInterval(() => {
         try {
           if (!this._isGameActuallyRunning(game) || game.drawTimeExpired || timeLeft < 0) {
-            clearInterval(timer);
+            this._clearTimer(timer);
             if (game._drawTimer === timer) game._drawTimer = null;
             return;
           }
@@ -2889,17 +2876,17 @@ export class GameServer {
             this._broadcastToRoom(room, ["gameLowCardTimeLeft", `${timeLeft}s`]);
           }
           if (timeLeft === 0) {
-            clearInterval(timer);
+            this._clearTimer(timer);
             game._drawTimer = null;
             this._broadcastToRoom(room, ["gameLowCardTimeLeft", "TIME UP"]);
             this._closeDrawPhase(room, game);
           }
           timeLeft--;
         } catch(e) { 
-          clearInterval(timer); 
+          this._clearTimer(timer); 
           if (game._drawTimer === timer) game._drawTimer = null; 
         }
-      }, 1000);
+      }, 1000));
       game._drawTimer = timer;
     } catch(e) {}
   }
@@ -2910,7 +2897,7 @@ export class GameServer {
       game.drawTimeExpired = true;
       game.evaluationLocked = true;
       if (game._drawTimer) { 
-        clearInterval(game._drawTimer); 
+        this._clearTimer(game._drawTimer);
         game._drawTimer = null; 
       }
       if (game.botPlayers?.size > 0 && this._isGameActuallyRunning(game)) {
@@ -2920,17 +2907,18 @@ export class GameServer {
       }
       this._broadcastToRoom(room, ["gameLowCardWait", "wait results"]);
       if (game._evalTimer) { 
-        clearTimeout(game._evalTimer); 
+        this._clearTimer(game._evalTimer);
         game._evalTimer = null; 
       }
-      game._evalTimer = setTimeout(() => {
+      const evalTimer = this._trackTimer(setTimeout(() => {
         try {
           const currentGame = this.activeGames.get(room);
           if (currentGame && currentGame === game && currentGame._isActive && !currentGame._gameEnded) {
             this._evaluateRound(room, game);
           }
         } catch(e) {}
-      }, CONSTANTS.EVALUATION_DELAY_MS);
+      }, CONSTANTS.EVALUATION_DELAY_MS));
+      game._evalTimer = evalTimer;
     } catch(e) {}
   }
 
@@ -2941,21 +2929,24 @@ export class GameServer {
       if (currentGame !== game) return;
       
       game._isEvaluating = true;
-      game._safetyTimer = setTimeout(() => {
+      const safetyTimer = this._trackTimer(setTimeout(() => {
         try { 
           if (game?._isEvaluating) { 
             game._isEvaluating = false; 
             this._scheduleGameCleanup(room, game); 
           } 
         } catch(e) {}
-      }, CONSTANTS.EVALUATION_TIMEOUT_MS);
+      }, CONSTANTS.EVALUATION_TIMEOUT_MS));
+      game._safetyTimer = safetyTimer;
       
       if (game._evalTimer) { 
-        clearTimeout(game._evalTimer); 
+        this._clearTimer(game._evalTimer);
         game._evalTimer = null; 
       }
       if (game._botTimeouts) { 
-        for (const id of game._botTimeouts) clearTimeout(id); 
+        for (const id of game._botTimeouts) {
+          this._clearTimer(id);
+        }
         game._botTimeouts.clear(); 
       }
       
@@ -2974,7 +2965,7 @@ export class GameServer {
       if (entries.length === 0) {
         game._isEvaluating = false;
         if (game._safetyTimer) { 
-          clearTimeout(game._safetyTimer); 
+          this._clearTimer(game._safetyTimer);
           game._safetyTimer = null; 
         }
         this._broadcastToRoom(room, ["gameLowCardError", "No numbers drawn this round"]);
@@ -3007,7 +2998,7 @@ export class GameServer {
         game._endTime = Date.now();
         game._isEvaluating = false;
         if (game._safetyTimer) { 
-          clearTimeout(game._safetyTimer); 
+          this._clearTimer(game._safetyTimer);
           game._safetyTimer = null; 
         }
         this._scheduleGameCleanup(room, game);
@@ -3018,7 +3009,7 @@ export class GameServer {
       if (game.numbers.size < activePlayerIds.length) {
         game._isEvaluating = false;
         if (game._safetyTimer) { 
-          clearTimeout(game._safetyTimer); 
+          this._clearTimer(game._safetyTimer);
           game._safetyTimer = null; 
         }
         return;
@@ -3039,7 +3030,7 @@ export class GameServer {
       if (allSame && remaining.length >= 2) {
         game._isEvaluating = false;
         if (game._safetyTimer) { 
-          clearTimeout(game._safetyTimer); 
+          this._clearTimer(game._safetyTimer);
           game._safetyTimer = null; 
         }
         numbers.clear();
@@ -3086,7 +3077,7 @@ export class GameServer {
         game._endTime = Date.now();
         game._isEvaluating = false;
         if (game._safetyTimer) { 
-          clearTimeout(game._safetyTimer); 
+          this._clearTimer(game._safetyTimer);
           game._safetyTimer = null; 
         }
         this._scheduleGameCleanup(room, game);
@@ -3096,7 +3087,7 @@ export class GameServer {
       if (remaining.length === 0) {
         game._isEvaluating = false;
         if (game._safetyTimer) { 
-          clearTimeout(game._safetyTimer); 
+          this._clearTimer(game._safetyTimer);
           game._safetyTimer = null; 
         }
         game._gameEnded = true;
@@ -3125,7 +3116,7 @@ export class GameServer {
       game._isEvaluating = false;
       
       if (game._safetyTimer) { 
-        clearTimeout(game._safetyTimer); 
+        this._clearTimer(game._safetyTimer);
         game._safetyTimer = null; 
       }
       
@@ -3221,13 +3212,14 @@ export class GameServer {
       const timers = ['_registrationTimer', '_drawTimer', '_evalTimer', '_safetyTimer'];
       for (const key of timers) {
         if (game[key]) { 
-          clearTimeout(game[key]); 
-          clearInterval(game[key]); 
+          this._clearTimer(game[key]);
           game[key] = null; 
         }
       }
       if (game._botTimeouts) { 
-        for (const id of game._botTimeouts) clearTimeout(id); 
+        for (const id of game._botTimeouts) {
+          this._clearTimer(id);
+        }
         game._botTimeouts.clear(); 
       }
       game._gameEnded = true;
@@ -3236,7 +3228,7 @@ export class GameServer {
       this._broadcastToRoom(room, ["gameLowCardEnd", []]);
       this.activeGames.delete(room);
       if (this._cleanupTimers.has(room)) { 
-        clearTimeout(this._cleanupTimers.get(room)); 
+        this._clearTimer(this._cleanupTimers.get(room));
         this._cleanupTimers.delete(room); 
       }
       this._gameLocks.delete(room);
@@ -3350,18 +3342,19 @@ export class GameServer {
           this._isGameActuallyRunning(game) && game._isActive && !game._gameEnded) {
         game.evaluationLocked = true;
         if (game._evalTimer) { 
-          clearTimeout(game._evalTimer); 
+          this._clearTimer(game._evalTimer);
           game._evalTimer = null; 
         }
         this._broadcastToRoom(room, ["gameLowCardWait", "wait results"]);
-        game._evalTimer = setTimeout(() => {
+        const evalTimer = this._trackTimer(setTimeout(() => {
           try {
             const currentGame = this.activeGames.get(room);
             if (currentGame && currentGame === game && currentGame._isActive && !currentGame._gameEnded) {
               this._evaluateRound(room, game);
             }
           } catch(e) {}
-        }, CONSTANTS.EVALUATION_DELAY_MS);
+        }, CONSTANTS.EVALUATION_DELAY_MS));
+        game._evalTimer = evalTimer;
       }
     } catch(e) {}
   }
@@ -3427,12 +3420,13 @@ export class GameServer {
       game.numbers?.delete(username);
       game.tanda?.delete(username);
       this._broadcastToRoom(room, ["gameLowCardError", `${username} has been eliminated`]);
-      setTimeout(() => {
+      const checkTimer = setTimeout(() => {
         try {
           const currentGame = this.activeGames.get(room);
           if (currentGame && currentGame === game && !game._gameEnded) this._checkGameCanContinue(room, game);
         } catch(e) {}
       }, 1000);
+      this._trackTimer(checkTimer);
       return true;
     } catch(e) { return false; }
   }
@@ -3516,11 +3510,12 @@ export class GameServer {
       }
       
       if (this._eventQueue.length > 0) {
-        setTimeout(() => {
+        const nextTimer = setTimeout(() => {
           if (!this.closing && !this.isDestroyed) {
             this._processEventQueue();
           }
         }, 1);
+        this._trackTimer(nextTimer);
       }
     } catch(e) {
       this._handleError('processQueue', e);
@@ -4038,10 +4033,11 @@ export class GameServer {
         this._isRecovering = true;
         this._recoveryAttempts++;
         this._lastRecoveryTime = now;
-        setTimeout(() => {
+        const recoveryTimer = setTimeout(() => {
           this._forceRecovery();
           this._isRecovering = false;
         }, CONSTANTS.ERROR_RECOVERY_DELAY_MS);
+        this._trackTimer(recoveryTimer);
       }
     } catch(e) {}
   }
@@ -4094,14 +4090,11 @@ export class GameServer {
       this._tieBreakers.clear();
       this._tieRound = 0;
       this._processingTieResults = false;
-      if (this._tieTimer) {
-        clearTimeout(this._tieTimer);
-        this._tieTimer = null;
-      }
-      if (this._tieInterval) {
-        clearInterval(this._tieInterval);
-        this._tieInterval = null;
-      }
+      
+      this._clearTimer(this._tieTimer);
+      this._clearTimer(this._tieInterval);
+      this._tieTimer = null;
+      this._tieInterval = null;
       
       if (this._eventQueue) {
         this._eventQueue = [];
@@ -4111,60 +4104,55 @@ export class GameServer {
 
   _cleanupResources() {
     try {
-      if (this._diceTimeout) {
-        clearTimeout(this._diceTimeout);
-        this._diceTimeout = null;
-      }
-      if (this._diceBreakTimeout) {
-        clearTimeout(this._diceBreakTimeout);
-        this._diceBreakTimeout = null;
-      }
-      if (this._diceStartTimeout) {
-        clearTimeout(this._diceStartTimeout);
-        this._diceStartTimeout = null;
-      }
-      if (this._diceTimeUpCooldownTimer) {
-        clearTimeout(this._diceTimeUpCooldownTimer);
-        this._diceTimeUpCooldownTimer = null;
-      }
+      this._clearTimer(this._diceTimeout);
+      this._clearTimer(this._diceBreakTimeout);
+      this._clearTimer(this._diceStartTimeout);
+      this._clearTimer(this._diceTimeUpCooldownTimer);
       this._stopDiceTimerNotifications();
       
-      if (this._tieTimer) {
-        clearTimeout(this._tieTimer);
-        this._tieTimer = null;
-      }
-      if (this._tieInterval) {
-        clearInterval(this._tieInterval);
-        this._tieInterval = null;
-      }
+      this._clearTimer(this._tieTimer);
+      this._clearTimer(this._tieInterval);
+      this._tieTimer = null;
+      this._tieInterval = null;
     } catch(e) {}
   }
 
+  // ==================== ✅ DESTROY - CLEANUP SEMUA TIMER ====================
   async destroy() {
     try {
       if (this.isDestroyed) return;
       this.isDestroyed = true;
       this.closing = true;
       
+      // ✅ CLEANUP SEMUA TIMER
+      for (const timer of this._allTimers) {
+        try {
+          clearTimeout(timer);
+          clearInterval(timer);
+        } catch(e) {}
+      }
+      this._allTimers.clear();
+      
+      // ✅ CLEANUP INTERVAL
       if (this._mainInterval) {
         clearInterval(this._mainInterval);
         this._mainInterval = null;
       }
       
-      if (this._diceTimeout) {
-        clearTimeout(this._diceTimeout);
-        this._diceTimeout = null;
-      }
-      if (this._diceStartTimeout) {
-        clearTimeout(this._diceStartTimeout);
-        this._diceStartTimeout = null;
-      }
-      if (this._diceTimeUpCooldownTimer) {
-        clearTimeout(this._diceTimeUpCooldownTimer);
-        this._diceTimeUpCooldownTimer = null;
-      }
+      // ✅ CLEANUP DICE TIMERS
+      this._clearTimer(this._diceTimeout);
+      this._clearTimer(this._diceBreakTimeout);
+      this._clearTimer(this._diceStartTimeout);
+      this._clearTimer(this._diceTimeUpCooldownTimer);
       this._stopDiceTimerNotifications();
       
+      // ✅ CLEANUP TIE BREAKER
+      this._clearTimer(this._tieTimer);
+      this._clearTimer(this._tieInterval);
+      this._tieTimer = null;
+      this._tieInterval = null;
+      
+      // ✅ CLEANUP CACHE
       this._cachedResetWeek = null;
       this._cachedResetWeekTimestamp = 0;
       this._cachedLastWeekWinner = null;
@@ -4176,14 +4164,23 @@ export class GameServer {
         this._kvCache.clear();
       }
       
+      // ✅ CLEANUP GAMES
       for (const [room, game] of this.activeGames) {
         await this._forceCleanupGame(room, game);
       }
       this.activeGames.clear();
       
+      // ✅ CLEANUP CLEANUP TIMERS
+      for (const [room, timer] of this._cleanupTimers) {
+        this._clearTimer(timer);
+      }
+      this._cleanupTimers.clear();
+      
+      // ✅ RESET DICE
       await this.resetDice();
       this.diceGameSystem.clearCache();
       
+      // ✅ CLOSE WEBSOCKETS
       for (const [wsId, ws] of this.wsMap) {
         try {
           if (ws && ws.readyState === 1) {

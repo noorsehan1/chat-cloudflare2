@@ -1,15 +1,11 @@
 // ==================== GAME-SERVER-ULTIMATE.js ====================
-// ✅ FINAL - PASTI AMAN UNTUK CLOUDFLARE FREE TIER
-// ✅ TIDAK MELEBIHI DURASI EKSEKUSI 10 DETIK
-// ✅ WEBSOCKET HAND SHAKE CEPAT (< 3 DETIK)
-// ✅ CONSTRUCTOR RINGAN (< 1 DETIK)
-// ✅ LAZY INIT DITUNDA
-// ✅ EVENT QUEUE DIBATASI (3 DETIK MAX)
-// ✅ BATCH SIZE KECIL (2 EVENT)
-// ✅ CIRCUIT BREAKER + RATE LIMITING
-// ✅ RACE CONDITION PROTECTED
-// ✅ MEMORY LEAK FIXED
-// ✅ RECONNECT SPAM PROTECTED
+// ✅ FINAL - OPTIMIZED UNTUK CLOUDFLARE FREE TIER
+// ✅ TANPA KICK USER PARKIR (IDLE)
+// ✅ USER TETAP TERHUBUNG SAMPAI CLOSE SENDIRI
+// ✅ HANYA CLEANUP KONEKSI YANG SUDAH MATI
+// ✅ CLEANUP INTERVAL 60 DETIK
+// ✅ HEALTH CHECK HANYA CEK DICE
+// ✅ TIDAK EXCEEDED ALLOWED DURATION
 
 const CONSTANTS = {
   MAX_LOWCARD_GAMES: 10,
@@ -47,27 +43,28 @@ const CONSTANTS = {
   BROADCAST_BATCH_SIZE: 5,
   CPU_YIELD_MS: 1,
   
-  // ========== OPTIMASI FINAL ==========
-  MAX_PROCESS_TIME_MS: 3000,      // 3 DETIK (FREE TIER AMAN)
-  EVENT_BATCH_SIZE: 2,            // 2 EVENT PER BATCH
-  MAX_QUEUE_SIZE: 300,            // 300 QUEUE MAX
-  CLEANUP_INTERVAL_MS: 30000,     // 30 DETIK
-  HAND_SHAKE_TIMEOUT_MS: 3000,    // 3 DETIK
-  RATE_LIMIT_MAX: 100,            // 100 REQUEST/MENIT
+  // ========== OPTIMASI UNTUK FREE TIER ==========
+  MAX_PROCESS_TIME_MS: 1500,        // 1.5 DETIK (dari 3 detik)
+  EVENT_BATCH_SIZE: 1,              // 1 EVENT (dari 2)
+  MAX_QUEUE_SIZE: 150,              // 150 (dari 300)
+  CLEANUP_INTERVAL_MS: 60000,       // 60 DETIK (dari 30 detik)
+  HAND_SHAKE_TIMEOUT_MS: 3000,
+  RATE_LIMIT_MAX: 100,
   RATE_LIMIT_WINDOW_MS: 60000,
-  MAX_BOT_TIMEOUTS: 5,            // 5 TIMEOUT MAX
-  IDLE_CONNECTION_TIMEOUT_MS: 180000, // 3 MENIT
-  MAX_EVENT_ITERATIONS: 20,       // 20 ITERASI MAX
+  MAX_BOT_TIMEOUTS: 5,
+  MAX_EVENT_ITERATIONS: 5,          // 5 ITERASI (dari 20)
   DICE_TIMER_INTERVAL_MS: 1000,
-  MAP_CLEANUP_AGE_MS: 1800000,    // 30 MENIT
-  BAN_DURATION_MS: 180000,        // 3 MENIT
-  MAX_RECONNECT_ATTEMPTS: 5,      // 5 ATTEMPTS
-  RECONNECT_WINDOW_MS: 30000,     // 30 DETIK
+  MAP_CLEANUP_AGE_MS: 1800000,
+  BAN_DURATION_MS: 180000,
+  MAX_RECONNECT_ATTEMPTS: 5,
+  RECONNECT_WINDOW_MS: 30000,
+  
+  // ========== TIDAK ADA IDLE TIMEOUT ==========
 };
 
 const QUIZ_SCHEDULE = {
   SESSIONS: [
-    { start: 1, end: 4 },
+    { start: 1, end: 6 },
     { start: 14, end: 15 },
     { start: 22, end: 23 }
   ],
@@ -175,29 +172,29 @@ class DiceGameSystem {
   clearCache() { this.userScores.clear(); }
 }
 
-// ==================== GAME SERVER (FINAL - PASTI AMAN) ====================
+// ==================== GAME SERVER ====================
 export class GameServer {
   constructor(state, env) {
     try {
-      // ========== INISIALISASI MINIMAL ==========
+      // ========== INISIALISASI ==========
       this.state = state;
       this.env = env;
       this.closing = false;
       this.isDestroyed = false;
       this._initialized = false;
       
-      // ========== CORE STATE - MINIMAL ==========
+      // ========== CORE STATE ==========
       this.activeGames = new Map();
       this._maxGames = CONSTANTS.MAX_LOWCARD_GAMES;
       
-      // ========== WEBSOCKET - MINIMAL ==========
+      // ========== WEBSOCKET ==========
       this._wsIdCounter = 0;
       this.wsClients = new Map();
       this.clientRooms = new Map();
       this.wsMap = new Map();
       this.userConnections = new Map();
       
-      // ========== DICE - MINIMAL ==========
+      // ========== DICE ==========
       this.diceAnswered = new Set();
       this.diceHasWinner = false;
       this.diceWinner = null;
@@ -221,7 +218,7 @@ export class GameServer {
       this._diceTimerInterval = null;
       this._diceLock = false;
       
-      // ========== TIE BREAKER - MINIMAL ==========
+      // ========== TIE BREAKER ==========
       this._tieBreakers = new Map();
       this._tieRound = 0;
       this._tieActive = false;
@@ -232,14 +229,14 @@ export class GameServer {
       this._playerAnswers = new Map();
       this._tieLock = false;
       
-      // ========== CACHE - MINIMAL ==========
+      // ========== CACHE ==========
       this._cachedResetWeek = null;
       this._cachedLastWeekWinner = null;
       this._recordingEnabled = new Map();
       this._kvCache = new KVCache();
       this.diceGameSystem = new DiceGameSystem(this);
       
-      // ========== EVENT QUEUE - MINIMAL ==========
+      // ========== EVENT QUEUE ==========
       this._eventQueue = [];
       this._isProcessingQueue = false;
       this._diceTaskRunning = false;
@@ -250,11 +247,11 @@ export class GameServer {
       this._gameLocks = new Map();
       this._joinLocks = new Map();
       
-      // ========== RECONNECT - MINIMAL ==========
+      // ========== RECONNECT PROTECTION ==========
       this._reconnectAttempts = new Map();
       this._bannedUsers = new Map();
       
-      // ========== CIRCUIT BREAKER - MINIMAL ==========
+      // ========== CIRCUIT BREAKER ==========
       this._requestCount = 0;
       this._lastResetTime = Date.now();
       this._circuitOpen = false;
@@ -286,7 +283,7 @@ export class GameServer {
       }, 10000);
       this._allTimers.add(this._mainInterval);
       
-      // ========== ✅ CLEANUP INTERVAL (30 DETIK) ==========
+      // ========== ✅ CLEANUP INTERVAL (60 DETIK) ==========
       this._cleanupInterval = setInterval(() => {
         if (this.closing || this.isDestroyed) {
           clearInterval(this._cleanupInterval);
@@ -297,7 +294,7 @@ export class GameServer {
       }, CONSTANTS.CLEANUP_INTERVAL_MS);
       this._allTimers.add(this._cleanupInterval);
       
-      // ========== ✅ LAZY INIT - TUNDA 1 DETIK ==========
+      // ========== ✅ LAZY INIT ==========
       setTimeout(() => {
         if (!this.closing && !this.isDestroyed) {
           this._lazyInit();
@@ -331,16 +328,31 @@ export class GameServer {
     }
   }
 
-  // ========== CLEANUP ==========
+  // ========== CLEANUP (OPTIMAL) ==========
   _performCleanup() {
     try {
+      // Skip jika tidak ada koneksi
+      if (this.wsMap.size === 0) {
+        if (this._eventQueue && this._eventQueue.length > CONSTANTS.MAX_QUEUE_SIZE) {
+          this._eventQueue.splice(0, this._eventQueue.length - CONSTANTS.MAX_QUEUE_SIZE);
+        }
+        return;
+      }
+      
+      // Cleanup event queue
       if (this._eventQueue && this._eventQueue.length > CONSTANTS.MAX_QUEUE_SIZE) {
         this._eventQueue.splice(0, this._eventQueue.length - CONSTANTS.MAX_QUEUE_SIZE);
       }
       
+      // Cleanup dead connections
       this._cleanupDeadConnections();
-      this._cleanupAllMaps();
       
+      // Cleanup hanya yang perlu
+      this._cleanupUserConnections();
+      this._cleanupReconnectAttempts();
+      this._cleanupBannedUsers();
+      
+      // Reset error counter
       if (Date.now() - this._lastErrorReset > CONSTANTS.ERROR_RESET_INTERVAL_MS) {
         this._errorCount = 0;
         this._lastErrorReset = Date.now();
@@ -348,54 +360,80 @@ export class GameServer {
     } catch(e) {}
   }
 
-  // ========== CLEANUP ALL MAPS ==========
-  _cleanupAllMaps() {
+  // ========== CLEANUP USER CONNECTIONS ==========
+  _cleanupUserConnections() {
     try {
-      const now = Date.now();
-      const MAX_AGE = CONSTANTS.MAP_CLEANUP_AGE_MS || 1800000;
+      let cleaned = 0;
+      const MAX_CLEANUP = 20;
       
       for (const [username, conn] of this.userConnections) {
+        if (cleaned > MAX_CLEANUP) break;
         if (!conn?.ws || conn.ws.readyState !== 1) {
           this.userConnections.delete(username);
-        } else if (now - (conn.timestamp || 0) > MAX_AGE) {
-          this.userConnections.delete(username);
+          cleaned++;
         }
       }
-      
-      for (const [id, data] of this._tieBreakers) {
-        if (data.status === 'finished' || data.status === 'closed') {
-          this._tieBreakers.delete(id);
-        }
-      }
-      
-      for (const [key, timestamp] of this._switchLocks) {
-        if (now - timestamp > 10000) {
-          this._switchLocks.delete(key);
-          this._switchRetries.delete(key);
-        }
-      }
-      
-      for (const [key, timestamp] of this._gameLocks) {
-        if (now - timestamp > 10000) {
-          this._gameLocks.delete(key);
-        }
-      }
-      
-      for (const [key, timestamp] of this._joinLocks) {
-        if (now - timestamp > 10000) {
-          this._joinLocks.delete(key);
-        }
-      }
+    } catch(e) {}
+  }
+
+  // ========== CLEANUP RECONNECT ATTEMPTS ==========
+  _cleanupReconnectAttempts() {
+    try {
+      const now = Date.now();
+      let cleaned = 0;
+      const MAX_CLEANUP = 10;
       
       for (const [username, data] of this._reconnectAttempts) {
+        if (cleaned > MAX_CLEANUP) break;
         if (now - (data.lastAttempt || 0) > 300000) {
           this._reconnectAttempts.delete(username);
+          cleaned++;
+        }
+      }
+    } catch(e) {}
+  }
+
+  // ========== CLEANUP BANNED USERS ==========
+  _cleanupBannedUsers() {
+    try {
+      const now = Date.now();
+      let cleaned = 0;
+      const MAX_CLEANUP = 10;
+      
+      for (const [username, banUntil] of this._bannedUsers) {
+        if (cleaned > MAX_CLEANUP) break;
+        if (now > banUntil) {
+          this._bannedUsers.delete(username);
+          cleaned++;
+        }
+      }
+    } catch(e) {}
+  }
+
+  // ========== CLEANUP DEAD CONNECTIONS ==========
+  _cleanupDeadConnections() {
+    try {
+      const toRemove = [];
+      
+      for (const [wsId, ws] of this.wsMap) {
+        if (!ws || ws.readyState !== 1 || ws._closing) {
+          toRemove.push(wsId);
         }
       }
       
-      for (const [username, banUntil] of this._bannedUsers) {
-        if (now > banUntil) {
-          this._bannedUsers.delete(username);
+      for (const wsId of toRemove) {
+        const ws = this.wsMap.get(wsId);
+        if (ws) {
+          const room = this.clientRooms.get(wsId);
+          if (room) this._removeClientFromRoom(room, wsId);
+          this.clientRooms.delete(wsId);
+          this.wsMap.delete(wsId);
+          for (const [username, conn] of this.userConnections) {
+            if (conn?.wsId === wsId) { 
+              this.userConnections.delete(username); 
+              break; 
+            }
+          }
         }
       }
     } catch(e) {}
@@ -1357,11 +1395,13 @@ export class GameServer {
     } catch(e) {}
   }
 
+  // ========== HEALTH CHECK (HANYA DICE) ==========
   _performHealthCheck() {
     try {
       const now = Date.now();
       this._lastHeartbeat = now;
       
+      // ✅ HANYA CEK DICE - PERLU UNTUK SAFETY NET
       if (this._isDiceTime() && this.currentDiceRoll && this._diceStartTime) {
         const elapsed = (now - this._diceStartTime) / 1000;
         if (elapsed > (CONSTANTS.DICE_TOTAL_TIME_MS / 1000) + 30) {
@@ -1370,22 +1410,17 @@ export class GameServer {
           this._isShowingDice = false;
           this._canSubmitDiceAnswer = false;
           this._stopDiceTimerNotifications();
+          
+          // Broadcast reset
+          this._broadcastToRoom(DICE_ROOM, ["diceReset", { 
+            reason: "Timeout", 
+            timestamp: Date.now() 
+          }]);
         }
       }
       
-      const dead = [];
-      for (const [wsId, ws] of this.wsMap) {
-        if (!ws || ws.readyState !== 1) dead.push(wsId);
-      }
-      for (const wsId of dead) {
-        const ws = this.wsMap.get(wsId);
-        if (ws) {
-          const room = this.clientRooms.get(wsId);
-          if (room) this._removeClientFromRoom(room, wsId);
-          this.clientRooms.delete(wsId);
-          this.wsMap.delete(wsId);
-        }
-      }
+      // ❌ HAPUS: Cek WS mati (sudah ada di cleanup interval)
+      
     } catch(e) {}
   }
 
@@ -1524,42 +1559,6 @@ export class GameServer {
     } catch(e) {}
   }
 
-  _cleanupDeadConnections() {
-    try {
-      const now = Date.now();
-      const toRemove = [];
-      
-      for (const [wsId, ws] of this.wsMap) {
-        if (!ws || ws.readyState !== 1 || ws._closing) {
-          toRemove.push(wsId);
-          continue;
-        }
-        
-        const lastActivity = ws._lastActivity || ws._createdAt || now;
-        if (now - lastActivity > CONSTANTS.IDLE_CONNECTION_TIMEOUT_MS) {
-          toRemove.push(wsId);
-          try { ws.close(1000, "Idle timeout"); } catch(e) {}
-        }
-      }
-      
-      for (const wsId of toRemove) {
-        const ws = this.wsMap.get(wsId);
-        if (ws) {
-          const room = this.clientRooms.get(wsId);
-          if (room) this._removeClientFromRoom(room, wsId);
-          this.clientRooms.delete(wsId);
-          this.wsMap.delete(wsId);
-          for (const [username, conn] of this.userConnections) {
-            if (conn?.wsId === wsId) { 
-              this.userConnections.delete(username); 
-              break; 
-            }
-          }
-        }
-      }
-    } catch(e) {}
-  }
-
   // ==================== WS HELPERS ====================
 
   _getWsId(ws) { return ws?._wsId || null; }
@@ -1626,7 +1625,6 @@ export class GameServer {
       ws.room = room;
       ws.roomname = room;
       if (username) ws.username = username;
-      ws._lastActivity = Date.now();
     } catch(e) {}
   }
 
@@ -2695,7 +2693,7 @@ export class GameServer {
     } catch(e) {}
   }
 
-  // ==================== EVENT HANDLING (FULLY OPTIMIZED) ====================
+  // ==================== EVENT HANDLING (OPTIMAL) ====================
 
   async handleEvent(ws, data) {
     try {
@@ -2720,8 +2718,8 @@ export class GameServer {
       }
       
       const startTime = Date.now();
-      const MAX_PROCESS_TIME = CONSTANTS.MAX_PROCESS_TIME_MS || 3000;
-      const BATCH_SIZE = CONSTANTS.EVENT_BATCH_SIZE || 2;
+      const MAX_PROCESS_TIME = CONSTANTS.MAX_PROCESS_TIME_MS || 1500;
+      const BATCH_SIZE = CONSTANTS.EVENT_BATCH_SIZE || 1;
       let processed = 0;
       
       while (this._eventQueue.length > 0 && processed < 10) {
@@ -2950,7 +2948,7 @@ export class GameServer {
     }
   }
 
-  // ==================== FETCH (FINAL - PASTI AMAN) ====================
+  // ==================== FETCH ====================
 
   async fetch(req) {
     try {
@@ -3020,14 +3018,13 @@ export class GameServer {
         });
       }
       
-      // ========== WEBSOCKET (SUPER CEPAT) ==========
+      // ========== WEBSOCKET ==========
       if (url.pathname === "/game/ws") {
         const upgrade = req.headers.get("Upgrade");
         if (upgrade !== "websocket") {
           return new Response("WebSocket only", { status: 400 });
         }
         
-        // CEK CEPAT
         if (this.wsMap.size >= CONSTANTS.MAX_WS_CLIENTS) {
           return new Response("Server at maximum capacity", { 
             status: 503,
@@ -3042,12 +3039,10 @@ export class GameServer {
           });
         }
         
-        // BUAT WEBSOCKET PAIR
         const pair = new WebSocketPair();
         const [client, server] = [pair[0], pair[1]];
         const wsId = ++this._wsIdCounter;
         
-        // SETUP SERVER - MINIMAL
         server._wsId = wsId;
         server._closing = false;
         server.room = null;
@@ -3055,7 +3050,6 @@ export class GameServer {
         server._createdAt = Date.now();
         server.username = null;
         
-        // ACCEPT - LANGSUNG TANPA TIMEOUT
         try {
           this.state.acceptWebSocket(server);
         } catch(e) {
@@ -3063,7 +3057,6 @@ export class GameServer {
           return new Response("WebSocket acceptance failed", { status: 500 });
         }
         
-        // EVENT LISTENERS
         server.addEventListener("message", async (event) => {
           try {
             if (server._closing || this.closing || this.isDestroyed) return;
@@ -3135,6 +3128,10 @@ export class GameServer {
       if (username) {
         const conn = this.userConnections.get(username);
         if (conn?.wsId === wsId) this.userConnections.delete(username);
+        
+        if (room) {
+          this._broadcastToRoom(room, ["userLeftRoom", username, room]);
+        }
       }
       
       ws.room = null;

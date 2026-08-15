@@ -1,4 +1,4 @@
-// ==================== GAME-SERVER.JS - FULLY OPTIMIZED ====================
+// ==================== GAME-SERVER.JS - FIXED VERSION ====================
 
 const CONSTANTS = {
   MAX_LOWCARD_GAMES: 10,
@@ -33,17 +33,17 @@ const CONSTANTS = {
   TRANSLATE_TIMEOUT_MS: 10000,
   QUIZ_KEEP_ALIVE_INTERVAL_MS: 5000,
   QUIZ_NEXT_QUESTION_DELAY_MS: 5000,
-  CPU_TIME_LIMIT_MS: 8,
+  CPU_TIME_LIMIT_MS: 10,
   CPU_YIELD_DELAY_MS: 1,
   CPU_CHECK_INTERVAL_MS: 100,
-  MAX_EVENTS_PER_TICK: 3,
-  BROADCAST_BATCH_SIZE: 3,
+  MAX_EVENTS_PER_TICK: 5,
+  BROADCAST_BATCH_SIZE: 5,
   MAX_RESTART_ATTEMPTS: 3,
   RESTART_COOLDOWN_MS: 30000,
-  HEALTH_CHECK_INTERVAL_MS: 30000,
+  HEALTH_CHECK_INTERVAL_MS: 10000,
   MAX_IDLE_TIME_MS: 300000,
   RECONNECT_DELAY_MS: 2000,
-  MAX_EVENT_QUEUE_SIZE: 500,
+  MAX_EVENT_QUEUE_SIZE: 1000,
   ERROR_RECOVERY_DELAY_MS: 5000,
   MAX_UNHANDLED_ERRORS: 5,
   ERROR_RESET_INTERVAL_MS: 60000,
@@ -68,24 +68,13 @@ const CONSTANTS = {
   
   DICE_AUTO_START_DELAY_MS: 3000,
   DICE_MIN_PLAYERS_TO_AUTO_START: 1,
-  DICE_CHECK_INTERVAL_MS: 30000,
+  DICE_CHECK_INTERVAL_MS: 5000,
   
   DICE_LAST_RESET_WEEK: 'dice_last_reset_week',
   WEEKLY_RESET_CHECK_INTERVAL_MS: 300000,
   
   TIE_BREAKER_TIME_LIMIT: 20,
   TIE_BREAKER_COOLDOWN: 15000,
-  
-  // ✅ OPTIMIZATION: NEW CONSTANTS
-  MAIN_INTERVAL_MS: 30000,
-  GAME_STATE_CACHE_TTL: 500,
-  KV_CACHE_TTL: 10000,
-  DICE_NOTIFY_INTERVAL_MS: 3000,
-  BROADCAST_YIELD_THRESHOLD_MS: 5,
-  EVENT_PROCESS_DELAY_MS: 100,
-  MAX_CACHE_SIZE: 100,
-  CIRCUIT_BREAKER_THRESHOLD: 3,
-  CIRCUIT_BREAKER_TIMEOUT: 60000,
 };
 
 const QUIZ_SCHEDULE = {
@@ -99,62 +88,18 @@ const QUIZ_SCHEDULE = {
 
 const DICE_ROOM = "Quiz";
 
-// ==================== CIRCUIT BREAKER CLASS ====================
-class CircuitBreaker {
-  constructor(options = {}) {
-    this.failureThreshold = options.failureThreshold || CONSTANTS.CIRCUIT_BREAKER_THRESHOLD;
-    this.timeout = options.timeout || CONSTANTS.CIRCUIT_BREAKER_TIMEOUT;
-    this.failures = 0;
-    this.state = 'CLOSED';
-    this.lastFailureTime = 0;
-    this.lastSuccessTime = 0;
-  }
-
-  isOpen() {
-    if (this.state === 'OPEN') {
-      if (Date.now() - this.lastFailureTime > this.timeout) {
-        this.state = 'HALF_OPEN';
-        return false;
-      }
-      return true;
-    }
-    return false;
-  }
-
-  recordSuccess() {
-    this.failures = 0;
-    this.state = 'CLOSED';
-    this.lastSuccessTime = Date.now();
-  }
-
-  recordFailure() {
-    this.failures++;
-    this.lastFailureTime = Date.now();
-    if (this.failures >= this.failureThreshold) {
-      this.state = 'OPEN';
-    }
-  }
-
-  reset() {
-    this.failures = 0;
-    this.state = 'CLOSED';
-    this.lastFailureTime = 0;
-  }
-}
-
 // ==================== KV CACHE CLASS ====================
 class KVCache {
   constructor() {
     this.cache = new Map();
     this.ttl = 30000;
     this._cleanupInterval = null;
-    this.maxSize = CONSTANTS.MAX_CACHE_SIZE || 100;
   }
 
   get(key) {
     const entry = this.cache.get(key);
     if (!entry) return null;
-    if (Date.now() - entry.timestamp > entry.ttl) {
+    if (Date.now() - entry.timestamp > this.ttl) {
       this.cache.delete(key);
       return null;
     }
@@ -162,12 +107,6 @@ class KVCache {
   }
 
   set(key, value, customTtl = null) {
-    // ✅ BATASI UKURAN CACHE
-    if (this.cache.size >= this.maxSize) {
-      const oldestKey = this.cache.keys().next().value;
-      this.cache.delete(oldestKey);
-    }
-    
     const ttl = customTtl || this.ttl;
     this.cache.set(key, {
       value: value,
@@ -219,7 +158,6 @@ class CPUProtection {
     this._isProcessingQueue = false;
     this._rateLimitMap = new Map();
     this._cpuMonitorInterval = null;
-    this._lastGameStateSend = new Map();
   }
 
   _startCPUTimer() {
@@ -247,13 +185,13 @@ class CPUProtection {
   async _cpuYield() {
     try {
       if (this._isThrottled) {
-        await this._sleep(CONSTANTS.CPU_YIELD_DELAY_MS * 3);
+        await this._sleep(CONSTANTS.CPU_YIELD_DELAY_MS * 2);
         return;
       }
-      if (this._cpuAverage > CONSTANTS.CPU_TIME_LIMIT_MS * 0.7) {
-        await this._sleep(CONSTANTS.CPU_YIELD_DELAY_MS * 4);
+      if (this._cpuAverage > CONSTANTS.CPU_TIME_LIMIT_MS * 0.8) {
+        await this._sleep(CONSTANTS.CPU_YIELD_DELAY_MS * 3);
         this._isThrottled = true;
-        setTimeout(() => { this._isThrottled = false; }, 200);
+        setTimeout(() => { this._isThrottled = false; }, 100);
       } else {
         await this._sleep(CONSTANTS.CPU_YIELD_DELAY_MS);
       }
@@ -291,33 +229,21 @@ class CPUProtection {
         return false;
       }
       data.count++;
-      return data.count > 5;
+      return data.count > 10;
     } catch(e) { return false; }
   }
 
   _cpuMonitorTask() {
     try {
       const now = Date.now();
-      
-      // ✅ CLEANUP RATE LIMIT MAP
       for (const [key, data] of this._rateLimitMap) {
-        if (now - data.resetTime > 5000) this._rateLimitMap.delete(key);
+        if (now - data.resetTime > 1000) this._rateLimitMap.delete(key);
       }
-      
-      // ✅ CLEANUP GAME STATE CACHE
-      if (this._lastGameStateSend && this._lastGameStateSend.size > 200) {
-        for (const [key, timestamp] of this._lastGameStateSend) {
-          if (now - timestamp > 5000) {
-            this._lastGameStateSend.delete(key);
-          }
-        }
-      }
-      
       if (this._cpuHistory.length > 0) {
         const avg = this._cpuHistory.reduce((a, b) => a + b, 0) / this._cpuHistory.length;
-        if (avg > CONSTANTS.CPU_TIME_LIMIT_MS * 0.8) {
+        if (avg > CONSTANTS.CPU_TIME_LIMIT_MS * 0.9) {
           this._isThrottled = true;
-          setTimeout(() => { this._isThrottled = false; }, 1000);
+          setTimeout(() => { this._isThrottled = false; }, 500);
         }
       }
     } catch(e) {}
@@ -334,8 +260,7 @@ class DiceGameSystem {
     this._loading = false;
     this._usedDiceValues = new Set();
     this._lastLoadTime = 0;
-    this._cacheTTL = 10000;
-    this._kvCircuitBreaker = new CircuitBreaker();
+    this._cacheTTL = 5000;
   }
 
   async loadScores() {
@@ -354,22 +279,10 @@ class DiceGameSystem {
         return false;
       }
       
-      // ✅ USE CIRCUIT BREAKER
-      if (this._kvCircuitBreaker.isOpen()) {
-        this._loading = false;
-        return this._isLoaded;
-      }
-      
-      try {
-        const points = await env.QUESTIONS.get(CONSTANTS.DICE_POINT_KEY, 'json') || {};
-        this.userScores.clear();
-        for (const [username, score] of Object.entries(points)) {
-          this.userScores.set(username, score);
-        }
-        this._kvCircuitBreaker.recordSuccess();
-      } catch(e) {
-        this._kvCircuitBreaker.recordFailure();
-        throw e;
+      const points = await env.QUESTIONS.get(CONSTANTS.DICE_POINT_KEY, 'json') || {};
+      this.userScores.clear();
+      for (const [username, score] of Object.entries(points)) {
+        this.userScores.set(username, score);
       }
       
       this._isLoaded = true;
@@ -385,67 +298,26 @@ class DiceGameSystem {
   async getPoints() {
     try {
       if (!this.env?.QUESTIONS) return {};
-      
-      if (this._kvCircuitBreaker.isOpen()) {
-        // Return cached data
-        const cached = this.gameServer._kvCache?.get('dice_points');
-        if (cached) return cached;
-        return this._getCachedPoints();
+      const points = await this.env.QUESTIONS.get(CONSTANTS.DICE_POINT_KEY, 'json') || {};
+      this.userScores.clear();
+      for (const [username, score] of Object.entries(points)) {
+        this.userScores.set(username, score);
       }
-      
-      try {
-        const points = await this.env.QUESTIONS.get(CONSTANTS.DICE_POINT_KEY, 'json') || {};
-        this.userScores.clear();
-        for (const [username, score] of Object.entries(points)) {
-          this.userScores.set(username, score);
-        }
-        this.gameServer._kvCache?.set('dice_points', points, CONSTANTS.KV_CACHE_TTL);
-        this._kvCircuitBreaker.recordSuccess();
-        return points;
-      } catch(e) {
-        this._kvCircuitBreaker.recordFailure();
-        throw e;
-      }
+      return points;
     } catch(e) {
-      return this._getCachedPoints();
+      return {};
     }
-  }
-
-  _getCachedPoints() {
-    const points = {};
-    for (const [username, score] of this.userScores) {
-      points[username] = score;
-    }
-    return points;
   }
 
   async setPoints(points) {
     try {
       if (!this.env?.QUESTIONS) return false;
-      
-      if (this._kvCircuitBreaker.isOpen()) {
-        // Simpan ke cache saja
-        this.gameServer._kvCache?.set('dice_points', points, CONSTANTS.KV_CACHE_TTL);
-        this.userScores.clear();
-        for (const [username, score] of Object.entries(points)) {
-          this.userScores.set(username, score);
-        }
-        return true;
+      await this.env.QUESTIONS.put(CONSTANTS.DICE_POINT_KEY, JSON.stringify(points));
+      this.userScores.clear();
+      for (const [username, score] of Object.entries(points)) {
+        this.userScores.set(username, score);
       }
-      
-      try {
-        await this.env.QUESTIONS.put(CONSTANTS.DICE_POINT_KEY, JSON.stringify(points));
-        this.userScores.clear();
-        for (const [username, score] of Object.entries(points)) {
-          this.userScores.set(username, score);
-        }
-        this.gameServer._kvCache?.set('dice_points', points, CONSTANTS.KV_CACHE_TTL);
-        this._kvCircuitBreaker.recordSuccess();
-        return true;
-      } catch(e) {
-        this._kvCircuitBreaker.recordFailure();
-        return false;
-      }
+      return true;
     } catch(e) {
       return false;
     }
@@ -459,20 +331,10 @@ class DiceGameSystem {
         return this.gameServer._cachedLastWeekWinner;
       }
       
-      if (this._kvCircuitBreaker.isOpen()) {
-        return null;
-      }
-      
-      try {
-        const winnerData = await this.env.QUESTIONS.get(CONSTANTS.DICE_LAST_WEEK_WINNER, 'json');
-        this.gameServer._cachedLastWeekWinner = winnerData;
-        this.gameServer._cachedLastWeekWinnerTimestamp = Date.now();
-        this._kvCircuitBreaker.recordSuccess();
-        return winnerData;
-      } catch(e) {
-        this._kvCircuitBreaker.recordFailure();
-        return null;
-      }
+      const winnerData = await this.env.QUESTIONS.get(CONSTANTS.DICE_LAST_WEEK_WINNER, 'json');
+      this.gameServer._cachedLastWeekWinner = winnerData;
+      this.gameServer._cachedLastWeekWinnerTimestamp = Date.now();
+      return winnerData;
     } catch(e) {
       return null;
     }
@@ -481,23 +343,10 @@ class DiceGameSystem {
   async setLastWeekWinner(winner) {
     try {
       if (!this.env?.QUESTIONS) return false;
-      
-      if (this._kvCircuitBreaker.isOpen()) {
-        this.gameServer._cachedLastWeekWinner = winner;
-        this.gameServer._cachedLastWeekWinnerTimestamp = Date.now();
-        return true;
-      }
-      
-      try {
-        await this.env.QUESTIONS.put(CONSTANTS.DICE_LAST_WEEK_WINNER, JSON.stringify(winner));
-        this.gameServer._cachedLastWeekWinner = winner;
-        this.gameServer._cachedLastWeekWinnerTimestamp = Date.now();
-        this._kvCircuitBreaker.recordSuccess();
-        return true;
-      } catch(e) {
-        this._kvCircuitBreaker.recordFailure();
-        return false;
-      }
+      await this.env.QUESTIONS.put(CONSTANTS.DICE_LAST_WEEK_WINNER, JSON.stringify(winner));
+      this.gameServer._cachedLastWeekWinner = winner;
+      this.gameServer._cachedLastWeekWinnerTimestamp = Date.now();
+      return true;
     } catch(e) {
       return false;
     }
@@ -506,23 +355,10 @@ class DiceGameSystem {
   async deleteLastWeekWinner() {
     try {
       if (!this.env?.QUESTIONS) return false;
-      
-      if (this._kvCircuitBreaker.isOpen()) {
-        this.gameServer._cachedLastWeekWinner = null;
-        this.gameServer._cachedLastWeekWinnerTimestamp = 0;
-        return true;
-      }
-      
-      try {
-        await this.env.QUESTIONS.delete(CONSTANTS.DICE_LAST_WEEK_WINNER);
-        this.gameServer._cachedLastWeekWinner = null;
-        this.gameServer._cachedLastWeekWinnerTimestamp = 0;
-        this._kvCircuitBreaker.recordSuccess();
-        return true;
-      } catch(e) {
-        this._kvCircuitBreaker.recordFailure();
-        return false;
-      }
+      await this.env.QUESTIONS.delete(CONSTANTS.DICE_LAST_WEEK_WINNER);
+      this.gameServer._cachedLastWeekWinner = null;
+      this.gameServer._cachedLastWeekWinnerTimestamp = 0;
+      return true;
     } catch(e) {
       return false;
     }
@@ -544,7 +380,6 @@ class DiceGameSystem {
   clearCache() {
     this.userScores.clear();
     this._usedDiceValues.clear();
-    this._kvCircuitBreaker.reset();
   }
 }
 
@@ -562,6 +397,7 @@ export class GameServer extends CPUProtection {
 
       this._restartCount = 0;
       this._lastRestartTime = 0;
+      this._healthCheckInterval = null;
       this._isRestarting = false;
       this._startTime = Date.now();
       this._lastHeartbeat = Date.now();
@@ -618,7 +454,7 @@ export class GameServer extends CPUProtection {
       this._diceTimeLeftNotified = new Map();
       this._nextDiceNotified = new Map();
       this._diceJoinedNotified = new Map();
-      this._diceTimeLeftBroadcastCooldown = 3000;
+      this._diceTimeLeftBroadcastCooldown = 1000;
       this._lastDiceTimeLeftBroadcast = 0;
 
       this._diceQuestionStartTime = null;
@@ -676,11 +512,13 @@ export class GameServer extends CPUProtection {
 
       this._kvCache = new KVCache();
       this._kvCache.startCleanup();
-      this._kvCircuitBreaker = new CircuitBreaker();
 
       this.diceGameSystem = new DiceGameSystem(this);
 
-      // ==================== ✅ FIX: 1 INTERVAL SAJA ====================
+      // ==================== ✅ FIX: 1 INTERVAL SAJA UNTUK SEMUA ====================
+      // HAPUS SEMUA interval YANG BERJALAN BERBEDA
+      // GANTI DENGAN 1 INTERVAL SAJA
+      
       this._mainInterval = setInterval(() => {
         try {
           if (this.closing || this.isDestroyed) {
@@ -690,29 +528,37 @@ export class GameServer extends CPUProtection {
           }
           
           // JALANKAN SEMUA TASK DALAM 1 INTERVAL
+          // TANPA AKSES KV - HANYA LOGIKA INTERNAL
+          
+          // 1. CPU Monitor
           this._cpuMonitorTask();
           
-          // ✅ HEALTH CHECK - SETIAP 30 DETIK
-          this._performHealthCheck();
-          
-          // ✅ STUCK GAMES - SETIAP 30 DETIK
-          this._checkStuckGames();
-          this._cleanupStaleGames();
-          this._cleanupDeadConnections();
-          
-          // ✅ DICE TIMER - HANYA JIKA AKTIF
-          if (this.currentDiceRoll) {
-            this._diceTimerTask();
-          }
-          
-          // ✅ DICE KEEP ALIVE
+          // 2. Dice Keep Alive
           this._diceKeepAliveTask();
           
+          // 3. Health Check
+          this._healthCheckTask();
+          
+          // 4. Cek stuck games
+          this._checkStuckGames();
+          
+          // 5. Cleanup stale games
+          this._cleanupStaleGames();
+          
+          // 6. Cleanup dead connections
+          this._cleanupDeadConnections();
+          
+          // 7. Dice timer task (tanpa interval terpisah)
+          this._diceTimerTask();
+          
         } catch(e) {
-          // DIAM SAJA
+          // DIAM SAJA, JANGAN CRASH
         }
-      }, CONSTANTS.MAIN_INTERVAL_MS || 30000);
+      }, 10000); // JALANKAN SETIAP 10 DETIK
       
+      // ==================== END FIX ====================
+
+      // TETAP JALANKAN INIT ASYNC
       this._initAsync();
 
       setTimeout(async () => {
@@ -737,45 +583,13 @@ export class GameServer extends CPUProtection {
         }
       }, 8000);
 
+      // PANGGIL START DICE AUTO CHECKER TAPI TANPA INTERVAL BARU
       this._startDiceAutoChecker();
-
-      // ✅ CLEANUP CACHE PERIODIK
-      this._cleanupCacheInterval = setInterval(() => {
-        try {
-          if (this.closing || this.isDestroyed) {
-            clearInterval(this._cleanupCacheInterval);
-            this._cleanupCacheInterval = null;
-            return;
-          }
-          
-          if (this._rateLimitMap && this._rateLimitMap.size > 500) {
-            const now = Date.now();
-            for (const [key, data] of this._rateLimitMap) {
-              if (now - data.resetTime > 5000) {
-                this._rateLimitMap.delete(key);
-              }
-            }
-          }
-          
-          if (this._eventQueue && this._eventQueue.length > 300) {
-            this._eventQueue.splice(0, 100);
-          }
-          
-          if (this._lastGameStateSend && this._lastGameStateSend.size > 200) {
-            const now = Date.now();
-            for (const [key, timestamp] of this._lastGameStateSend) {
-              if (now - timestamp > 10000) {
-                this._lastGameStateSend.delete(key);
-              }
-            }
-          }
-        } catch(e) {}
-      }, 60000);
 
     } catch(e) {}
   }
 
-  // ==================== CACHE METHODS ====================
+  // ==================== CACHE UNTUK dice_last_reset_week ====================
 
   async _updateCachedResetWeek(week) {
     this._cachedResetWeek = week;
@@ -789,20 +603,11 @@ export class GameServer extends CPUProtection {
       }
       
       if (this.env?.QUESTIONS) {
-        if (this._kvCircuitBreaker.isOpen()) {
-          return this._cachedResetWeek;
-        }
-        
-        try {
-          const lastResetWeek = await this.env.QUESTIONS.get(CONSTANTS.DICE_LAST_RESET_WEEK);
-          if (lastResetWeek) {
-            this._cachedResetWeek = lastResetWeek;
-            this._cachedResetWeekTimestamp = Date.now();
-            this._kvCircuitBreaker.recordSuccess();
-            return lastResetWeek;
-          }
-        } catch(e) {
-          this._kvCircuitBreaker.recordFailure();
+        const lastResetWeek = await this.env.QUESTIONS.get(CONSTANTS.DICE_LAST_RESET_WEEK);
+        if (lastResetWeek) {
+          this._cachedResetWeek = lastResetWeek;
+          this._cachedResetWeekTimestamp = Date.now();
+          return lastResetWeek;
         }
       }
       
@@ -812,36 +617,23 @@ export class GameServer extends CPUProtection {
     }
   }
 
+  // ==================== CACHE UNTUK lowcard_recording_status_* ====================
+
   async _getRecordingStatusFromKV(roomName) {
     try {
       if (!roomName) return false;
-      
-      const cacheKey = `recording_${roomName}`;
-      const cached = this._kvCache.get(cacheKey);
-      if (cached !== null) return cached;
       
       if (this._recordingEnabled.has(roomName)) {
         return this._recordingEnabled.get(roomName);
       }
       
       if (this.env?.QUESTIONS) {
-        if (this._kvCircuitBreaker.isOpen()) {
-          return false;
-        }
-        
-        try {
-          const kvValue = await this.env.QUESTIONS.get(
-            CONSTANTS.LOWCARD_RECORDING_KEY + roomName
-          );
-          const isRecording = kvValue === 'true';
-          this._recordingEnabled.set(roomName, isRecording);
-          this._kvCache.set(cacheKey, isRecording, CONSTANTS.KV_CACHE_TTL);
-          this._kvCircuitBreaker.recordSuccess();
-          return isRecording;
-        } catch(e) {
-          this._kvCircuitBreaker.recordFailure();
-          return false;
-        }
+        const kvValue = await this.env.QUESTIONS.get(
+          CONSTANTS.LOWCARD_RECORDING_KEY + roomName
+        );
+        const isRecording = kvValue === 'true';
+        this._recordingEnabled.set(roomName, isRecording);
+        return isRecording;
       }
       
       return false;
@@ -854,24 +646,16 @@ export class GameServer extends CPUProtection {
     try {
       if (!this.env?.QUESTIONS) return;
 
-      if (this._kvCircuitBreaker.isOpen()) {
+      const existingResetWeek = await this.env.QUESTIONS.get(CONSTANTS.DICE_LAST_RESET_WEEK);
+      const currentWeek = this._generateCurrentWeek(new Date());
+
+      if (!existingResetWeek) {
+        await this.env.QUESTIONS.put(CONSTANTS.DICE_LAST_RESET_WEEK, currentWeek);
+        await this._updateCachedResetWeek(currentWeek);
         return;
       }
 
-      try {
-        const existingResetWeek = await this.env.QUESTIONS.get(CONSTANTS.DICE_LAST_RESET_WEEK);
-        const currentWeek = this._generateCurrentWeek(new Date());
-
-        if (!existingResetWeek) {
-          await this.env.QUESTIONS.put(CONSTANTS.DICE_LAST_RESET_WEEK, currentWeek);
-          await this._updateCachedResetWeek(currentWeek);
-        } else {
-          await this._updateCachedResetWeek(existingResetWeek);
-        }
-        this._kvCircuitBreaker.recordSuccess();
-      } catch(e) {
-        this._kvCircuitBreaker.recordFailure();
-      }
+      await this._updateCachedResetWeek(existingResetWeek);
 
     } catch(e) {}
   }
@@ -897,11 +681,7 @@ export class GameServer extends CPUProtection {
       
       if (!lastResetWeek) {
         await this._updateCachedResetWeek(currentWeek);
-        if (!this._kvCircuitBreaker.isOpen()) {
-          try {
-            await this.env.QUESTIONS.put(CONSTANTS.DICE_LAST_RESET_WEEK, currentWeek);
-          } catch(e) {}
-        }
+        await this.env.QUESTIONS.put(CONSTANTS.DICE_LAST_RESET_WEEK, currentWeek);
         return false;
       }
       
@@ -919,56 +699,49 @@ export class GameServer extends CPUProtection {
       const isResetTime = hours === 0 && minutes === 0;
       
       if (weekChanged && isMonday && isResetTime) {
-        if (this._kvCircuitBreaker.isOpen()) {
-          return false;
+        const points = await this.env.QUESTIONS.get(CONSTANTS.DICE_POINT_KEY, 'json') || {};
+        
+        let winner = null;
+        let highestScore = 0;
+        
+        for (const [username, score] of Object.entries(points)) {
+          const numericScore = typeof score === 'number' ? score : parseInt(score, 10) || 0;
+          if (numericScore > highestScore) {
+            highestScore = numericScore;
+            winner = username;
+          }
         }
         
-        try {
-          const points = await this.env.QUESTIONS.get(CONSTANTS.DICE_POINT_KEY, 'json') || {};
+        if (winner && highestScore > 0) {
+          const winnerData = {
+            username: winner,
+            score: highestScore,
+            week: lastResetWeek,
+            timestamp: Date.now()
+          };
           
-          let winner = null;
-          let highestScore = 0;
+          await this.env.QUESTIONS.put(
+            CONSTANTS.DICE_LAST_WEEK_WINNER,
+            JSON.stringify(winnerData)
+          );
           
-          for (const [username, score] of Object.entries(points)) {
-            const numericScore = typeof score === 'number' ? score : parseInt(score, 10) || 0;
-            if (numericScore > highestScore) {
-              highestScore = numericScore;
-              winner = username;
-            }
-          }
+          this._cachedLastWeekWinner = winnerData;
+          this._cachedLastWeekWinnerTimestamp = Date.now();
           
-          if (winner && highestScore > 0) {
-            const winnerData = {
-              username: winner,
-              score: highestScore,
-              week: lastResetWeek,
-              timestamp: Date.now()
-            };
-            
-            await this.env.QUESTIONS.put(
-              CONSTANTS.DICE_LAST_WEEK_WINNER,
-              JSON.stringify(winnerData)
-            );
-            
-            this._cachedLastWeekWinner = winnerData;
-            this._cachedLastWeekWinnerTimestamp = Date.now();
-          } else {
-            await this.env.QUESTIONS.delete(CONSTANTS.DICE_LAST_WEEK_WINNER);
-            this._cachedLastWeekWinner = null;
-            this._cachedLastWeekWinnerTimestamp = 0;
-          }
-          
-          await this.env.QUESTIONS.put(CONSTANTS.DICE_POINT_KEY, JSON.stringify({}));
-          
-          await this._updateCachedResetWeek(currentWeek);
-          await this.env.QUESTIONS.put(CONSTANTS.DICE_LAST_RESET_WEEK, currentWeek);
-          
-          this.diceGameSystem.userScores.clear();
-          this._kvCircuitBreaker.recordSuccess();
-          return true;
-        } catch(e) {
-          this._kvCircuitBreaker.recordFailure();
+        } else {
+          await this.env.QUESTIONS.delete(CONSTANTS.DICE_LAST_WEEK_WINNER);
+          this._cachedLastWeekWinner = null;
+          this._cachedLastWeekWinnerTimestamp = 0;
         }
+        
+        await this.env.QUESTIONS.put(CONSTANTS.DICE_POINT_KEY, JSON.stringify({}));
+        
+        await this._updateCachedResetWeek(currentWeek);
+        await this.env.QUESTIONS.put(CONSTANTS.DICE_LAST_RESET_WEEK, currentWeek);
+        
+        this.diceGameSystem.userScores.clear();
+        
+        return true;
       }
       
       return false;
@@ -989,6 +762,12 @@ export class GameServer extends CPUProtection {
     } catch(e) {
       return '2026-W01';
     }
+  }
+
+  _healthCheckTask() {
+    try {
+      this._performHealthCheck();
+    } catch(e) {}
   }
 
   _diceKeepAliveTask() {
@@ -1097,13 +876,19 @@ export class GameServer extends CPUProtection {
     } catch(e) {}
   }
 
+  // ==================== ✅ FIX: TANPA INTERVAL BARU ====================
   _startDiceAutoChecker() {
     try {
+      // HAPUS interval, PANGGIL MANUAL SAJA
+      // TIDAK PERLU INTERVAL KARENA SUDAH ADA _mainInterval
+      
+      // PANGGIL SEKALI SAAT START
       setTimeout(() => {
         if (!this.closing && !this.isDestroyed) {
           this._diceAutoTask().catch(() => {});
         }
       }, 1000);
+      
     } catch(e) {}
   }
 
@@ -1229,17 +1014,10 @@ export class GameServer extends CPUProtection {
       this._recordingEnabled.set(roomName, true);
       
       if (this.env?.QUESTIONS) {
-        if (!this._kvCircuitBreaker.isOpen()) {
-          try {
-            await this.env.QUESTIONS.put(
-              CONSTANTS.LOWCARD_RECORDING_KEY + roomName, 
-              'true'
-            );
-            this._kvCircuitBreaker.recordSuccess();
-          } catch(e) {
-            this._kvCircuitBreaker.recordFailure();
-          }
-        }
+        await this.env.QUESTIONS.put(
+          CONSTANTS.LOWCARD_RECORDING_KEY + roomName, 
+          'true'
+        );
       }
       
       this._broadcastToRoom(roomName, ["recordingStatus", true]);
@@ -1268,30 +1046,23 @@ export class GameServer extends CPUProtection {
         const statusKey = CONSTANTS.LOWCARD_RECORDING_KEY + room;
         const winnerKey = CONSTANTS.LOWCARD_WINNER_KEY + room;
         
-        if (!this._kvCircuitBreaker.isOpen()) {
+        await this.env.QUESTIONS.delete(statusKey);
+        await this.env.QUESTIONS.delete(winnerKey);
+        
+        const prefixes = [
+          CONSTANTS.LOWCARD_WINNER_KEY,
+          CONSTANTS.LOWCARD_RECORDING_KEY
+        ];
+        
+        for (const prefix of prefixes) {
           try {
-            await this.env.QUESTIONS.delete(statusKey);
-            await this.env.QUESTIONS.delete(winnerKey);
-            
-            const prefixes = [
-              CONSTANTS.LOWCARD_WINNER_KEY,
-              CONSTANTS.LOWCARD_RECORDING_KEY
-            ];
-            
-            for (const prefix of prefixes) {
-              try {
-                const list = await this.env.QUESTIONS.list({ prefix: prefix });
-                for (const key of list.keys) {
-                  if (key.name === prefix + room || key.name.includes(room)) {
-                    await this.env.QUESTIONS.delete(key.name);
-                  }
-                }
-              } catch(e) {}
+            const list = await this.env.QUESTIONS.list({ prefix: prefix });
+            for (const key of list.keys) {
+              if (key.name === prefix + room || key.name.includes(room)) {
+                await this.env.QUESTIONS.delete(key.name);
+              }
             }
-            this._kvCircuitBreaker.recordSuccess();
-          } catch(e) {
-            this._kvCircuitBreaker.recordFailure();
-          }
+          } catch(e) {}
         }
       }
       
@@ -1330,20 +1101,13 @@ export class GameServer extends CPUProtection {
       }
       
       const key = CONSTANTS.LOWCARD_WINNER_KEY + room;
+      const winners = await this.env.QUESTIONS.get(key, 'json');
       
-      if (this._kvCircuitBreaker.isOpen()) {
-        return this._kvCache.get(`winners_${room}`) || {};
+      if (winners && typeof winners === 'object' && Object.keys(winners).length > 0) {
+        return winners;
       }
       
-      try {
-        const winners = await this.env.QUESTIONS.get(key, 'json');
-        this._kvCache.set(`winners_${room}`, winners || {}, CONSTANTS.KV_CACHE_TTL);
-        this._kvCircuitBreaker.recordSuccess();
-        return winners || {};
-      } catch(e) {
-        this._kvCircuitBreaker.recordFailure();
-        return this._kvCache.get(`winners_${room}`) || {};
-      }
+      return {};
     } catch(e) {
       return {};
     }
@@ -1395,30 +1159,20 @@ export class GameServer extends CPUProtection {
       
       const key = CONSTANTS.LOWCARD_WINNER_KEY + room;
       
-      if (this._kvCircuitBreaker.isOpen()) {
-        return false;
-      }
+      let roomWinners = await this.env.QUESTIONS.get(key, 'json') || {};
       
-      try {
-        let roomWinners = await this.env.QUESTIONS.get(key, 'json') || {};
-        
-        let currentCount = 0;
-        if (roomWinners[username]) {
-          const valStr = String(roomWinners[username]);
-          currentCount = parseInt(valStr.replace("x", "").replace("X", "")) || 0;
-        }
-        const newCount = currentCount + 1;
-        
-        roomWinners[username] = newCount + "x";
-        
-        await this.env.QUESTIONS.put(key, JSON.stringify(roomWinners));
-        this._kvCache.delete(`winners_${room}`);
-        this._kvCircuitBreaker.recordSuccess();
-        return true;
-      } catch(e) {
-        this._kvCircuitBreaker.recordFailure();
-        return false;
+      let currentCount = 0;
+      if (roomWinners[username]) {
+        const valStr = String(roomWinners[username]);
+        currentCount = parseInt(valStr.replace("x", "").replace("X", "")) || 0;
       }
+      const newCount = currentCount + 1;
+      
+      roomWinners[username] = newCount + "x";
+      
+      await this.env.QUESTIONS.put(key, JSON.stringify(roomWinners));
+      
+      return true;
     } catch(e) {
       return false;
     }
@@ -1522,7 +1276,6 @@ export class GameServer extends CPUProtection {
         key = `cooldown_${remaining}`;
       }
       
-      // ✅ REDUCE NOTIFICATION FREQUENCY
       if (message !== "TIME UP") {
         if (this._lastNotificationKey === key && (now - this._lastNotificationTime) < 3000) {
           return;
@@ -1711,8 +1464,10 @@ export class GameServer extends CPUProtection {
     } catch(e) {}
   }
 
+  // ==================== ✅ FIX: TANPA INTERVAL BARU ====================
   _startDiceTimerNotifications() {
     try {
+      // HAPUS interval, GANTI DENGAN TIMEOUT
       if (this._diceTimerTimeout) {
         clearTimeout(this._diceTimerTimeout);
         this._diceTimerTimeout = null;
@@ -1734,11 +1489,13 @@ export class GameServer extends CPUProtection {
         timeup: false
       };
       
+      // PANGGIL PERTAMA KALI
       this._diceTimerTick();
+      
     } catch(e) {}
   }
 
-  // ✅ OPTIMIZED DICE TIMER TICK
+  // ==================== ✅ FIX: TAMBAH METHOD TIMER TICK ====================
   _diceTimerTick() {
     try {
       if (!this.currentDiceRoll || !this._diceQuestionStartTime) {
@@ -1749,15 +1506,21 @@ export class GameServer extends CPUProtection {
       const remaining = Math.max(0, CONSTANTS.DICE_ANSWER_TIME_MS / 1000 - elapsed);
       const remainingInt = Math.floor(remaining);
       
-      // ✅ HANYA KIRIM PADA WAKTU TERTENTU
-      const notifyTimes = [20, 15, 10, 5, 3, 1];
       let shouldSend = false;
       let message = "";
       
-      if (notifyTimes.includes(remainingInt) && !this._diceNotifiedFlags[remainingInt]) {
-        this._diceNotifiedFlags[remainingInt] = true;
+      if (remainingInt === 20 && !this._diceNotifiedFlags[20]) {
+        this._diceNotifiedFlags[20] = true;
         shouldSend = true;
-        message = `${remainingInt}s remaining`;
+        message = "20s remaining";
+      } else if (remainingInt === 10 && !this._diceNotifiedFlags[10]) {
+        this._diceNotifiedFlags[10] = true;
+        shouldSend = true;
+        message = "10s remaining";
+      } else if (remainingInt === 5 && !this._diceNotifiedFlags[5]) {
+        this._diceNotifiedFlags[5] = true;
+        shouldSend = true;
+        message = "5s remaining";
       } else if (remainingInt <= 0 && !this._diceNotifiedFlags.timeup) {
         this._diceNotifiedFlags.timeup = true;
         shouldSend = true;
@@ -1776,12 +1539,8 @@ export class GameServer extends CPUProtection {
         });
       }
       
-      // ✅ PANGGIL LAGI DENGAN DELAY YANG LEBIH PANJANG
-      if (remainingInt > 1 && !this._diceNotifiedFlags.timeup) {
-        this._diceTimerTimeout = setTimeout(() => {
-          this._diceTimerTick();
-        }, 2000);
-      } else if (remainingInt > 0 && !this._diceNotifiedFlags.timeup) {
+      // PANGGIL LAGI SETELAH 1 DETIK (PAKAI TIMEOUT, BUKAN INTERVAL)
+      if (remainingInt > 0 && !this._diceNotifiedFlags.timeup) {
         this._diceTimerTimeout = setTimeout(() => {
           this._diceTimerTick();
         }, 1000);
@@ -2359,7 +2118,7 @@ export class GameServer extends CPUProtection {
     let notified5 = false;
     let isProcessed = false;
     
-    // ✅ OPTIMIZED: KURANGI INTERVAL FREKUENSI
+    // ✅ FIX: PAKAI INTERVAL TAPI HANYA UNTUK TIE BREAKER
     this._tieInterval = setInterval(() => {
       timeLeft--;
       
@@ -2760,7 +2519,6 @@ export class GameServer extends CPUProtection {
     } catch(e) {}
   }
 
-  // ✅ OPTIMIZED BROADCAST WITH CPU YIELD
   async _broadcastDiceResult(type, data) {
     try {
       const wsIds = this.wsClients.get(DICE_ROOM);
@@ -2768,7 +2526,7 @@ export class GameServer extends CPUProtection {
       
       const msgStr = JSON.stringify([type, data]);
       const wsIdArray = Array.from(wsIds);
-      const BATCH_SIZE = CONSTANTS.BROADCAST_BATCH_SIZE || 3;
+      const BATCH_SIZE = CONSTANTS.BROADCAST_BATCH_SIZE || 5;
       let startTime = Date.now();
       
       for (let i = 0; i < wsIdArray.length; i += BATCH_SIZE) {
@@ -2777,12 +2535,14 @@ export class GameServer extends CPUProtection {
         for (const wsId of batch) {
           const ws = this.wsMap.get(wsId);
           if (ws && ws.readyState === 1) {
-            try { ws.send(msgStr); } catch(e) {}
+            try { 
+              ws.send(msgStr); 
+            } catch(e) {}
           }
         }
         
-        // ✅ YIELD LEBIH AGGRESIF
-        if (Date.now() - startTime > CONSTANTS.BROADCAST_YIELD_THRESHOLD_MS) {
+        // ✅ TAMBAHKAN CPU YIELD
+        if (Date.now() - startTime > 8) {
           await this._cpuYield();
           startTime = Date.now();
         }
@@ -2949,7 +2709,6 @@ export class GameServer extends CPUProtection {
     } catch(e) { return 0; }
   }
 
-  // ✅ OPTIMIZED BROADCAST DICE ROLL
   async _broadcastDiceRoll(diceValue) {
     try {
       if (this._tieActive) {
@@ -2966,12 +2725,12 @@ export class GameServer extends CPUProtection {
         canAnswerNow: true,
         message: "♡ clik draw ♡",
         round: this._diceRound || 1,
-        timerNotifications: [20, 15, 10, 5, 3, 1]
+        timerNotifications: [20, 10, 5]
       };
       
       const msgStr = JSON.stringify(["diceRoll", msgData]);
       const wsIdArray = Array.from(wsIds);
-      const BATCH_SIZE = CONSTANTS.BROADCAST_BATCH_SIZE || 3;
+      const BATCH_SIZE = CONSTANTS.BROADCAST_BATCH_SIZE || 5;
       let startTime = Date.now();
       
       for (let i = 0; i < wsIdArray.length; i += BATCH_SIZE) {
@@ -2984,8 +2743,8 @@ export class GameServer extends CPUProtection {
           }
         }
         
-        // ✅ YIELD LEBIH AGGRESIF
-        if (Date.now() - startTime > CONSTANTS.BROADCAST_YIELD_THRESHOLD_MS) {
+        // ✅ TAMBAHKAN CPU YIELD
+        if (Date.now() - startTime > 8) {
           await this._cpuYield();
           startTime = Date.now();
         }
@@ -3263,23 +3022,9 @@ export class GameServer extends CPUProtection {
     } catch(e) {}
   }
 
-  // ✅ OPTIMIZED: DENGAN CACHE UNTUK GAME STATE
   _sendGameStateToClient(ws, room) {
     try {
       if (!ws || ws.readyState !== 1 || !room) return;
-      
-      // ✅ CEK APAKAH PERLU KIRIM
-      const now = Date.now();
-      const wsId = ws._wsId;
-      const lastSend = this._lastGameStateSend?.get(wsId) || 0;
-      
-      // JANGAN KIRIM LEBIH DARI 1x PER 500ms
-      if (now - lastSend < CONSTANTS.GAME_STATE_CACHE_TTL) {
-        return;
-      }
-      
-      this._lastGameStateSend = this._lastGameStateSend || new Map();
-      this._lastGameStateSend.set(wsId, now);
       
       const game = this.activeGames.get(room);
       if (!game || !game._isActive || game._gameEnded) {
@@ -3401,7 +3146,7 @@ export class GameServer extends CPUProtection {
     } catch(e) {}
   }
 
-  // ✅ OPTIMIZED BROADCAST TO ROOM
+  // ==================== ✅ FIX: TAMBAHKAN CPU YIELD DI BROADCAST ====================
   async _broadcastToRoom(room, message) {
     try {
       if (this.closing || this.isDestroyed || !room || !message) return;
@@ -3410,7 +3155,7 @@ export class GameServer extends CPUProtection {
       
       const msgStr = JSON.stringify(message);
       const wsIdArray = Array.from(wsIds);
-      const BATCH_SIZE = CONSTANTS.BROADCAST_BATCH_SIZE || 3;
+      const BATCH_SIZE = CONSTANTS.BROADCAST_BATCH_SIZE || 5;
       let startTime = Date.now();
       
       for (let i = 0; i < wsIdArray.length; i += BATCH_SIZE) {
@@ -3423,8 +3168,8 @@ export class GameServer extends CPUProtection {
           }
         }
         
-        // ✅ YIELD LEBIH AGGRESIF
-        if (Date.now() - startTime > CONSTANTS.BROADCAST_YIELD_THRESHOLD_MS) {
+        // ✅ TAMBAHKAN CPU YIELD
+        if (Date.now() - startTime > 8) {
           await this._cpuYield();
           startTime = Date.now();
         }
@@ -3935,7 +3680,7 @@ export class GameServer extends CPUProtection {
     } catch(e) {}
   }
 
-  // ✅ OPTIMIZED EVALUATE ROUND
+  // ==================== ✅ FIX: TAMBAHKAN CPU YIELD DI EVALUATE ====================
   async _evaluateRound(room, game) {
     try {
       if (this.isDestroyed || !game?._isActive || game._gameEnded || game._isEvaluating || !game.players) return;
@@ -4517,43 +4262,36 @@ export class GameServer extends CPUProtection {
     } catch(e) {}
   }
 
-  // ✅ OPTIMIZED EVENT QUEUE
+  // ==================== ✅ FIX: TAMBAHKAN CPU YIELD DI EVENT QUEUE ====================
   async _processEventQueue() {
     try {
       if (this._isProcessingQueue || this._eventQueue.length === 0) return;
       if (this._eventQueue.length > CONSTANTS.MAX_EVENT_QUEUE_SIZE) {
         this._eventQueue.splice(0, this._eventQueue.length - CONSTANTS.MAX_EVENT_QUEUE_SIZE);
       }
-      
       this._isProcessingQueue = true;
       this._startCPUTimer();
-      
-      const batchSize = Math.min(CONSTANTS.MAX_EVENTS_PER_TICK, 3);
+      const batchSize = CONSTANTS.MAX_EVENTS_PER_TICK;
       const batch = this._eventQueue.splice(0, batchSize);
-      
-      let processed = 0;
       for (const item of batch) {
         try {
           await this._processEventItem(item.ws, item.data);
-          processed++;
         } catch(e) {
           this._handleError('processEvent', e);
         }
-        
+        // ✅ CEK CPU SETIAP ITEM
         if (this._checkCPULimit()) {
           await this._cpuYield();
           this._startCPUTimer();
         }
       }
-      
-      if (this._eventQueue.length > 0 && processed > 0) {
+      if (this._eventQueue.length > 0) {
         setTimeout(() => {
           if (!this.closing && !this.isDestroyed) {
             this._processEventQueue();
           }
-        }, CONSTANTS.EVENT_PROCESS_DELAY_MS);
+        }, CONSTANTS.CPU_YIELD_DELAY_MS);
       }
-      
     } catch(e) {
       this._handleError('processQueue', e);
     } finally {
@@ -5226,14 +4964,10 @@ export class GameServer extends CPUProtection {
       this.isDestroyed = true;
       this.closing = true;
       
+      // ✅ CLEANUP SEMUA INTERVAL
       if (this._mainInterval) {
         clearInterval(this._mainInterval);
         this._mainInterval = null;
-      }
-      
-      if (this._cleanupCacheInterval) {
-        clearInterval(this._cleanupCacheInterval);
-        this._cleanupCacheInterval = null;
       }
       
       if (this._diceKeepAliveInterval) {
@@ -5286,6 +5020,7 @@ export class GameServer extends CPUProtection {
         this._diceTimerTimeout = null;
       }
       
+      // ✅ BERSIHKAN CACHE
       this._cachedResetWeek = null;
       this._cachedResetWeekTimestamp = 0;
       this._cachedLastWeekWinner = null;
@@ -5349,9 +5084,7 @@ export class GameServer extends CPUProtection {
             currentWeek: this._generateCurrentWeek(new Date()),
             tieActive: this._tieActive,
             tieRound: this._tieRound,
-            tiePlayers: this._tiePlayers.length,
-            cpuAverage: this._cpuAverage || 0,
-            eventQueueProcessed: this._cpuCheckCount || 0
+            tiePlayers: this._tiePlayers.length
           };
           return new Response(JSON.stringify(status), {
             headers: { 'Content-Type': 'application/json' }

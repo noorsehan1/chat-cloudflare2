@@ -1,4 +1,4 @@
- // ==================== GAME-SERVER-FIXED.js ====================
+// ==================== GAME-SERVER-FIXED.js ====================
 // ✅ HANYA 1 INTERVAL - TANPA RECURSIVE TIMEOUT
 // ✅ TANPA CPU PROTECTION
 // ✅ RESET WINNER HANYA SAAT getDiceLastWeekWinner DIPANGGIL

@@ -1,10 +1,8 @@
 // ==================== GAME-SERVER-ULTIMATE.js ====================
-// ✅ FINAL - OPTIMIZED UNTUK CLOUDFLARE FREE TIER
-// ✅ TANPA KICK USER PARKIR (IDLE)
+// ✅ FINAL - TANPA TTL CACHE
+// ✅ KV CACHE BERDASARKAN INPUTAN (TIDAK AUTO EXPIRE)
 // ✅ USER TETAP TERHUBUNG SAMPAI CLOSE SENDIRI
-// ✅ HANYA CLEANUP KONEKSI YANG SUDAH MATI
-// ✅ CLEANUP INTERVAL 60 DETIK
-// ✅ HEALTH CHECK HANYA CEK DICE
+// ✅ OPTIMIZED UNTUK CLOUDFLARE FREE TIER
 // ✅ TIDAK EXCEEDED ALLOWED DURATION
 
 const CONSTANTS = {
@@ -44,27 +42,25 @@ const CONSTANTS = {
   CPU_YIELD_MS: 1,
   
   // ========== OPTIMASI UNTUK FREE TIER ==========
-  MAX_PROCESS_TIME_MS: 1500,        // 1.5 DETIK (dari 3 detik)
-  EVENT_BATCH_SIZE: 1,              // 1 EVENT (dari 2)
-  MAX_QUEUE_SIZE: 150,              // 150 (dari 300)
-  CLEANUP_INTERVAL_MS: 60000,       // 60 DETIK (dari 30 detik)
+  MAX_PROCESS_TIME_MS: 1500,
+  EVENT_BATCH_SIZE: 1,
+  MAX_QUEUE_SIZE: 150,
+  CLEANUP_INTERVAL_MS: 60000,
   HAND_SHAKE_TIMEOUT_MS: 3000,
   RATE_LIMIT_MAX: 100,
   RATE_LIMIT_WINDOW_MS: 60000,
   MAX_BOT_TIMEOUTS: 5,
-  MAX_EVENT_ITERATIONS: 5,          // 5 ITERASI (dari 20)
+  MAX_EVENT_ITERATIONS: 5,
   DICE_TIMER_INTERVAL_MS: 1000,
   MAP_CLEANUP_AGE_MS: 1800000,
   BAN_DURATION_MS: 180000,
   MAX_RECONNECT_ATTEMPTS: 5,
   RECONNECT_WINDOW_MS: 30000,
-  
-  // ========== TIDAK ADA IDLE TIMEOUT ==========
 };
 
 const QUIZ_SCHEDULE = {
   SESSIONS: [
-    { start: 1, end: 6 },
+    { start: 1, end: 4 },
     { start: 14, end: 15 },
     { start: 22, end: 23 }
   ],
@@ -73,30 +69,47 @@ const QUIZ_SCHEDULE = {
 
 const DICE_ROOM = "Quiz";
 
-// ==================== KV CACHE ====================
+// ==================== KV CACHE (TANPA TTL) ====================
 class KVCache {
   constructor() {
     this.cache = new Map();
-    this.ttl = 30000;
+    // ❌ TIDAK ADA TTL
+    // Data akan tetap di cache sampai dihapus manual
   }
 
   get(key) {
     const entry = this.cache.get(key);
     if (!entry) return null;
-    if (Date.now() - entry.timestamp > this.ttl) {
-      this.cache.delete(key);
-      return null;
-    }
+    // ✅ KEMBALIKAN DATA TANPA CEK TTL
     return entry.value;
   }
 
-  set(key, value, customTtl = null) {
-    const ttl = customTtl || this.ttl;
-    this.cache.set(key, { value, timestamp: Date.now(), ttl });
+  set(key, value) {
+    // ✅ SET DATA TANPA TTL
+    this.cache.set(key, { value, timestamp: Date.now() });
   }
 
   delete(key) { this.cache.delete(key); }
   clear() { this.cache.clear(); }
+  
+  // ✅ METHOD UNTUK UPDATE MANUAL
+  update(key, value) {
+    if (this.cache.has(key)) {
+      this.cache.set(key, { value, timestamp: Date.now() });
+      return true;
+    }
+    return false;
+  }
+  
+  // ✅ METHOD UNTUK CEK EXIST
+  has(key) {
+    return this.cache.has(key);
+  }
+  
+  // ✅ METHOD UNTUK GET ALL KEYS
+  keys() {
+    return Array.from(this.cache.keys());
+  }
 }
 
 // ==================== DICE GAME SYSTEM ====================
@@ -176,12 +189,13 @@ class DiceGameSystem {
 export class GameServer {
   constructor(state, env) {
     try {
-      // ========== INISIALISASI ==========
+      // ========== INISIALISASI MINIMAL ==========
       this.state = state;
       this.env = env;
       this.closing = false;
       this.isDestroyed = false;
       this._initialized = false;
+      this._startTime = Date.now();
       
       // ========== CORE STATE ==========
       this.activeGames = new Map();
@@ -233,7 +247,7 @@ export class GameServer {
       this._cachedResetWeek = null;
       this._cachedLastWeekWinner = null;
       this._recordingEnabled = new Map();
-      this._kvCache = new KVCache();
+      this._kvCache = new KVCache(); // ✅ TANPA TTL
       this.diceGameSystem = new DiceGameSystem(this);
       
       // ========== EVENT QUEUE ==========
@@ -257,7 +271,6 @@ export class GameServer {
       this._circuitOpen = false;
       this._errorCount = 0;
       this._lastErrorReset = Date.now();
-      this._startTime = Date.now();
       
       // ========== ✅ INTERVAL 1 DETIK ==========
       this._scheduleInterval = setInterval(() => {
@@ -294,12 +307,12 @@ export class GameServer {
       }, CONSTANTS.CLEANUP_INTERVAL_MS);
       this._allTimers.add(this._cleanupInterval);
       
-      // ========== ✅ LAZY INIT ==========
+      // ========== ✅ LAZY INIT - TUNDA 3 DETIK ==========
       setTimeout(() => {
         if (!this.closing && !this.isDestroyed) {
           this._lazyInit();
         }
-      }, 1000);
+      }, 3000);
       
     } catch(e) {}
   }
@@ -310,13 +323,13 @@ export class GameServer {
     this._initialized = true;
     
     try {
-      await this._withTimeout(this._loadKVData(), 2000);
+      await this._withTimeout(this._loadKVData(), 3000);
       
       setTimeout(() => {
         if (!this.closing && !this.isDestroyed && !this._isShowingDice) {
           this.forceStartDice();
         }
-      }, 3000);
+      }, 5000);
       
     } catch(e) {
       setTimeout(() => {
@@ -328,10 +341,9 @@ export class GameServer {
     }
   }
 
-  // ========== CLEANUP (OPTIMAL) ==========
+  // ========== CLEANUP ==========
   _performCleanup() {
     try {
-      // Skip jika tidak ada koneksi
       if (this.wsMap.size === 0) {
         if (this._eventQueue && this._eventQueue.length > CONSTANTS.MAX_QUEUE_SIZE) {
           this._eventQueue.splice(0, this._eventQueue.length - CONSTANTS.MAX_QUEUE_SIZE);
@@ -339,20 +351,15 @@ export class GameServer {
         return;
       }
       
-      // Cleanup event queue
       if (this._eventQueue && this._eventQueue.length > CONSTANTS.MAX_QUEUE_SIZE) {
         this._eventQueue.splice(0, this._eventQueue.length - CONSTANTS.MAX_QUEUE_SIZE);
       }
       
-      // Cleanup dead connections
       this._cleanupDeadConnections();
-      
-      // Cleanup hanya yang perlu
       this._cleanupUserConnections();
       this._cleanupReconnectAttempts();
       this._cleanupBannedUsers();
       
-      // Reset error counter
       if (Date.now() - this._lastErrorReset > CONSTANTS.ERROR_RESET_INTERVAL_MS) {
         this._errorCount = 0;
         this._lastErrorReset = Date.now();
@@ -479,7 +486,11 @@ export class GameServer {
       if (this.closing || this.isDestroyed) return;
       
       const currentWeek = this._generateCurrentWeek(new Date());
-      const existing = await this._getCachedResetWeek();
+      const existing = await this._withTimeout(
+        this._getCachedResetWeek(), 
+        2000
+      );
+      
       if (!existing && this.env?.QUESTIONS) {
         this._cachedResetWeek = currentWeek;
         this._fireAndForget(
@@ -487,7 +498,11 @@ export class GameServer {
         );
       }
       
-      await this.diceGameSystem.loadScores();
+      await this._withTimeout(
+        this.diceGameSystem.loadScores(), 
+        2000
+      );
+      
     } catch(e) {}
   }
 
@@ -1395,13 +1410,12 @@ export class GameServer {
     } catch(e) {}
   }
 
-  // ========== HEALTH CHECK (HANYA DICE) ==========
   _performHealthCheck() {
     try {
       const now = Date.now();
       this._lastHeartbeat = now;
       
-      // ✅ HANYA CEK DICE - PERLU UNTUK SAFETY NET
+      // ✅ HANYA CEK DICE
       if (this._isDiceTime() && this.currentDiceRoll && this._diceStartTime) {
         const elapsed = (now - this._diceStartTime) / 1000;
         if (elapsed > (CONSTANTS.DICE_TOTAL_TIME_MS / 1000) + 30) {
@@ -1411,16 +1425,12 @@ export class GameServer {
           this._canSubmitDiceAnswer = false;
           this._stopDiceTimerNotifications();
           
-          // Broadcast reset
           this._broadcastToRoom(DICE_ROOM, ["diceReset", { 
             reason: "Timeout", 
             timestamp: Date.now() 
           }]);
         }
       }
-      
-      // ❌ HAPUS: Cek WS mati (sudah ada di cleanup interval)
-      
     } catch(e) {}
   }
 
@@ -2693,7 +2703,7 @@ export class GameServer {
     } catch(e) {}
   }
 
-  // ==================== EVENT HANDLING (OPTIMAL) ====================
+  // ==================== EVENT HANDLING ====================
 
   async handleEvent(ws, data) {
     try {

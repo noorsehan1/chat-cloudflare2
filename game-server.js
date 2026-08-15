@@ -1,6 +1,8 @@
 // ==================== GAME-SERVER-ULTIMATE.js ====================
-// ✅ FINAL - TANPA TTL CACHE
-// ✅ KV CACHE BERDASARKAN INPUTAN (TIDAK AUTO EXPIRE)
+// ✅ FINAL - DENGAN FIX DICE LAMBAT
+// ✅ DICE CHECK INTERVAL 2 DETIK
+// ✅ WINDOW WAKTU 60 DETIK
+// ✅ TANPA TTL CACHE
 // ✅ USER TETAP TERHUBUNG SAMPAI CLOSE SENDIRI
 // ✅ OPTIMIZED UNTUK CLOUDFLARE FREE TIER
 // ✅ TIDAK EXCEEDED ALLOWED DURATION
@@ -19,7 +21,7 @@ const CONSTANTS = {
   STALE_GAME_TIMEOUT_MS: 600000,
   STUCK_DRAW_TIMEOUT_MS: 60000,
   STUCK_REGISTRATION_TIMEOUT_MS: 30000,
-  MAX_WS_CLIENTS: 200,
+  MAX_WS_CLIENTS: 50,
   MAX_EVENT_QUEUE_SIZE: 1000,
   ERROR_RESET_INTERVAL_MS: 60000,
   LOWCARD_WINNER_KEY: 'lowcard_winner_',
@@ -56,6 +58,10 @@ const CONSTANTS = {
   BAN_DURATION_MS: 180000,
   MAX_RECONNECT_ATTEMPTS: 5,
   RECONNECT_WINDOW_MS: 30000,
+  
+  // ========== FIX DICE LAMBAT ==========
+  DICE_CHECK_INTERVAL_MS: 2000, // 2 DETIK
+  DICE_START_WINDOW_MS: 60000, // 60 DETIK (dari 30)
 };
 
 const QUIZ_SCHEDULE = {
@@ -74,25 +80,21 @@ class KVCache {
   constructor() {
     this.cache = new Map();
     // ❌ TIDAK ADA TTL
-    // Data akan tetap di cache sampai dihapus manual
   }
 
   get(key) {
     const entry = this.cache.get(key);
     if (!entry) return null;
-    // ✅ KEMBALIKAN DATA TANPA CEK TTL
     return entry.value;
   }
 
   set(key, value) {
-    // ✅ SET DATA TANPA TTL
     this.cache.set(key, { value, timestamp: Date.now() });
   }
 
   delete(key) { this.cache.delete(key); }
   clear() { this.cache.clear(); }
   
-  // ✅ METHOD UNTUK UPDATE MANUAL
   update(key, value) {
     if (this.cache.has(key)) {
       this.cache.set(key, { value, timestamp: Date.now() });
@@ -101,12 +103,10 @@ class KVCache {
     return false;
   }
   
-  // ✅ METHOD UNTUK CEK EXIST
   has(key) {
     return this.cache.has(key);
   }
   
-  // ✅ METHOD UNTUK GET ALL KEYS
   keys() {
     return Array.from(this.cache.keys());
   }
@@ -247,7 +247,7 @@ export class GameServer {
       this._cachedResetWeek = null;
       this._cachedLastWeekWinner = null;
       this._recordingEnabled = new Map();
-      this._kvCache = new KVCache(); // ✅ TANPA TTL
+      this._kvCache = new KVCache();
       this.diceGameSystem = new DiceGameSystem(this);
       
       // ========== EVENT QUEUE ==========
@@ -306,6 +306,26 @@ export class GameServer {
         this._performCleanup();
       }, CONSTANTS.CLEANUP_INTERVAL_MS);
       this._allTimers.add(this._cleanupInterval);
+      
+      // ========== ✅ DICE CHECK INTERVAL (2 DETIK) ==========
+      // FIX: Interval khusus untuk cek dice agar tidak terlewat
+      this._diceCheckInterval = setInterval(() => {
+        if (this.closing || this.isDestroyed) {
+          clearInterval(this._diceCheckInterval);
+          this._diceCheckInterval = null;
+          return;
+        }
+        
+        // CEK APAKAH SUDAH WAKTU DICE
+        if (this._isDiceTime() && !this.currentDiceRoll && !this._diceTimeout && 
+            !this._isShowingDice && !this._diceTimeUpCooldown && !this._tieActive) {
+          const clients = this.wsClients.get(DICE_ROOM);
+          if (clients?.size > 0) {
+            this.forceStartDice();
+          }
+        }
+      }, CONSTANTS.DICE_CHECK_INTERVAL_MS);
+      this._allTimers.add(this._diceCheckInterval);
       
       // ========== ✅ LAZY INIT - TUNDA 3 DETIK ==========
       setTimeout(() => {
@@ -1384,13 +1404,26 @@ export class GameServer {
       
       for (const session of QUIZ_SCHEDULE.SESSIONS) {
         const startTotalSeconds = session.start * 60 * 60;
-        if (currentTotalSeconds >= startTotalSeconds - 30 && currentTotalSeconds < startTotalSeconds + 30) {
+        
+        // ✅ FIX: WINDOW 60 DETIK (dari 30)
+        if (currentTotalSeconds >= startTotalSeconds - 60 && currentTotalSeconds < startTotalSeconds + 60) {
           const clients = this.wsClients.get(DICE_ROOM);
           if (clients?.size > 0) {
             this.diceAutoEnabled = true;
             this.forceStartDice();
+            break;
           }
-          break;
+        }
+        
+        // ✅ FIX: CEK JIKA SUDAH DALAM SESSION
+        if (this._isDiceTime() && !this.currentDiceRoll && !this._diceTimeout && 
+            !this._isShowingDice && !this._diceTimeUpCooldown) {
+          const clients = this.wsClients.get(DICE_ROOM);
+          if (clients?.size > 0) {
+            this.diceAutoEnabled = true;
+            this.forceStartDice();
+            break;
+          }
         }
       }
     } catch(e) {}
@@ -1415,7 +1448,6 @@ export class GameServer {
       const now = Date.now();
       this._lastHeartbeat = now;
       
-      // ✅ HANYA CEK DICE
       if (this._isDiceTime() && this.currentDiceRoll && this._diceStartTime) {
         const elapsed = (now - this._diceStartTime) / 1000;
         if (elapsed > (CONSTANTS.DICE_TOTAL_TIME_MS / 1000) + 30) {
@@ -3248,6 +3280,7 @@ export class GameServer {
       if (this._mainInterval) { clearInterval(this._mainInterval); this._mainInterval = null; }
       if (this._scheduleInterval) { clearInterval(this._scheduleInterval); this._scheduleInterval = null; }
       if (this._cleanupInterval) { clearInterval(this._cleanupInterval); this._cleanupInterval = null; }
+      if (this._diceCheckInterval) { clearInterval(this._diceCheckInterval); this._diceCheckInterval = null; }
       
       if (this._diceTimerInterval) {
         clearInterval(this._diceTimerInterval);

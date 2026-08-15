@@ -1,19 +1,7 @@
-// ==================== GAME-SERVER-FINAL-FIXED.js ====================
-// ✅ VERSI FINAL - FIXED - HOST BISA START GAME DI KV KOSONG
-// ✅ SEMUA ASYNC DI _initAsync()
-// ✅ HANYA 1 SETTIMEOUT DI CONSTRUCTOR
-// ✅ LOAD KV CEPAT
-// ✅ TANPA CPU PROTECTION - TANPA TTL - TANPA RATE LIMITING
-// ✅ HANYA 1 INTERVAL (GABUNGAN) - HEMAT DURABLE 95%
-// ✅ RESET OTOMATIS SAAT MINGGU BERGANTI (PAKAI UTC SERVER - ISO 8601)
-// ✅ SESSION DICE TETAP PAKAI WITA (UTC+8)
-// ✅ SIAP DEPLOY - HEMAT - DURABLE - ANTI HYBERNATE
-// ✅ SUPPORT startGameWithRecording DARI ANDROID
-// ✅ TAMBAH NOTIF LEFTIME SAAT MASUK ROOM QUIZ (DELAY 5 DETIK)
-// ✅ FIX: _isWeekChanged() return true jika lastResetWeek null
-// ✅ FIX: _calculateAndGetLastWeekWinner() handle null lastResetWeek
+// ==================== GAME-SERVER-FINAL.js ====================
+// ✅ VERSI FINAL - FIX RECORDING ISSUE
+// ✅ FIX: startGame() handling recording status dengan benar
 // ✅ FIX: DO Timeout - Optimasi Constructor
-// ✅ FIX: Host bisa start game di KV kosong - default recording FALSE
 
 const CONSTANTS = {
   REGISTRATION_TIME_MS: 20000,
@@ -326,13 +314,13 @@ export class GameServer {
         this._alarmTick();
       }, CONSTANTS.ALARM_INTERVAL_MS || 180000);
       
-      // ✅ PANGGIL _initAsync() SEKALI SAJA
-      this._initAsync().catch(() => {});
-      
-      // ✅ ALARM TICK PERTAMA (CEPAT)
+      // ✅ HANYA 1 SETTIMEOUT (100ms)
       setTimeout(() => {
         if (!this.closing && !this.isDestroyed) this._alarmTick();
       }, 100);
+      
+      // ✅ PANGGIL _initAsync TANPA AWAIT
+      this._initAsync().catch(() => {});
       
       // ✅ START DICE AUTO CHECKER
       this._startDiceAutoChecker();
@@ -340,7 +328,7 @@ export class GameServer {
     } catch(e) {}
   }
 
-  // ==================== INIT ASYNC (OPTIMASI) ====================
+  // ==================== INIT ASYNC ====================
   
   async _initAsync() {
     try {
@@ -468,21 +456,6 @@ export class GameServer {
         const value = await this.env.QUESTIONS.get(key.name);
         const isRecording = value === 'true';
         this._recordingEnabled.set(roomName, isRecording);
-      }
-
-      // ========================================
-      // 6. ✅ FIX: SET DEFAULT FALSE UNTUK ROOM BARU
-      // ========================================
-      const allRooms = new Set();
-      for (const [room] of this.wsClients) {
-        if (room && room !== DICE_ROOM) {
-          allRooms.add(room);
-        }
-      }
-      for (const room of allRooms) {
-        if (!this._recordingEnabled.has(room)) {
-          this._recordingEnabled.set(room, false);
-        }
       }
       
     } catch(e) {}
@@ -789,7 +762,6 @@ export class GameServer {
     }
   }
 
-  // ✅ FIX: return true jika lastResetWeek null
   _isWeekChanged() {
     try {
       const currentWeek = this._generateCurrentWeek(new Date());
@@ -805,7 +777,6 @@ export class GameServer {
     }
   }
 
-  // ✅ FIX: handle null lastResetWeek
   async _calculateAndGetLastWeekWinner() {
     try {
       if (!this.env?.QUESTIONS) return null;
@@ -816,7 +787,6 @@ export class GameServer {
         lastResetWeek = await this._getCachedResetWeek();
       }
       
-      // ✅ Jika tidak ada lastResetWeek
       if (!lastResetWeek) {
         const points = await this.diceGameSystem.getPoints();
         let winner = null;
@@ -1892,63 +1862,33 @@ export class GameServer {
     } catch(e) {}
   }
 
-  // ==================== ✅ FIX: RECORDING METHODS (DEFAULT FALSE) ====================
+  // ==================== RECORDING METHODS (FIX) ====================
 
   async _getRecordingStatusFromKV(roomName) {
     try {
-        if (!roomName) return false;
-        
-        // ✅ Cek cache dulu
-        if (this._recordingEnabled.has(roomName)) {
-            return this._recordingEnabled.get(roomName);
-        }
-        
-        // ✅ Jika di KV tidak ada, default FALSE
-        if (this.env?.QUESTIONS) {
-            const kvValue = await this.env.QUESTIONS.get(CONSTANTS.LOWCARD_RECORDING_KEY + roomName);
-            const isRecording = kvValue === 'true';
-            this._recordingEnabled.set(roomName, isRecording);
-            return isRecording;
-        }
-        
-        // ✅ Default: FALSE (KV kosong)
-        this._recordingEnabled.set(roomName, false);
-        return false;
-    } catch(e) { 
-        // ✅ ERROR handling: default FALSE
-        this._recordingEnabled.set(roomName, false);
-        return false; 
-    }
+      if (!roomName) return false;
+      if (this._recordingEnabled.has(roomName)) {
+        return this._recordingEnabled.get(roomName);
+      }
+      if (this.env?.QUESTIONS) {
+        const kvValue = await this.env.QUESTIONS.get(CONSTANTS.LOWCARD_RECORDING_KEY + roomName);
+        const isRecording = kvValue === 'true';
+        this._recordingEnabled.set(roomName, isRecording);
+        return isRecording;
+      }
+      return false;
+    } catch(e) { return false; }
   }
 
-  // ==================== ✅ FIX: DEBUG RECORDING STATUS ====================
-
-  async _debugRecordingStatus(roomName) {
+  // ✅ TAMBAHKAN METHOD UNTUK CEK RECORDING DARI LUAR
+  async isRecordingEnabled(room) {
     try {
-        if (!roomName) return null;
-        
-        const result = {
-            room: roomName,
-            fromCache: this._recordingEnabled.has(roomName),
-            cachedValue: this._recordingEnabled.get(roomName) || false,
-            kvKey: CONSTANTS.LOWCARD_RECORDING_KEY + roomName,
-            kvValue: null,
-            fromKV: false
-        };
-        
-        if (this.env?.QUESTIONS) {
-            const kvValue = await this.env.QUESTIONS.get(CONSTANTS.LOWCARD_RECORDING_KEY + roomName);
-            result.kvValue = kvValue;
-            result.fromKV = kvValue !== null;
-        }
-        
-        return result;
+      if (!room) return false;
+      return await this._getRecordingStatusFromKV(room);
     } catch(e) {
-        return { error: e.message };
+      return false;
     }
   }
-
-  // ==================== CACHE METHODS ====================
 
   async _startRecordingWinners(roomName) {
     try {
@@ -2054,90 +1994,91 @@ export class GameServer {
     } catch(e) {}
   }
 
-  // ==================== ✅ FIX: GAME METHODS (START GAME DI KV KOSONG) ====================
+  // ==================== GAME METHODS ====================
 
+  // ✅ FIX: startGame dengan handling recording yang benar
   async startGame(ws, bet, username, forceStart = false) {
     try {
-        if (this.isDestroyed) {
-            this._safeSend(ws, ["gameLowCardError", "Server is shutting down"]);
-            return;
-        }
-        if (!username?.trim()) {
-            this._safeSend(ws, ["gameLowCardError", "Username is required"]);
-            return;
-        }
-        
-        const usernameClean = username.trim();
-        const room = ws.room || ws.roomname || this.clientRooms.get(ws._wsId);
-        if (!room) {
-            this._safeSend(ws, ["gameLowCardError", "Please switch to a room first"]);
-            return;
-        }
-        if (room === DICE_ROOM) {
-            this._safeSend(ws, ["gameLowCardError", "Cannot start game in Quiz room"]);
-            return;
-        }
+      if (this.isDestroyed) {
+        this._safeSend(ws, ["gameLowCardError", "Server is shutting down"]);
+        return;
+      }
+      if (!username?.trim()) {
+        this._safeSend(ws, ["gameLowCardError", "Username is required"]);
+        return;
+      }
+      
+      const usernameClean = username.trim();
+      const room = ws.room || ws.roomname || this.clientRooms.get(ws._wsId);
+      if (!room) {
+        this._safeSend(ws, ["gameLowCardError", "Please switch to a room first"]);
+        return;
+      }
+      if (room === DICE_ROOM) {
+        this._safeSend(ws, ["gameLowCardError", "Cannot start game in Quiz room"]);
+        return;
+      }
 
-        // ✅ FIX: AMAN - Default FALSE jika KV kosong
-        const isRecordingEnabled = await this._getRecordingStatusFromKV(room) || false;
-        
-        // ✅ Log untuk debugging
-        console.log(`[startGame] Room: ${room}, Recording: ${isRecordingEnabled}, ForceStart: ${forceStart}`);
-        
-        if (isRecordingEnabled && !forceStart) {
-            this._safeSend(ws, ["gameLowCardError", "Recording is ACTIVE in this room"]);
-            return;
-        }
-        
-        if (isRecordingEnabled && forceStart) {
-            this._safeSend(ws, ["gameLowCardInfo", "Game started with recording enabled"]);
-        }
+      // ✅ CEK RECORDING STATUS
+      const isRecordingEnabled = await this._getRecordingStatusFromKV(room);
+      
+      // ✅ LOGIKA RECORDING YANG BENAR
+      if (isRecordingEnabled && !forceStart) {
+        // ❌ TOLAK - harus pakai startGameWithRecording
+        this._safeSend(ws, ["gameLowCardError", "Recording is ACTIVE in this room. Please use startGameWithRecording"]);
+        return;
+      }
+      
+      if (isRecordingEnabled && forceStart) {
+        // ✅ IZINKAN - start dengan recording
+        this._safeSend(ws, ["gameLowCardInfo", "Game started with recording enabled"]);
+      }
+      
+      // ✅ Jika recording disabled, lanjutkan normal (tidak ada pesan khusus)
 
-        // ✅ Cek existing game
-        const existingGame = this.activeGames.get(room);
-        if (existingGame?._isActive && !existingGame._gameEnded) {
-            this._safeSend(ws, ["gameLowCardError", "Game is already running"]);
-            return;
-        }
-        
-        if (existingGame) await this._forceCleanupGame(room, existingGame);
-        
-        // ✅ Validasi Bet
-        const betAmount = parseInt(bet, 10) || 0;
-        if (betAmount < 0 || (betAmount !== 0 && betAmount < 100) || betAmount > CONSTANTS.MAX_BET) {
-            this._safeSend(ws, ["gameLowCardError", `Invalid bet (0 or 100-${CONSTANTS.MAX_BET})`]);
-            return;
-        }
-        
-        const wsId = ws._wsId;
-        const game = {
-            room, players: new Map(), botPlayers: new Map(), registrationOpen: true,
-            round: 1, numbers: new Map(), tanda: new Map(), eliminated: new Set(),
-            betAmount, hostId: usernameClean, hostName: usernameClean, useBots: false,
-            evaluationLocked: false, drawTimeExpired: false,
-            _isActive: true, _gameEnded: false, _phase: 'registration',
-            _botTimeouts: new Set(), _botsAdded: false,
-            _registrationTimer: null, _drawTimer: null, _evalTimer: null, _safetyTimer: null,
-            _isEvaluating: false, _createdAt: Date.now(), _drawPhaseStart: null, _endTime: null,
-            playerWsId: new Map(),
-            _startedByRecording: isRecordingEnabled && forceStart,
-            _startedBy: forceStart ? 'recording' : 'user'
-        };
-        
-        game.players.set(usernameClean, { id: usernameClean, name: usernameClean });
-        game.playerWsId.set(usernameClean, wsId);
-        this.activeGames.set(room, game);
-        this._addClient(room, ws, usernameClean, false);
-        this._broadcastToRoom(room, ["gameLowCardStart", betAmount]);
-        this._broadcastToRoom(room, ["gameLowCardStartSuccess", usernameClean, betAmount]);
-        
-        this._startRegistration(room, game);
-        
-    } catch(e) {
-        console.error('[startGame] Error:', e);
-        this._safeSend(ws, ["gameLowCardError", "Failed to start game: " + e.message]);
-    }
+      const existingGame = this.activeGames.get(room);
+      if (existingGame?._isActive && !existingGame._gameEnded) {
+        this._safeSend(ws, ["gameLowCardError", "Game is already running"]);
+        return;
+      }
+      
+      if (existingGame) await this._forceCleanupGame(room, existingGame);
+      
+      const betAmount = parseInt(bet, 10) || 0;
+      if (betAmount < 0 || (betAmount !== 0 && betAmount < 100) || betAmount > CONSTANTS.MAX_BET) {
+        this._safeSend(ws, ["gameLowCardError", `Invalid bet (0 or 100-${CONSTANTS.MAX_BET})`]);
+        return;
+      }
+      
+      const wsId = ws._wsId;
+      const game = {
+        room, players: new Map(), botPlayers: new Map(), registrationOpen: true,
+        round: 1, numbers: new Map(), tanda: new Map(), eliminated: new Set(),
+        betAmount, hostId: usernameClean, hostName: usernameClean, useBots: false,
+        evaluationLocked: false, drawTimeExpired: false,
+        _isActive: true, _gameEnded: false, _phase: 'registration',
+        _botTimeouts: new Set(), _botsAdded: false,
+        _registrationTimer: null, _drawTimer: null, _evalTimer: null, _safetyTimer: null,
+        _isEvaluating: false, _createdAt: Date.now(), _drawPhaseStart: null, _endTime: null,
+        playerWsId: new Map(),
+        _startedByRecording: isRecordingEnabled && forceStart,
+        _startedBy: forceStart ? 'recording' : 'user'
+      };
+      
+      game.players.set(usernameClean, { id: usernameClean, name: usernameClean });
+      game.playerWsId.set(usernameClean, wsId);
+      this.activeGames.set(room, game);
+      this._addClient(room, ws, usernameClean, false);
+      this._broadcastToRoom(room, ["gameLowCardStart", betAmount]);
+      this._broadcastToRoom(room, ["gameLowCardStartSuccess", usernameClean, betAmount]);
+      
+      this._startRegistration(room, game);
+      
+    } catch(e) {}
   }
+
+  // ==================== SISANYA SAMA (game methods, websocket, dll) ====================
+  // ... (LANJUTKAN DENGAN SEMUA METHOD YANG SUDAH ADA SEBELUMNYA)
 
   async joinGame(ws, username) {
     try {
@@ -3336,18 +3277,6 @@ export class GameServer {
       if (evt === "switchRoom") {
         const [_, room, username] = data;
         await this.switchRoom(ws, room, username);
-        return;
-      }
-
-      // ==================== ✅ FIX: DEBUG RECORDING STATUS ====================
-      if (evt === "debugRecordingStatus") {
-        const roomName = data[1] || ws.room || ws.roomname || this.clientRooms.get(ws._wsId);
-        if (!roomName) {
-            this._safeSend(ws, ["debugRecordingStatus", { error: "Room required" }]);
-            return;
-        }
-        const status = await this._debugRecordingStatus(roomName);
-        this._safeSend(ws, ["debugRecordingStatus", status]);
         return;
       }
 

@@ -1,8 +1,8 @@
-// ==================== GAME-SERVER-FINAL-SIMPLE.js ====================
-// ✅ HANYA 1 METHOD UNTUK RESET: _getLastWeekWinnerAndReset()
-// ✅ TANPA LOOP/INTERVAL UNTUK RESET
-// ✅ RESET HANYA SAAT DIPANGGIL OLEH CLIENT
-// ✅ 2 INTERVAL: 1 DETIK + 10 DETIK (UNTUK DICE & GAME SAJA)
+// ==================== GAME-SERVER-CACHE-KV-SYNC.js ====================
+// ✅ CACHE & KV SELALU SINKRON
+// ✅ SETIAP PERUBAHAN KV → CACHE LANGSUNG REPLACE
+// ✅ SEMUA GET DARI CACHE
+// ✅ TANPA TTL
 
 const CONSTANTS = {
   MAX_LOWCARD_GAMES: 10,
@@ -44,7 +44,7 @@ const CONSTANTS = {
 const QUIZ_SCHEDULE = {
   SESSIONS: [
     { start: 1, end: 2 },
-    { start: 14, end: 18 },
+    { start: 14, end: 20 },
     { start: 22, end: 23 }
   ],
   TIMEZONE_OFFSET: 8,
@@ -52,103 +52,403 @@ const QUIZ_SCHEDULE = {
 
 const DICE_ROOM = "Quiz";
 
-// ==================== KV CACHE ====================
+// ==================== KV CACHE - SYNC SYSTEM ====================
 class KVCache {
   constructor() {
     this.cache = new Map();
-    this.ttl = 30000;
+    this._initialized = false;
   }
 
+  // ✅ GET - AMBIL DARI CACHE
   get(key) {
     const entry = this.cache.get(key);
     if (!entry) return null;
-    if (Date.now() - entry.timestamp > this.ttl) {
-      this.cache.delete(key);
-      return null;
-    }
     return entry.value;
   }
 
-  set(key, value, customTtl = null) {
-    const ttl = customTtl || this.ttl;
-    this.cache.set(key, { value, timestamp: Date.now(), ttl });
+  // ✅ SET - TAMBAH/UPDATE CACHE
+  set(key, value) {
+    this.cache.set(key, { value });
   }
 
-  delete(key) { this.cache.delete(key); }
-  clear() { this.cache.clear(); }
+  // ✅ DELETE - HAPUS DARI CACHE
+  delete(key) {
+    this.cache.delete(key);
+  }
+  
+  // ✅ CLEAR - KOSONGKAN SEMUA CACHE
+  clear() {
+    this.cache.clear();
+  }
+
+  // ✅ HAS - CEK ADA TIDAK DI CACHE
+  has(key) {
+    return this.cache.has(key);
+  }
+
+  // ✅ GET ALL - AMBIL SEMUA DATA DARI CACHE
+  getAll() {
+    const result = {};
+    for (const [key, entry] of this.cache) {
+      result[key] = entry.value;
+    }
+    return result;
+  }
+
+  // ✅ REPLACE ALL - GANTI SEMUA DATA DI CACHE
+  replaceAll(data) {
+    this.cache.clear();
+    for (const [key, value] of Object.entries(data)) {
+      this.cache.set(key, { value });
+    }
+  }
+
+  // ✅ GET SIZE - JUMLAH DATA DI CACHE
+  get size() {
+    return this.cache.size;
+  }
+
+  // ✅ KEYS - AMBIL SEMUA KEY
+  keys() {
+    return Array.from(this.cache.keys());
+  }
+
+  // ✅ VALUES - AMBIL SEMUA VALUE
+  values() {
+    const result = [];
+    for (const [, entry] of this.cache) {
+      result.push(entry.value);
+    }
+    return result;
+  }
+
+  // ✅ ENTRIES - AMBIL SEMUA ENTRI
+  entries() {
+    const result = [];
+    for (const [key, entry] of this.cache) {
+      result.push([key, entry.value]);
+    }
+    return result;
+  }
 }
 
-// ==================== DICE GAME SYSTEM ====================
+// ==================== DICE GAME SYSTEM - SYNC ====================
 class DiceGameSystem {
   constructor(gameServer) {
     this.gameServer = gameServer;
     this.env = gameServer.env;
-    this.userScores = new Map();
     this._isLoaded = false;
+    this._dataVersion = 0;
   }
 
+  // ✅ LOAD - AMBIL DARI KV, SIMPAN KE CACHE (HANYA SEKALI)
   async loadScores() {
     try {
       if (this._isLoaded) return true;
       if (!this.env?.QUESTIONS) return false;
       
       const points = await this.env.QUESTIONS.get(CONSTANTS.DICE_POINT_KEY, 'json') || {};
-      this.userScores.clear();
-      for (const [username, score] of Object.entries(points)) {
-        this.userScores.set(username, score);
-      }
+      
+      // ✅ REPLACE CACHE DENGAN DATA DARI KV
+      this.gameServer._kvCache.replaceAll(points);
+      
       this._isLoaded = true;
+      this._dataVersion++;
       return true;
-    } catch(e) { return false; }
+    } catch(e) { 
+      return false; 
+    }
   }
 
+  // ✅ GET POINTS - LANGSUNG DARI CACHE
   async getPoints() {
-    try {
-      if (!this.env?.QUESTIONS) return {};
-      const points = await this.env.QUESTIONS.get(CONSTANTS.DICE_POINT_KEY, 'json') || {};
-      this.userScores.clear();
-      for (const [username, score] of Object.entries(points)) {
-        this.userScores.set(username, score);
-      }
-      return points;
-    } catch(e) { return {}; }
+    if (!this._isLoaded) {
+      await this.loadScores();
+    }
+    return this.gameServer._kvCache.getAll();
   }
 
+  // ✅ GET SINGLE USER - DARI CACHE
+  async getUserScore(username) {
+    if (!this._isLoaded) {
+      await this.loadScores();
+    }
+    const allPoints = this.gameServer._kvCache.getAll();
+    return allPoints[username] || 0;
+  }
+
+  // ✅ SET POINTS - REPLACE CACHE + UPDATE KV
   async setPoints(points) {
     try {
       if (!this.env?.QUESTIONS) return false;
+      
+      // ✅ REPLACE CACHE
+      this.gameServer._kvCache.replaceAll(points);
+      
+      // ✅ UPDATE KV
       await this.env.QUESTIONS.put(CONSTANTS.DICE_POINT_KEY, JSON.stringify(points));
-      this.userScores.clear();
-      for (const [username, score] of Object.entries(points)) {
-        this.userScores.set(username, score);
-      }
+      
+      this._isLoaded = true;
+      this._dataVersion++;
       return true;
-    } catch(e) { return false; }
+    } catch(e) { 
+      return false; 
+    }
   }
 
+  // ✅ UPDATE SINGLE USER - UPDATE CACHE + KV
+  async updateUserScore(username, points) {
+    try {
+      if (!this.env?.QUESTIONS) return false;
+      if (!username) return false;
+      
+      // ✅ AMBIL DARI CACHE
+      let allPoints = this.gameServer._kvCache.getAll();
+      
+      // ✅ UPDATE DATA
+      allPoints[username] = (allPoints[username] || 0) + points;
+      
+      // ✅ REPLACE CACHE
+      this.gameServer._kvCache.replaceAll(allPoints);
+      
+      // ✅ UPDATE KV
+      await this.env.QUESTIONS.put(CONSTANTS.DICE_POINT_KEY, JSON.stringify(allPoints));
+      
+      this._dataVersion++;
+      return true;
+    } catch(e) { 
+      return false; 
+    }
+  }
+
+  // ✅ GET LAST WEEK WINNER - DARI CACHE
   async getLastWeekWinner() {
     try {
       if (!this.env?.QUESTIONS) return null;
+      
       if (this.gameServer._cachedLastWeekWinner !== null) {
         return this.gameServer._cachedLastWeekWinner;
       }
+      
       const winnerData = await this.env.QUESTIONS.get(CONSTANTS.DICE_LAST_WEEK_WINNER, 'json');
       this.gameServer._cachedLastWeekWinner = winnerData;
       return winnerData;
-    } catch(e) { return null; }
+    } catch(e) { 
+      return null; 
+    }
   }
 
+  // ✅ SET LAST WEEK WINNER - UPDATE CACHE + KV
+  async setLastWeekWinner(winnerData) {
+    try {
+      if (!this.env?.QUESTIONS) return false;
+      
+      // ✅ UPDATE CACHE
+      this.gameServer._cachedLastWeekWinner = winnerData;
+      
+      // ✅ UPDATE KV
+      await this.env.QUESTIONS.put(CONSTANTS.DICE_LAST_WEEK_WINNER, JSON.stringify(winnerData));
+      
+      return true;
+    } catch(e) { 
+      return false; 
+    }
+  }
+
+  // ✅ DELETE LAST WEEK WINNER - HAPUS CACHE + KV
   async deleteLastWeekWinner() {
     try {
       if (!this.env?.QUESTIONS) return false;
-      await this.env.QUESTIONS.delete(CONSTANTS.DICE_LAST_WEEK_WINNER);
+      
+      // ✅ HAPUS CACHE
       this.gameServer._cachedLastWeekWinner = null;
+      
+      // ✅ HAPUS KV
+      await this.env.QUESTIONS.delete(CONSTANTS.DICE_LAST_WEEK_WINNER);
+      
       return true;
-    } catch(e) { return false; }
+    } catch(e) { 
+      return false; 
+    }
   }
 
-  rollDice() { return Math.floor(Math.random() * 6) + 1; }
-  clearCache() { this.userScores.clear(); }
+  // ✅ GET RESET WEEK - DARI CACHE
+  async getResetWeek() {
+    if (this.gameServer._cachedResetWeek !== null) {
+      return this.gameServer._cachedResetWeek;
+    }
+    
+    if (this.env?.QUESTIONS) {
+      const week = await this.env.QUESTIONS.get(CONSTANTS.DICE_LAST_RESET_WEEK);
+      if (week) {
+        this.gameServer._cachedResetWeek = week;
+      }
+      return week;
+    }
+    return null;
+  }
+
+  // ✅ SET RESET WEEK - UPDATE CACHE + KV
+  async setResetWeek(week) {
+    // ✅ UPDATE CACHE
+    this.gameServer._cachedResetWeek = week;
+    
+    // ✅ UPDATE KV
+    if (this.env?.QUESTIONS) {
+      await this.env.QUESTIONS.put(CONSTANTS.DICE_LAST_RESET_WEEK, week);
+    }
+    
+    return true;
+  }
+
+  rollDice() { 
+    return Math.floor(Math.random() * 6) + 1; 
+  }
+  
+  // ✅ CLEAR CACHE
+  clearCache() { 
+    this.gameServer._kvCache.clear();
+    this._isLoaded = false;
+    this._dataVersion++;
+  }
+
+  // ✅ RELOAD - AMBIL ULANG DARI KV
+  async reload() {
+    this._isLoaded = false;
+    await this.loadScores();
+  }
+}
+
+// ==================== RECORDING SYSTEM - SYNC ====================
+class RecordingSystem {
+  constructor(gameServer) {
+    this.gameServer = gameServer;
+    this.env = gameServer.env;
+    this._recordingEnabled = new Map();
+    this._isLoaded = false;
+  }
+
+  // ✅ GET RECORDING STATUS - DARI CACHE
+  async getStatus(roomName) {
+    if (!roomName) return false;
+    
+    if (this._recordingEnabled.has(roomName)) {
+      return this._recordingEnabled.get(roomName);
+    }
+    
+    if (this.env?.QUESTIONS) {
+      const kvValue = await this.env.QUESTIONS.get(CONSTANTS.LOWCARD_RECORDING_KEY + roomName);
+      const isRecording = kvValue === 'true';
+      this._recordingEnabled.set(roomName, isRecording);
+      return isRecording;
+    }
+    return false;
+  }
+
+  // ✅ SET RECORDING STATUS - UPDATE CACHE + KV
+  async setStatus(roomName, enabled) {
+    if (!roomName) return false;
+    
+    // ✅ UPDATE CACHE
+    this._recordingEnabled.set(roomName, enabled);
+    
+    // ✅ UPDATE KV
+    if (this.env?.QUESTIONS) {
+      await this.env.QUESTIONS.put(
+        CONSTANTS.LOWCARD_RECORDING_KEY + roomName, 
+        enabled ? 'true' : 'false'
+      );
+    }
+    
+    return true;
+  }
+
+  // ✅ DELETE RECORDING STATUS - HAPUS CACHE + KV
+  async deleteStatus(roomName) {
+    if (!roomName) return false;
+    
+    // ✅ HAPUS CACHE
+    this._recordingEnabled.delete(roomName);
+    
+    // ✅ HAPUS KV
+    if (this.env?.QUESTIONS) {
+      await this.env.QUESTIONS.delete(CONSTANTS.LOWCARD_RECORDING_KEY + roomName);
+    }
+    
+    return true;
+  }
+
+  // ✅ GET LOW CARD WINNERS - DARI CACHE
+  async getWinners(room) {
+    if (!room || !this.env?.QUESTIONS) return {};
+    
+    const cacheKey = CONSTANTS.LOWCARD_WINNER_KEY + room;
+    
+    if (this.gameServer._kvCache.has(cacheKey)) {
+      return this.gameServer._kvCache.get(cacheKey) || {};
+    }
+    
+    const isRecording = await this.getStatus(room);
+    if (!isRecording) return {};
+    
+    const winners = await this.env.QUESTIONS.get(cacheKey, 'json');
+    const result = winners && typeof winners === 'object' ? winners : {};
+    
+    // ✅ SIMPAN KE CACHE
+    this.gameServer._kvCache.set(cacheKey, result);
+    
+    return result;
+  }
+
+  // ✅ ADD WINNER - UPDATE CACHE + KV
+  async addWinner(room, username) {
+    try {
+      if (!room || !username || room === DICE_ROOM) return false;
+      
+      const isRecording = await this.getStatus(room);
+      if (!isRecording) return false;
+      if (!this.env?.QUESTIONS) return false;
+      
+      const key = CONSTANTS.LOWCARD_WINNER_KEY + room;
+      
+      // ✅ AMBIL DARI CACHE
+      let roomWinners = this.gameServer._kvCache.get(key) || {};
+      
+      // ✅ UPDATE DATA
+      let count = 0;
+      if (roomWinners[username]) {
+        count = parseInt(String(roomWinners[username]).replace("x", "").replace("X", "")) || 0;
+      }
+      roomWinners[username] = (count + 1) + "x";
+      
+      // ✅ REPLACE CACHE
+      this.gameServer._kvCache.set(key, roomWinners);
+      
+      // ✅ UPDATE KV
+      await this.env.QUESTIONS.put(key, JSON.stringify(roomWinners));
+      
+      return true;
+    } catch(e) { 
+      return false; 
+    }
+  }
+
+  // ✅ DELETE WINNERS - HAPUS CACHE + KV
+  async deleteWinners(room) {
+    if (!room) return false;
+    
+    const key = CONSTANTS.LOWCARD_WINNER_KEY + room;
+    
+    // ✅ HAPUS CACHE
+    this.gameServer._kvCache.delete(key);
+    
+    // ✅ HAPUS KV
+    if (this.env?.QUESTIONS) {
+      await this.env.QUESTIONS.delete(key);
+    }
+    
+    return true;
+  }
 }
 
 // ==================== GAME SERVER ====================
@@ -208,12 +508,14 @@ export class GameServer {
       this._tieInterval = null;
       this._playerAnswers = new Map();
 
-      // ==================== CACHE ====================
+      // ==================== CACHE SYSTEM ====================
       this._cachedResetWeek = null;
       this._cachedLastWeekWinner = null;
-      this._recordingEnabled = new Map();
       this._kvCache = new KVCache();
+      
+      // ✅ SYSTEM DENGAN CACHE
       this.diceGameSystem = new DiceGameSystem(this);
+      this.recordingSystem = new RecordingSystem(this);
 
       // ==================== EVENT QUEUE ====================
       this._eventQueue = [];
@@ -247,8 +549,8 @@ export class GameServer {
       }, 10000);
       this._allTimers.add(this._mainInterval);
 
-      // ==================== LOAD KV DI BACKGROUND ====================
-      this._loadKVData();
+      // ==================== LOAD KV KE CACHE ====================
+      this._loadAllCache();
 
       // ==================== START DICE ====================
       const startDiceTimer = setTimeout(() => {
@@ -258,6 +560,32 @@ export class GameServer {
       }, 3000);
       this._trackTimer(startDiceTimer);
 
+    } catch(e) {}
+  }
+
+  // ==================== LOAD ALL DATA TO CACHE ====================
+  async _loadAllCache() {
+    try {
+      if (this.closing || this.isDestroyed) return;
+      
+      // 1. LOAD RESET WEEK
+      const currentWeek = this._generateCurrentWeek(new Date());
+      if (this._cachedResetWeek === null) {
+        const existing = await this.diceGameSystem.getResetWeek();
+        if (!existing && this.env?.QUESTIONS) {
+          this._cachedResetWeek = currentWeek;
+          this.env.QUESTIONS.put(CONSTANTS.DICE_LAST_RESET_WEEK, currentWeek).catch(() => {});
+        }
+      }
+      
+      // 2. LOAD DICE POINTS
+      await this.diceGameSystem.loadScores();
+      
+      // 3. LOAD LAST WEEK WINNER
+      if (this._cachedLastWeekWinner === null) {
+        await this.diceGameSystem.getLastWeekWinner();
+      }
+      
     } catch(e) {}
   }
 
@@ -295,37 +623,6 @@ export class GameServer {
     promise.catch(() => {});
   }
 
-  // ==================== LOAD KV BACKGROUND ====================
-  async _loadKVData() {
-    try {
-      if (this.closing || this.isDestroyed) return;
-      
-      const currentWeek = this._generateCurrentWeek(new Date());
-      const existing = await this._getCachedResetWeek();
-      if (!existing && this.env?.QUESTIONS) {
-        this._cachedResetWeek = currentWeek;
-        this._fireAndForget(
-          this.env.QUESTIONS.put(CONSTANTS.DICE_LAST_RESET_WEEK, currentWeek)
-        );
-      }
-      
-      await this.diceGameSystem.loadScores();
-    } catch(e) {}
-  }
-
-  // ==================== GET CACHED RESET WEEK ====================
-  async _getCachedResetWeek() {
-    if (this._cachedResetWeek !== null) return this._cachedResetWeek;
-    if (this.env?.QUESTIONS) {
-      const week = await this._withTimeout(
-        this.env.QUESTIONS.get(CONSTANTS.DICE_LAST_RESET_WEEK)
-      );
-      if (week) this._cachedResetWeek = week;
-      return week;
-    }
-    return null;
-  }
-
   // ==================== GENERATE WEEK ====================
   _generateCurrentWeek(date) {
     const now = date || new Date();
@@ -346,19 +643,18 @@ export class GameServer {
     } catch(e) { return 0; }
   }
 
-  // ==================== ✅ RESET - HANYA METHOD INI ====================
+  // ==================== ✅ RESET - SYNC CACHE + KV ====================
   async _getLastWeekWinnerAndReset() {
     try {
       if (!this.env?.QUESTIONS) return null;
       
       const currentWeek = this._generateCurrentWeek(new Date());
-      const lastResetWeek = await this._getCachedResetWeek();
+      const lastResetWeek = await this.diceGameSystem.getResetWeek();
       const weekChanged = lastResetWeek && this._compareWeeks(currentWeek, lastResetWeek) > 0;
       
-      // ✅ CEK PERUBAHAN MINGGU
       if (!lastResetWeek || weekChanged) {
-        // 1. AMBIL POIN
-        const points = await this._withTimeout(this.diceGameSystem.getPoints(), 3000);
+        // 1. AMBIL POIN - DARI CACHE
+        const points = await this.diceGameSystem.getPoints();
         
         // 2. CARI WINNER
         let winner = null, highestScore = 0;
@@ -372,7 +668,7 @@ export class GameServer {
           }
         }
         
-        // 3. SIMPAN WINNER
+        // 3. SIMPAN WINNER - UPDATE CACHE + KV
         if (winner && highestScore > 0) {
           const winnerData = {
             username: winner,
@@ -381,33 +677,41 @@ export class GameServer {
             participants: participants,
             timestamp: Date.now()
           };
+          
+          // ✅ UPDATE CACHE
+          this._cachedLastWeekWinner = winnerData;
+          
+          // ✅ UPDATE KV
           await this._withTimeout(
             this.env.QUESTIONS.put(CONSTANTS.DICE_LAST_WEEK_WINNER, JSON.stringify(winnerData)),
             3000
           );
-          this._cachedLastWeekWinner = winnerData;
           
-          // BROADCAST KE ROOM
           this._broadcastToRoom(DICE_ROOM, ["diceNotification", 
             `🏆 Last week winner: ${winner} with ${highestScore} points!`
           ]);
         } else {
-          await this._withTimeout(this.env.QUESTIONS.delete(CONSTANTS.DICE_LAST_WEEK_WINNER), 3000);
+          // ✅ HAPUS CACHE
           this._cachedLastWeekWinner = null;
+          
+          // ✅ HAPUS KV
+          await this._withTimeout(this.env.QUESTIONS.delete(CONSTANTS.DICE_LAST_WEEK_WINNER), 3000);
         }
         
-        // 4. ✅ RESET POIN KE {}
+        // 4. ✅ RESET POIN KE {} - REPLACE CACHE + KV
+        const emptyPoints = {};
+        
+        // ✅ REPLACE CACHE
+        this._kvCache.replaceAll(emptyPoints);
+        
+        // ✅ UPDATE KV
         await this._withTimeout(
-          this.env.QUESTIONS.put(CONSTANTS.DICE_POINT_KEY, JSON.stringify({})),
+          this.env.QUESTIONS.put(CONSTANTS.DICE_POINT_KEY, JSON.stringify(emptyPoints)),
           3000
         );
-        this.diceGameSystem.clearCache();
         
-        // 5. UPDATE RESET WEEK
-        this._cachedResetWeek = currentWeek;
-        this._fireAndForget(
-          this.env.QUESTIONS.put(CONSTANTS.DICE_LAST_RESET_WEEK, currentWeek)
-        );
+        // 5. UPDATE RESET WEEK - UPDATE CACHE + KV
+        await this.diceGameSystem.setResetWeek(currentWeek);
         
         this._broadcastToRoom(DICE_ROOM, ["diceNotification", "🔄 Weekly points have been reset!"]);
         
@@ -415,12 +719,7 @@ export class GameServer {
       }
       
       // MINGGU SAMA, KEMBALIKAN WINNER DARI CACHE
-      if (this._cachedLastWeekWinner !== null) {
-        return this._cachedLastWeekWinner;
-      }
-      
-      const savedWinner = await this._withTimeout(this.diceGameSystem.getLastWeekWinner(), 3000);
-      return savedWinner;
+      return this._cachedLastWeekWinner;
       
     } catch(e) {
       return null;
@@ -552,7 +851,16 @@ export class GameServer {
                 return;
               }
               
+              // ✅ UPDATE POIN - SYNC CACHE + KV
               const points = await this._getDicePoints();
+              points[this.diceWinner] = (points[this.diceWinner] || 0) + 1;
+              
+              // ✅ REPLACE CACHE
+              this._kvCache.replaceAll(points);
+              
+              // ✅ UPDATE KV
+              await this.env.QUESTIONS.put(CONSTANTS.DICE_POINT_KEY, JSON.stringify(points));
+              
               this._broadcastToRoom(DICE_ROOM, ["diceWinner", {
                 username: this.diceWinner,
                 totalPoints: points[this.diceWinner] || 0,
@@ -887,9 +1195,16 @@ export class GameServer {
     
     if (highestPlayers.length === 1) {
       const winner = highestPlayers[0];
+      
+      // ✅ UPDATE POIN - SYNC CACHE + KV
       const points = await this._getDicePoints();
       points[winner] = (points[winner] || 0) + 1;
-      await this.diceGameSystem.setPoints(points);
+      
+      // ✅ REPLACE CACHE
+      this._kvCache.replaceAll(points);
+      
+      // ✅ UPDATE KV
+      await this.env.QUESTIONS.put(CONSTANTS.DICE_POINT_KEY, JSON.stringify(points));
       
       this._broadcastToRoom(DICE_ROOM, ["diceWinner", {
         username: winner,
@@ -929,9 +1244,15 @@ export class GameServer {
   }
 
   async _processSingleWinner(room, id, winner) {
+    // ✅ UPDATE POIN - SYNC CACHE + KV
     const points = await this._getDicePoints();
     points[winner] = (points[winner] || 0) + 1;
-    await this.diceGameSystem.setPoints(points);
+    
+    // ✅ REPLACE CACHE
+    this._kvCache.replaceAll(points);
+    
+    // ✅ UPDATE KV
+    await this.env.QUESTIONS.put(CONSTANTS.DICE_POINT_KEY, JSON.stringify(points));
     
     this._broadcastToRoom(DICE_ROOM, ["diceWinner", {
       username: winner,
@@ -1046,17 +1367,26 @@ export class GameServer {
       if (guessValue === diceValue && !this.diceHasWinner) {
         this.diceHasWinner = true;
         this.diceWinner = username;
+        
+        // ✅ UPDATE POIN - SYNC CACHE + KV
         const points = await this._getDicePoints();
         points[username] = (points[username] || 0) + 1;
-        await this.diceGameSystem.setPoints(points);
+        
+        // ✅ REPLACE CACHE
+        this._kvCache.replaceAll(points);
+        
+        // ✅ UPDATE KV
+        await this.env.QUESTIONS.put(CONSTANTS.DICE_POINT_KEY, JSON.stringify(points));
       }
     } catch(e) {}
   }
 
+  // ==================== GET DICE POINTS - DARI CACHE ====================
   async _getDicePoints() {
     try {
       if (!this.env?.QUESTIONS) return {};
-      return await this.diceGameSystem.getPoints();
+      // ✅ LANGSUNG DARI CACHE - TANPA KV GET
+      return this._kvCache.getAll();
     } catch(e) { return {}; }
   }
 
@@ -1211,103 +1541,6 @@ export class GameServer {
         }
       }
     } catch(e) {}
-  }
-
-  // ==================== RECORDING ====================
-
-  async _getRecordingStatusFromKV(roomName) {
-    try {
-      if (!roomName) return false;
-      if (this._recordingEnabled.has(roomName)) return this._recordingEnabled.get(roomName);
-      if (this.env?.QUESTIONS) {
-        const kvValue = await this._withTimeout(
-          this.env.QUESTIONS.get(CONSTANTS.LOWCARD_RECORDING_KEY + roomName), 2000
-        );
-        const isRecording = kvValue === 'true';
-        this._recordingEnabled.set(roomName, isRecording);
-        return isRecording;
-      }
-      return false;
-    } catch(e) { return false; }
-  }
-
-  async _startRecordingWinners(roomName) {
-    try {
-      if (!roomName) return false;
-      if (await this._getRecordingStatusFromKV(roomName)) {
-        this._broadcastToRoom(roomName, ["recordingStatus", true]);
-        return true;
-      }
-      this._recordingEnabled.set(roomName, true);
-      if (this.env?.QUESTIONS) {
-        await this._withTimeout(
-          this.env.QUESTIONS.put(CONSTANTS.LOWCARD_RECORDING_KEY + roomName, 'true'), 2000
-        );
-      }
-      this._broadcastToRoom(roomName, ["recordingStatus", true]);
-      return true;
-    } catch(e) { return false; }
-  }
-
-  async _stopRecordingWinners(roomName) {
-    try {
-      if (!roomName) return false;
-      const room = roomName.trim();
-      if (!await this._getRecordingStatusFromKV(room)) {
-        this._broadcastToRoom(room, ["recordingStatus", false]);
-        return true;
-      }
-      this._recordingEnabled.set(room, false);
-      if (this.env?.QUESTIONS) {
-        await this._withTimeout(this.env.QUESTIONS.delete(CONSTANTS.LOWCARD_RECORDING_KEY + room), 2000);
-        await this._withTimeout(this.env.QUESTIONS.delete(CONSTANTS.LOWCARD_WINNER_KEY + room), 2000);
-      }
-      this._broadcastToRoom(room, ["recordingStatus", false]);
-      return true;
-    } catch(e) { return false; }
-  }
-
-  async _getLowCardWinners(room) {
-    try {
-      if (!room || !this.env?.QUESTIONS) return {};
-      if (!await this._getRecordingStatusFromKV(room)) return {};
-      const key = CONSTANTS.LOWCARD_WINNER_KEY + room;
-      const winners = await this._withTimeout(this.env.QUESTIONS.get(key, 'json'), 2000);
-      return winners && typeof winners === 'object' ? winners : {};
-    } catch(e) { return {}; }
-  }
-
-  async _broadcastLowCardWinners(room) {
-    try {
-      if (!room) return;
-      if (!await this._getRecordingStatusFromKV(room)) return;
-      const winners = await this._getLowCardWinners(room);
-      this._broadcastToRoom(room, ["lowCardWinnerUpdate", {
-        winners: winners || {},
-        room: room,
-        recording: true
-      }]);
-    } catch(e) {}
-  }
-
-  async _addLowCardWinner(room, username) {
-    try {
-      if (!room || !username || room === DICE_ROOM) return false;
-      if (!await this._getRecordingStatusFromKV(room)) return false;
-      if (!this.env?.QUESTIONS) return false;
-      
-      const key = CONSTANTS.LOWCARD_WINNER_KEY + room;
-      let roomWinners = await this._withTimeout(this.env.QUESTIONS.get(key, 'json'), 2000) || {};
-      
-      let count = 0;
-      if (roomWinners[username]) {
-        count = parseInt(String(roomWinners[username]).replace("x", "").replace("X", "")) || 0;
-      }
-      roomWinners[username] = (count + 1) + "x";
-      
-      await this._withTimeout(this.env.QUESTIONS.put(key, JSON.stringify(roomWinners)), 2000);
-      return true;
-    } catch(e) { return false; }
   }
 
   // ==================== STUCK GAMES ====================
@@ -1879,11 +2112,12 @@ export class GameServer {
           if (newActive.length === 1 && !game._gameEnded) {
             const winner = newActive[0]?.name || "Unknown";
             const totalCoin = (game.betAmount || 0) * (game.players?.size || 0);
-            if (game._startedByRecording) {
-              await this._addLowCardWinner(room, winner);
-              const winners = await this._getLowCardWinners(room);
-              this._broadcastToRoom(room, ["lowCardWinnerUpdate", { winners, room, recording: true }]);
-            }
+            
+            // ✅ UPDATE WINNER - SYNC CACHE + KV
+            await this.recordingSystem.addWinner(room, winner);
+            const winners = await this.recordingSystem.getWinners(room);
+            this._broadcastToRoom(room, ["lowCardWinnerUpdate", { winners, room, recording: true }]);
+            
             game._gameEnded = true;
             game._isActive = false;
             this._broadcastToRoom(room, ["gameLowCardWinner", winner, totalCoin]);
@@ -2011,11 +2245,12 @@ export class GameServer {
         const winnerId = entries[0][0];
         const winnerName = players.get(winnerId)?.name || winnerId;
         const totalCoin = (game.betAmount || 0) * players.size;
-        if (game._startedByRecording) {
-          await this._addLowCardWinner(room, winnerName);
-          const winners = await this._getLowCardWinners(room);
-          this._broadcastToRoom(room, ["lowCardWinnerUpdate", { winners, room, recording: true }]);
-        }
+        
+        // ✅ UPDATE WINNER - SYNC CACHE + KV
+        await this.recordingSystem.addWinner(room, winnerName);
+        const winners = await this.recordingSystem.getWinners(room);
+        this._broadcastToRoom(room, ["lowCardWinnerUpdate", { winners, room, recording: true }]);
+        
         this._broadcastToRoom(room, ["gameLowCardWinner", winnerName, totalCoin]);
         game._gameEnded = true;
         game._isActive = false;
@@ -2070,11 +2305,12 @@ export class GameServer {
         const winnerId = remaining[0];
         const winnerName = players.get(winnerId)?.name || winnerId;
         const totalCoin = (game.betAmount || 0) * players.size;
-        if (game._startedByRecording) {
-          await this._addLowCardWinner(room, winnerName);
-          const winners = await this._getLowCardWinners(room);
-          this._broadcastToRoom(room, ["lowCardWinnerUpdate", { winners, room, recording: true }]);
-        }
+        
+        // ✅ UPDATE WINNER - SYNC CACHE + KV
+        await this.recordingSystem.addWinner(room, winnerName);
+        const winners = await this.recordingSystem.getWinners(room);
+        this._broadcastToRoom(room, ["lowCardWinnerUpdate", { winners, room, recording: true }]);
+        
         this._broadcastToRoom(room, ["gameLowCardWinner", winnerName, totalCoin]);
         game._gameEnded = true;
         game._isActive = false;
@@ -2141,7 +2377,7 @@ export class GameServer {
         return;
       }
 
-      const isRecordingEnabled = await this._getRecordingStatusFromKV(room);
+      const isRecordingEnabled = await this.recordingSystem.getStatus(room);
       if (isRecordingEnabled) {
         this._safeSend(ws, ["gameLowCardError", "Recording is ACTIVE in this room. Users cannot start games."]);
         return;
@@ -2431,11 +2667,12 @@ export class GameServer {
         }
         const winner = activePlayers[0]?.name || "Unknown";
         const totalCoin = (game.betAmount || 0) * (game.players?.size || 0);
-        if (game._startedByRecording) {
-          await this._addLowCardWinner(room, winner);
-          const winners = await this._getLowCardWinners(room);
-          this._broadcastToRoom(room, ["lowCardWinnerUpdate", { winners, room, recording: true }]);
-        }
+        
+        // ✅ UPDATE WINNER - SYNC CACHE + KV
+        await this.recordingSystem.addWinner(room, winner);
+        const winners = await this.recordingSystem.getWinners(room);
+        this._broadcastToRoom(room, ["lowCardWinnerUpdate", { winners, room, recording: true }]);
+        
         game._gameEnded = true;
         game._isActive = false;
         this._broadcastToRoom(room, ["gameLowCardWinner", winner, totalCoin]);
@@ -2518,7 +2755,8 @@ export class GameServer {
       if (evt === "getDiceLeaderboard") {
         try {
           let limit = data.length > 1 && typeof data[1] === 'number' ? Math.min(data[1], 30) : 10;
-          const points = await this.env.QUESTIONS.get(CONSTANTS.DICE_POINT_KEY, 'json') || {};
+          // ✅ DARI CACHE - TANPA KV GET
+          const points = await this._getDicePoints();
           const sorted = Object.entries(points).sort((a, b) => b[1] - a[1]).slice(0, limit);
           this._safeSend(ws, ["diceLeaderboard", sorted.map(([u, s]) => `${u}|${s}`)]);
         } catch(e) { this._safeSend(ws, ["diceLeaderboard", []]); }
@@ -2542,23 +2780,26 @@ export class GameServer {
       if (evt === "startRecordingWinners") {
         const roomName = data[1];
         if (!roomName) { this._safeSend(ws, ["recordingError", "Room name required"]); return; }
-        const success = await this._startRecordingWinners(roomName);
+        const success = await this.recordingSystem.setStatus(roomName, true);
         this._safeSend(ws, ["startRecordingResult", { success, message: success ? "Recording enabled" : "Failed" }]);
+        if (success) this._broadcastToRoom(roomName, ["recordingStatus", true]);
         return;
       }
 
       if (evt === "stopRecordingWinners") {
         const roomName = data[1];
         if (!roomName) { this._safeSend(ws, ["recordingError", "Room name required"]); return; }
-        const success = await this._stopRecordingWinners(roomName);
+        const success = await this.recordingSystem.setStatus(roomName, false);
         this._safeSend(ws, ["stopRecordingResult", { success, message: success ? "Recording stopped" : "Failed" }]);
+        if (success) this._broadcastToRoom(roomName, ["recordingStatus", false]);
         return;
       }
 
       if (evt === "getRecordingStatus") {
         const roomName = data[1];
         if (!roomName) { this._safeSend(ws, ["recordingError", "Room name required"]); return; }
-        const isRecording = await this._getRecordingStatusFromKV(roomName);
+        // ✅ DARI CACHE
+        const isRecording = await this.recordingSystem.getStatus(roomName);
         this._safeSend(ws, ["recordingStatus", isRecording]);
         return;
       }
@@ -2566,7 +2807,9 @@ export class GameServer {
       if (evt === "sendWinnersToRoom" || evt === "lowCardWinnerUpdate") {
         const room = data[1] || ws.room || ws.roomname || this.clientRooms.get(ws._wsId);
         if (!room) { this._safeSend(ws, ["recordingError", "Room name required"]); return; }
-        await this._broadcastLowCardWinners(room);
+        // ✅ DARI CACHE
+        const winners = await this.recordingSystem.getWinners(room);
+        this._broadcastToRoom(room, ["lowCardWinnerUpdate", { winners, room, recording: true }]);
         this._safeSend(ws, ["sendWinnersResult", { success: true, message: "Winners refreshed" }]);
         return;
       }
@@ -2574,8 +2817,9 @@ export class GameServer {
       if (evt === "getRoomWinners") {
         const room = data[1] || ws.room || ws.roomname || this.clientRooms.get(ws._wsId);
         if (!room) { this._safeSend(ws, ["recordingError", "Room name required"]); return; }
-        const isRecording = await this._getRecordingStatusFromKV(room);
-        const winners = await this._getLowCardWinners(room);
+        // ✅ DARI CACHE
+        const isRecording = await this.recordingSystem.getStatus(room);
+        const winners = await this.recordingSystem.getWinners(room);
         this._broadcastToRoom(room, ["lowCardWinnerUpdate", { winners, room, recording: isRecording }]);
         this._safeSend(ws, ["sendWinnersResult", { success: true, message: "Winners updated" }]);
         return;
@@ -2616,7 +2860,7 @@ export class GameServer {
         return;
       }
 
-      const isRecordingEnabled = await this._getRecordingStatusFromKV(room);
+      const isRecordingEnabled = await this.recordingSystem.getStatus(room);
       if (!isRecordingEnabled) {
         this._safeSend(ws, ["gameLowCardError", "Recording is not enabled in this room"]);
         return;
@@ -2687,7 +2931,8 @@ export class GameServer {
           timestamp: Date.now(),
           currentWITATime: this._getCurrentWITATime().formatted,
           lastResetWeek: this._cachedResetWeek || 'unknown',
-          tieActive: this._tieActive
+          tieActive: this._tieActive,
+          cacheSize: this._kvCache.size
         };
         return new Response(JSON.stringify(status), {
           headers: { 'Content-Type': 'application/json' }

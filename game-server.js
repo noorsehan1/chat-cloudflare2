@@ -1,5 +1,5 @@
 // ==================== GAME-SERVER.JS ====================
-// VERSION: 3.0.0 - SUPER OPTIMIZED FOR CLOUDFLARE DO FREE TIER
+// VERSION: 3.0.1 - FIXED ROOM SWITCH CONNECTION ISSUE
 
 const CONSTANTS = {
   MAX_LOWCARD_GAMES: 5,
@@ -180,7 +180,6 @@ class DiceGameSystem {
 export class GameServer {
   constructor(state, env) {
     try {
-      // ========== MINIMAL SETUP - SUPER CEPAT ==========
       this.state = state;
       this.env = env;
       this.closing = false;
@@ -190,14 +189,12 @@ export class GameServer {
       this._wsIdCounter = 0;
       this._lastActivity = Date.now();
       
-      // ========== CORE MAPS ==========
       this.activeGames = new Map();
       this.wsMap = new Map();
       this.wsClients = new Map();
       this.clientRooms = new Map();
       this.userConnections = new Map();
       
-      // ========== DICE - LAZY ==========
       this.diceGameSystem = null;
       this.currentDiceRoll = null;
       this._diceLock = false;
@@ -225,7 +222,6 @@ export class GameServer {
       this._canSubmitDiceAnswer = false;
       this._diceRound = 0;
       
-      // ========== TIE BREAKER ==========
       this._tieBreakers = new Map();
       this._tieRound = 0;
       this._tiePlayers = [];
@@ -234,7 +230,6 @@ export class GameServer {
       this._tieInterval = null;
       this._tieLock = false;
       
-      // ========== QUEUE - KECIL ==========
       this._eventQueue = [];
       this._isProcessingQueue = false;
       this._allTimers = new Set();
@@ -244,7 +239,6 @@ export class GameServer {
       this._switchLocks = new Map();
       this._switchRetries = new Map();
       
-      // ========== CIRCUIT BREAKER ==========
       this._requestCount = 0;
       this._lastResetTime = Date.now();
       this._circuitOpen = false;
@@ -252,22 +246,18 @@ export class GameServer {
       this._lastErrorReset = Date.now();
       this._tickCount = 0;
       
-      // ========== RECONNECT PROTECTION ==========
       this._reconnectAttempts = new Map();
       this._bannedUsers = new Map();
       
-      // ========== CACHE ==========
       this._cachedResetWeek = null;
       this._cachedLastWeekWinner = null;
       this._recordingEnabled = new Map();
       this._kvCache = new KVCache();
       this.DICE_ROOM = DICE_ROOM;
       
-      // ========== INTERVAL ==========
       this._mainInterval = null;
       this._cleanupInterval = null;
       
-      // TUNDA SEMUA INISIALISASI BERAT - 2 DETIK
       setTimeout(() => {
         if (!this.closing && !this.isDestroyed) {
           this._initLazy();
@@ -279,7 +269,6 @@ export class GameServer {
     }
   }
 
-  // ========== LAZY INIT - DITUNDA ==========
   _initLazy() {
     if (this._initialized || this.closing || this.isDestroyed) return;
     this._initialized = true;
@@ -302,7 +291,6 @@ export class GameServer {
     }
   }
 
-  // ========== MAIN INTERVAL ==========
   _startMainInterval() {
     if (this.closing || this.isDestroyed) return;
     
@@ -328,7 +316,6 @@ export class GameServer {
     this._allTimers.add(this._cleanupInterval);
   }
 
-  // ========== TICK ==========
   _doTick() {
     try {
       const tick = this._tickCount % 3;
@@ -347,7 +334,6 @@ export class GameServer {
     } catch(e) {}
   }
 
-  // ========== CHECK DICE ==========
   _checkDice() {
     try {
       if (this._tieActive || this._isShowingDice || this._diceTimeUpCooldown) return;
@@ -361,7 +347,6 @@ export class GameServer {
     } catch(e) {}
   }
 
-  // ========== IS DICE TIME ==========
   _isDiceTime() {
     try {
       const witaTime = this._getCurrentWITATime();
@@ -384,7 +369,6 @@ export class GameServer {
     } catch(e) { return { hours: 0, minutes: 0, totalMinutes: 0 }; }
   }
 
-  // ========== START DICE ==========
   _startDiceFast() {
     try {
       if (this._diceLock || this.currentDiceRoll || this._isShowingDice) return;
@@ -438,10 +422,8 @@ export class GameServer {
     }
   }
 
-  // ========== END DICE ROUND - DENGAN TIE BREAKER ==========
   async _endDiceRound() {
     try {
-      // Bersihkan timer
       if (this._diceTimerInterval) {
         clearInterval(this._diceTimerInterval);
         this._diceTimerInterval = null;
@@ -454,11 +436,9 @@ export class GameServer {
       this._canSubmitDiceAnswer = false;
       this._isShowingDice = false;
       
-      // CEK SEMUA JAWABAN SETELAH TIMER HABIS
       const diceValue = this.currentDiceRoll?.value;
       const roundNumber = this._diceRound || 1;
       
-      // Kumpulkan semua pemain yang menjawab BENAR
       const correctPlayers = [];
       for (const player of this.diceAnswered) {
         if (this._playerAnswers.get(player) === diceValue) {
@@ -466,17 +446,13 @@ export class GameServer {
         }
       }
       
-      // KASUS 1: TIDAK ADA PEMENANG
       if (correctPlayers.length === 0) {
         this._broadcastToRoom(DICE_ROOM, ["diceNoWinner", {
           message: "No winner",
           value: diceValue,
           round: roundNumber
         }]);
-      }
-      
-      // KASUS 2: 1 PEMENANG
-      else if (correctPlayers.length === 1) {
+      } else if (correctPlayers.length === 1) {
         const winner = correctPlayers[0];
         
         try {
@@ -498,21 +474,15 @@ export class GameServer {
             round: roundNumber
           }]);
         }
-      }
-      
-      // KASUS 3: TIE BREAKER (LEBIH DARI 1 PEMENANG)
-      else if (correctPlayers.length > 1 && !this._tieActive) {
+      } else if (correctPlayers.length > 1 && !this._tieActive) {
         this.currentDiceRoll = null;
         this._diceLock = false;
         this._isShowingDice = false;
-        
-       
         
         await this._startTieBreaker(DICE_ROOM, correctPlayers);
         return;
       }
       
-      // RESET & COOLDOWN
       this.currentDiceRoll = null;
       this._diceLock = false;
       this._diceTimeUpCooldown = true;
@@ -530,8 +500,6 @@ export class GameServer {
     }
   }
 
-  // ========== TIE BREAKER - TANPA DADU BARU ==========
-  
   async _startTieBreaker(room, players) {
     if (this._tieLock) return;
     this._tieLock = true;
@@ -575,8 +543,6 @@ export class GameServer {
     data.status = 'running';
     data.players = players;
     
-    // ❌ TANPA DADU BARU - TIDAK PAKAI currentDiceRoll
-    
     this._diceQuestionStartTime = Date.now();
     this._canSubmitDiceAnswer = true;
     this.diceAnswered = new Set();
@@ -585,7 +551,6 @@ export class GameServer {
     this.diceHasWinner = false;
     this.diceWinner = null;
     
-    // ✅ BROADCAST TANPA DADU - HANYA NOTIFIKASI
     this._broadcastToRoom(DICE_ROOM, ["diceNotification", 
       `♡ Tie Round ${this._tieRound}: ${players.join(', ')}`
     ]);
@@ -654,7 +619,6 @@ export class GameServer {
     const data = this._tieBreakers.get(id);
     if (!data) return;
     
-    // ✅ CARI NILAI TERTINGGI DARI JAWABAN (TANPA DADU)
     let highest = 0, highestPlayers = [];
     for (const player of players) {
       const answer = this._tieAnswers.get(player);
@@ -668,7 +632,6 @@ export class GameServer {
       }
     }
     
-    // TIDAK ADA YANG JAWAB
     if (highestPlayers.length === 0) {
       this._broadcastToRoom(DICE_ROOM, ["diceNotification", "No one answered tie breaker"]);
       this._resetTieBreakerState(id);
@@ -676,7 +639,6 @@ export class GameServer {
       return;
     }
     
-    // ✅ 1 PEMENANG (NILAI TERTINGGI)
     if (highestPlayers.length === 1) {
       const winner = highestPlayers[0];
       
@@ -711,15 +673,12 @@ export class GameServer {
       return;
     }
     
-    // ✅ MASIH TIE (NILAI SAMA) → ROUND LAGI
     if (highestPlayers.length > 1) {
       this._tiePlayers = highestPlayers;
       this._tieAnswers = new Map();
       data.players = highestPlayers;
       data.round = this._tieRound;
       data.status = 'waiting';
-      
-      // TANPA NOTIF "Still tied"
       
       const nextTimer = setTimeout(() => {
         if (this._tieActive && this._tiePlayers.length > 1) {
@@ -810,7 +769,6 @@ export class GameServer {
     return null;
   }
 
-  // ========== SUBMIT DICE ANSWER ==========
   async submitDiceAnswer(ws, username, guess) {
     try {
       if (!ws || !username) return;
@@ -823,9 +781,7 @@ export class GameServer {
         return;
       }
       
-      // ============ TIE BREAKER MODE ============
       if (this._tieActive) {
-        // Hanya pemain yang terlibat tie yang bisa jawab
         if (!this._tiePlayers.includes(username)) {
           this._safeSend(ws, ["diceError", "You are not in tie breaker"]);
           return;
@@ -835,7 +791,6 @@ export class GameServer {
           return;
         }
         
-        // ✅ SIMPAN JAWABAN TIE (TANPA DADU)
         this._tieAnswers.set(username, guessValue);
         this.diceAnswered.add(username);
         
@@ -846,7 +801,6 @@ export class GameServer {
           tieRound: this._tieRound
         }]);
         
-        // Jika semua pemain tie sudah menjawab → proses hasil
         if (this._tieAnswers.size === this._tiePlayers.length) {
           this._canSubmitDiceAnswer = false;
           this._isShowingDice = false;
@@ -873,7 +827,6 @@ export class GameServer {
         return;
       }
       
-      // ============ DICE NORMAL MODE ============
       if (!this.currentDiceRoll) return;
       
       const diceValue = this.currentDiceRoll.value;
@@ -887,7 +840,6 @@ export class GameServer {
         round: this._diceRound || 1
       }]);
       
-      // ✅ CEK APAKAH JAWABAN BENAR (LANGSUNG DETEKSI)
       if (guessValue === diceValue && !this.diceHasWinner) {
         this.diceHasWinner = true;
         this.diceWinner = username;
@@ -896,7 +848,6 @@ export class GameServer {
     } catch(e) {}
   }
 
-  // ========== GET DICE POINTS ==========
   async _getDicePoints() {
     try {
       if (!this.env?.QUESTIONS) return {};
@@ -904,7 +855,6 @@ export class GameServer {
     } catch(e) { return {}; }
   }
 
-  // ========== GET TIME LEFT UNTIL NEXT DICE ==========
   _getTimeLeftUntilNextDice() {
     try {
       const witaTime = this._getCurrentWITATime();
@@ -931,7 +881,6 @@ export class GameServer {
     }
   }
 
-  // ========== LOAD KV DATA ==========
   async _loadKVData() {
     try {
       if (this.closing || this.isDestroyed || !this.env?.QUESTIONS) return;
@@ -957,7 +906,6 @@ export class GameServer {
     return `${year}-W${String(week).padStart(2, '0')}`;
   }
 
-  // ========== CLEANUP ==========
   _cleanupMemory() {
     try {
       if (this.wsMap) {
@@ -1061,7 +1009,6 @@ export class GameServer {
     } catch(e) {}
   }
 
-  // ========== CHECK STUCK GAMES ==========
   _checkStuckGames() {
     try {
       const now = Date.now();
@@ -1079,7 +1026,6 @@ export class GameServer {
     } catch(e) {}
   }
 
-  // ========== TIMER MANAGEMENT ==========
   _trackTimer(timer) {
     if (timer) this._allTimers.add(timer);
     return timer;
@@ -1111,7 +1057,6 @@ export class GameServer {
     promise.catch(() => {});
   }
 
-  // ========== FETCH ==========
   async fetch(req) {
     try {
       if (this._circuitOpen) {
@@ -1176,7 +1121,6 @@ export class GameServer {
         });
       }
       
-      // ========== WEBSOCKET ==========
       if (url.pathname === "/game/ws") {
         const upgrade = req.headers.get("Upgrade");
         if (upgrade !== "websocket") {
@@ -1208,7 +1152,6 @@ export class GameServer {
         server.username = null;
         server._createdAt = Date.now();
         
-        // LANGSUNG ACCEPT - TANPA state.acceptWebSocket()
         try {
           server.accept();
         } catch(e) {
@@ -1253,7 +1196,6 @@ export class GameServer {
     }
   }
 
-  // ========== PROCESS WITH TIMEOUT ==========
   async _processWithTimeout(ws, data, timeoutMs = 500) {
     try {
       const timeoutPromise = new Promise((_, reject) => {
@@ -1270,7 +1212,6 @@ export class GameServer {
     } catch(e) {}
   }
 
-  // ========== HANDLE EVENT ==========
   async handleEvent(ws, data) {
     try {
       if (this.isDestroyed || !ws || !data?.[0]) return;
@@ -1331,7 +1272,6 @@ export class GameServer {
     } catch(e) {}
   }
 
-  // ========== HANDLE EVENT INTERNAL ==========
   async _handleEventInternal(ws, data) {
     try {
       if (this.isDestroyed || !ws || !data || !data[0]) return;
@@ -1456,7 +1396,6 @@ export class GameServer {
     } catch(e) {}
   }
 
-  // ========== RECORDING ==========
   async _getRecordingStatusFromKV(roomName) {
     try {
       if (!roomName) return false;
@@ -1563,7 +1502,6 @@ export class GameServer {
     } catch(e) { return false; }
   }
 
-  // ========== WS HELPERS ==========
   _getWsId(ws) { return ws?._wsId || null; }
 
   _ensureRoomConsistency(ws) {
@@ -1591,6 +1529,7 @@ export class GameServer {
     } catch(e) { return null; }
   }
 
+  // ========== FIXED: ADD CLIENT - PROPER CLEANUP ==========
   _addClient(room, ws, username = null) {
     try {
       if (!ws) return;
@@ -1605,28 +1544,58 @@ export class GameServer {
       }
       
       const wsId = this._getWsId(ws);
-      if (!wsId) { this._safeSend(ws, ["gameLowCardError", "Connection error"]); return; }
-      
-      if (this.clientRooms.has(wsId)) {
-        const oldRoom = this.clientRooms.get(wsId);
-        if (oldRoom && oldRoom !== room) this._removeClientFromRoom(oldRoom, wsId);
+      if (!wsId) {
+        this._safeSend(ws, ["gameLowCardError", "Connection error"]);
+        return;
       }
       
+      // Remove from old room first
+      if (this.clientRooms.has(wsId)) {
+        const oldRoom = this.clientRooms.get(wsId);
+        if (oldRoom && oldRoom !== room) {
+          this._removeClientFromRoom(oldRoom, wsId);
+        }
+        this.clientRooms.delete(wsId);
+      }
+      
+      // If username exists, clean up stale connections
       if (username) {
-        let conn = this.userConnections.get(username);
-        if (conn) { conn.room = room; conn.timestamp = Date.now(); conn.ws = ws; conn.wsId = wsId; }
-        else { this.userConnections.set(username, { wsId, ws, room, timestamp: Date.now() }); }
+        const existingConn = this.userConnections.get(username);
+        if (existingConn) {
+          if (existingConn.wsId !== wsId) {
+            if (existingConn.room) {
+              this._removeClientFromRoom(existingConn.room, existingConn.wsId);
+            }
+            if (this.wsMap.get(existingConn.wsId) === existingConn.ws) {
+              this.wsMap.delete(existingConn.wsId);
+            }
+            this.clientRooms.delete(existingConn.wsId);
+          }
+        }
+        
+        this.userConnections.set(username, { 
+          wsId, 
+          ws, 
+          room, 
+          timestamp: Date.now() 
+        });
+        ws.username = username;
         this._reconnectAttempts.delete(username);
       }
       
+      // Add to new room
       let clients = this.wsClients.get(room);
-      if (!clients) { clients = new Set(); this.wsClients.set(room, clients); }
+      if (!clients) {
+        clients = new Set();
+        this.wsClients.set(room, clients);
+      }
       clients.add(wsId);
       this.clientRooms.set(wsId, room);
       this.wsMap.set(wsId, ws);
+      
       ws.room = room;
       ws.roomname = room;
-      if (username) ws.username = username;
+      
     } catch(e) {}
   }
 
@@ -1666,7 +1635,6 @@ export class GameServer {
     } catch(e) { return false; }
   }
 
-  // ========== BROADCAST ==========
   _broadcastToRoom(room, message) {
     try {
       if (this.closing || this.isDestroyed || !room || !message) return;
@@ -1688,7 +1656,7 @@ export class GameServer {
     } catch(e) {}
   }
 
-  // ========== SWITCH ROOM ==========
+  // ========== FIXED: SWITCH ROOM - PROPER CLEANUP ==========
   async switchRoom(ws, room, username = null) {
     try {
       if (this.isDestroyed) {
@@ -1711,8 +1679,6 @@ export class GameServer {
       if (currentRoom === roomName) {
         this._safeSend(ws, ["switchRoomSuccess", roomName]);
         this._sendGameStateToClient(ws, roomName);
-        
-        // ✅ KIRIM NOTIFIKASI LEFTTIME SAAT SWITCH KE QUIZ
         if (roomName === DICE_ROOM) {
           this._sendDiceNotificationOnSwitch(ws, wsId);
         }
@@ -1737,22 +1703,57 @@ export class GameServer {
       this._switchRetries.set(lockKey, 0);
       
       try {
-        if (currentRoom) this._removeClientFromRoom(currentRoom, wsId);
+        // Remove from old room first
+        if (currentRoom) {
+          this._removeClientFromRoom(currentRoom, wsId);
+          if (this.wsMap.get(wsId) !== ws) {
+            this.wsMap.set(wsId, ws);
+          }
+        }
+        
+        // Update all references before adding to new room
+        if (username) {
+          const oldConn = this.userConnections.get(username);
+          if (oldConn && oldConn.wsId !== wsId) {
+            if (oldConn.room) {
+              this._removeClientFromRoom(oldConn.room, oldConn.wsId);
+            }
+            if (this.wsMap.get(oldConn.wsId) === oldConn.ws) {
+              this.wsMap.delete(oldConn.wsId);
+            }
+            this.clientRooms.delete(oldConn.wsId);
+          }
+          this.userConnections.set(username, { 
+            wsId, 
+            ws, 
+            room: roomName, 
+            timestamp: Date.now() 
+          });
+          ws.username = username;
+        }
+        
+        // Add to new room
         this._addClient(roomName, ws, username);
+        
+        // Ensure ws properties are set
         ws.room = roomName;
         ws.roomname = roomName;
-        if (username) ws.username = username;
         
-        if (username) {
-          let conn = this.userConnections.get(username);
-          if (conn) { conn.room = roomName; conn.wsId = wsId; conn.ws = ws; conn.timestamp = Date.now(); }
-          else { this.userConnections.set(username, { wsId, ws, room: roomName, timestamp: Date.now() }); }
+        // Ensure wsMap has the correct reference
+        this.wsMap.set(wsId, ws);
+        
+        // Ensure wsClients has the correct reference
+        let clients = this.wsClients.get(roomName);
+        if (!clients) {
+          clients = new Set();
+          this.wsClients.set(roomName, clients);
         }
+        clients.add(wsId);
+        this.clientRooms.set(wsId, roomName);
         
         this._safeSend(ws, ["switchRoomSuccess", roomName]);
         this._sendGameStateToClient(ws, roomName);
         
-        // ✅ KIRIM NOTIFIKASI LEFTTIME SAAT SWITCH KE QUIZ
         if (roomName === DICE_ROOM) {
           this._sendDiceNotificationOnSwitch(ws, wsId);
         }
@@ -1767,7 +1768,9 @@ export class GameServer {
           this._switchRetries.delete(lockKey);
         }, 2000);
       }
-    } catch(e) {}
+    } catch(e) {
+      this._safeSend(ws, ["switchRoomError", "Failed to switch room"]);
+    }
   }
 
   _sendGameStateToClient(ws, room) {
@@ -1800,76 +1803,61 @@ export class GameServer {
     } catch(e) {}
   }
 
-  // ========== SEND DICE NOTIFICATION ON SWITCH - HANYA LEFTTIME ==========
-  // ========== SEND DICE NOTIFICATION ON SWITCH - DELAY 5 DETIK SEBELUM KIRIM NOTIF ==========
-_sendDiceNotificationOnSwitch(ws, wsId) {
-  try {
-    if (!ws || ws.readyState !== 1) return;
-    
-    // HAPUS CACHE NOTIFIKASI SEBELUMNYA
-    this._diceTimeLeftNotified?.delete(wsId);
-    this._nextDiceNotified?.delete(wsId);
-    this._diceJoinedNotified?.delete(wsId);
-    
-    // CEK APAKAH DICE SEDANG BERJALAN
-    const isGameActive = this.currentDiceRoll && this._canSubmitDiceAnswer;
-    
-    // ============ KASUS 1: DICE SEDANG BERJALAN ============
-    if (isGameActive) {
-      const elapsed = (Date.now() - this._diceStartTime) / 1000;
-      const totalTime = CONSTANTS.DICE_TOTAL_TIME_MS / 1000;
-      const remaining = Math.max(0, totalTime - elapsed);
-      const remainingInt = Math.floor(remaining);
+  _sendDiceNotificationOnSwitch(ws, wsId) {
+    try {
+      if (!ws || ws.readyState !== 1) return;
       
-      if (remainingInt > 0) {
-        // ✅ KIRIM LANGSUNG (TANPA DELAY) KARENA DICE SEDANG JALAN
-        this._safeSend(ws, ["diceNotification", `${remainingInt}s remaining`]);
-      }
-      return;
-    }
-    
-    // ============ KASUS 2: DICE BELUM DIMULAI / SESSION BELUM JAM ============
-    const timeLeft = this._getTimeLeftUntilNextDice();
-    const isDiceTime = this._isDiceTime();
-    
-    if (!isDiceTime || !this.diceAutoEnabled) {
-      // ✅ DELAY 5 DETIK SEBELUM KIRIM NOTIFIKASI LEFTTIME
-      setTimeout(() => {
-        if (!this.closing && !this.isDestroyed && ws && ws.readyState === 1) {
-          // ✅ KIRIM NOTIFIKASI LEFTTIME SETELAH DELAY 5 DETIK
-          this._safeSend(ws, ["diceNotification", `Next dice game in: ${timeLeft.text}`]);
+      this._diceTimeLeftNotified?.delete(wsId);
+      this._nextDiceNotified?.delete(wsId);
+      this._diceJoinedNotified?.delete(wsId);
+      
+      const isGameActive = this.currentDiceRoll && this._canSubmitDiceAnswer;
+      
+      if (isGameActive) {
+        const elapsed = (Date.now() - this._diceStartTime) / 1000;
+        const totalTime = CONSTANTS.DICE_TOTAL_TIME_MS / 1000;
+        const remaining = Math.max(0, totalTime - elapsed);
+        const remainingInt = Math.floor(remaining);
+        
+        if (remainingInt > 0) {
+          this._safeSend(ws, ["diceNotification", `${remainingInt}s remaining`]);
         }
-      }, 5000);
+        return;
+      }
       
-      // ✅ START DICE SETELAH JAM + 5 DETIK
-      const waitTime = timeLeft.totalMs + 5000;
-      setTimeout(() => {
-        if (!this.closing && !this.isDestroyed && !this.currentDiceRoll && !this._isShowingDice) {
-          if (this._isDiceTime()) {
+      const timeLeft = this._getTimeLeftUntilNextDice();
+      const isDiceTime = this._isDiceTime();
+      
+      if (!isDiceTime || !this.diceAutoEnabled) {
+        setTimeout(() => {
+          if (!this.closing && !this.isDestroyed && ws && ws.readyState === 1) {
+            this._safeSend(ws, ["diceNotification", `Next dice game in: ${timeLeft.text}`]);
+          }
+        }, 5000);
+        
+        const waitTime = timeLeft.totalMs + 5000;
+        setTimeout(() => {
+          if (!this.closing && !this.isDestroyed && !this.currentDiceRoll && !this._isShowingDice) {
+            if (this._isDiceTime()) {
+              this.forceStartDice();
+            }
+          }
+        }, waitTime);
+        
+        return;
+      }
+      
+      if (isDiceTime && !this.currentDiceRoll && this.diceAutoEnabled) {
+        setTimeout(() => {
+          if (!this.closing && !this.isDestroyed && !this.currentDiceRoll && !this._isShowingDice) {
             this.forceStartDice();
           }
-        }
-      }, waitTime);
+        }, 5000);
+      }
       
-      return;
-    }
-    
-    // ============ KASUS 3: DICE AKTIF TAPI BELUM MULAI ============
-    if (isDiceTime && !this.currentDiceRoll && this.diceAutoEnabled) {
-      // ❌ TIDAK ADA NOTIFIKASI
-      
-      // ✅ DELAY 5 DETIK SEBELUM START
-      setTimeout(() => {
-        if (!this.closing && !this.isDestroyed && !this.currentDiceRoll && !this._isShowingDice) {
-          this.forceStartDice();
-        }
-      }, 5000);
-    }
-    
-  } catch(e) {}
-}
+    } catch(e) {}
+  }
 
-  // ========== GET LAST WEEK WINNER ==========
   async _getLastWeekWinnerAndReset() {
     try {
       if (!this.env?.QUESTIONS) return null;
@@ -1961,7 +1949,6 @@ _sendDiceNotificationOnSwitch(ws, wsId) {
     } catch(e) { return 0; }
   }
 
-  // ========== LOW CARD GAME ==========
   _isGameActuallyRunning(game) { return game?._isActive === true && !game?._gameEnded; }
 
   _getActivePlayers(game) {
@@ -2457,7 +2444,6 @@ _sendDiceNotificationOnSwitch(ws, wsId) {
     } catch(e) {}
   }
 
-  // ========== GAME START ==========
   async startGame(ws, bet, username) {
     try {
       if (this.isDestroyed) {
@@ -2868,7 +2854,6 @@ _sendDiceNotificationOnSwitch(ws, wsId) {
     }
   }
 
-  // ========== WEBSOCKET HANDLERS ==========
   webSocketClose(ws) {
     try {
       if (!ws) return;
@@ -2946,7 +2931,6 @@ _sendDiceNotificationOnSwitch(ws, wsId) {
     } catch(e) {}
   }
 
-  // ========== HANDLE ERROR ==========
   _handleError(type, error) {
     try {
       const now = Date.now();
@@ -2963,7 +2947,6 @@ _sendDiceNotificationOnSwitch(ws, wsId) {
     } catch(e) {}
   }
 
-  // ========== DESTROY ==========
   async destroy() {
     try {
       if (this.isDestroyed) return;

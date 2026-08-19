@@ -1,7 +1,7 @@
 // ==================== CHAT-SERVER.JS ====================
 // VERSION: 3.0.0 - OPTIMIZED FOR CLOUDFLARE DO FREE TIER
 
-const C = {
+ const C = {
   MAX_SEATS: 45,
   MAX_GLOBAL_CONNECTIONS: 150,
   MAX_MESSAGE_SIZE: 5000,

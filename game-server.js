@@ -601,16 +601,6 @@ class RealTimeSyncManager {
           this.diceGameSystem.userScores.set(username, score);
         }
       } else {
-        const backup = await this.state.storage.get('dice_points_backup_manual');
-        if (backup && Object.keys(backup).length > 0) {
-          await this.diceGameSystem.pointsCache.setPoints(backup, this.env);
-          this.diceGameSystem.userScores.clear();
-          for (const [username, score] of Object.entries(backup)) {
-            this.diceGameSystem.userScores.set(username, score);
-          }
-          return true;
-        }
-        
         this.diceGameSystem.userScores.clear();
         this.diceGameSystem.pointsCache.pointsCache.delete('points');
         this.diceGameSystem.pointsCache.leaderboardCache.delete('leaderboard');
@@ -619,10 +609,8 @@ class RealTimeSyncManager {
       
       if (points && Object.keys(points).length > 0) {
         await this.env.QUESTIONS.put(CONSTANTS.DICE_POINT_KEY, JSON.stringify(points));
-        await this.state.storage.put('dice_points_backup_manual', points);
       } else {
         await this.env.QUESTIONS.delete(CONSTANTS.DICE_POINT_KEY);
-        await this.state.storage.delete(this.KEYS.DICE_POINTS);
       }
       
       if (points && Object.keys(points).length > 0) {
@@ -715,21 +703,9 @@ class RealTimeSyncManager {
           this.diceGameSystem.userScores.set(username, score);
         }
         await this.state.storage.put(this.KEYS.DICE_POINTS, points);
-        await this.state.storage.put('dice_points_backup_manual', points);
       } else {
-        const backup = await this.state.storage.get('dice_points_backup_manual');
-        if (backup && Object.keys(backup).length > 0) {
-          await this.diceGameSystem.pointsCache.setPoints(backup, this.env);
-          this.diceGameSystem.userScores.clear();
-          for (const [username, score] of Object.entries(backup)) {
-            this.diceGameSystem.userScores.set(username, score);
-          }
-          await this.state.storage.put(this.KEYS.DICE_POINTS, backup);
-          await this.env.QUESTIONS.put(CONSTANTS.DICE_POINT_KEY, JSON.stringify(backup));
-        } else {
-          await this.env.QUESTIONS.delete(CONSTANTS.DICE_POINT_KEY);
-          await this.state.storage.delete(this.KEYS.DICE_POINTS);
-        }
+        await this.env.QUESTIONS.delete(CONSTANTS.DICE_POINT_KEY);
+        await this.state.storage.delete(this.KEYS.DICE_POINTS);
       }
       
       const winner = await this.env.QUESTIONS.get(CONSTANTS.DICE_LAST_WEEK_WINNER, 'json');
@@ -1179,10 +1155,8 @@ export class GameServer {
       // 3C. STORAGE DICE POINTS
       if (points && Object.keys(points).length > 0) {
         await this.ctx.storage.put('dicePointsBackup', points);
-        await this.ctx.storage.put('dice_points_backup_manual', points);
       } else {
         await this.ctx.storage.delete('dicePointsBackup');
-        await this.ctx.storage.delete('dice_points_backup_manual');
       }
       
       // 3D. STORAGE LAST WEEK WINNER

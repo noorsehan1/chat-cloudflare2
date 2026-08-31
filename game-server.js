@@ -507,26 +507,38 @@ class RealTimeSyncManager {
     this._syncLocks.set(lockKey, Date.now());
     
     try {
+      // 1. CACHE
       if (enabled) {
         this.cacheManager.recordingStatus.set(room, true);
       } else {
         this.cacheManager.recordingStatus.delete(room);
+        this.cacheManager.winnersCache.delete(room);
       }
       
-      const kvKey = CONSTANTS.LOWCARD_RECORDING_KEY + room;
+      // 2. KV
+      const kvRecordingKey = CONSTANTS.LOWCARD_RECORDING_KEY + room;
+      const kvWinnerKey = CONSTANTS.LOWCARD_WINNER_KEY + room;
+      
       if (enabled) {
-        await this.env.QUESTIONS.put(kvKey, 'true');
+        await this.env.QUESTIONS.put(kvRecordingKey, 'true');
       } else {
-        await this.env.QUESTIONS.delete(kvKey);
+        await this.env.QUESTIONS.delete(kvRecordingKey);
+        await this.env.QUESTIONS.delete(kvWinnerKey);
       }
       
+      // 3. STORAGE
       const recordingMap = await this.state.storage.get(this.KEYS.RECORDING_STATUS) || {};
+      const winnersMap = await this.state.storage.get(this.KEYS.WINNERS) || {};
+      
       if (enabled) {
         recordingMap[room] = true;
       } else {
         delete recordingMap[room];
+        delete winnersMap[room];
       }
+      
       await this.state.storage.put(this.KEYS.RECORDING_STATUS, recordingMap);
+      await this.state.storage.put(this.KEYS.WINNERS, winnersMap);
       
       return true;
       
@@ -543,12 +555,14 @@ class RealTimeSyncManager {
     this._syncLocks.set(lockKey, Date.now());
     
     try {
+      // 1. CACHE
       if (winners && Object.keys(winners).length > 0) {
         this.cacheManager.winnersCache.set(room, { winners });
       } else {
         this.cacheManager.winnersCache.delete(room);
       }
       
+      // 2. KV
       const kvKey = CONSTANTS.LOWCARD_WINNER_KEY + room;
       if (winners && Object.keys(winners).length > 0) {
         await this.env.QUESTIONS.put(kvKey, JSON.stringify(winners));
@@ -556,6 +570,7 @@ class RealTimeSyncManager {
         await this.env.QUESTIONS.delete(kvKey);
       }
       
+      // 3. STORAGE
       const winnersMap = await this.state.storage.get(this.KEYS.WINNERS) || {};
       if (winners && Object.keys(winners).length > 0) {
         winnersMap[room] = winners;
@@ -1795,9 +1810,8 @@ export class GameServer {
         }
         
         await this.syncManager.syncRecording(roomName, false);
-        this.cacheManager.winnersCache.delete(roomName);
         this._broadcastToRoom(roomName, ["recordingStatus", false]);
-        this._safeSend(ws, ["stopRecordingResult", { success: true, message: "Recording stopped" }]);
+        this._safeSend(ws, ["stopRecordingResult", { success: true, message: "Recording stopped and winners deleted" }]);
         return;
       }
 

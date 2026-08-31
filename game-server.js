@@ -1808,9 +1808,6 @@ export class GameServer {
           return;
         }
         const isRecording = this.cacheManager.getRecordingStatus(roomName);
-        if (!isRecording) {
-          return;
-        }
         this._safeSend(ws, ["recordingStatus", isRecording]);
         return;
       }
@@ -1853,10 +1850,7 @@ export class GameServer {
         }
         const isRecording = this.cacheManager.getRecordingStatus(room);
         const winners = this.cacheManager.getWinners(room);
-        if (!isRecording && (!winners || Object.keys(winners).length === 0)) {
-          return;
-        }
-        this._safeSend(ws, ["roomWinners", { winners, room, recording: isRecording }]);
+        this._safeSend(ws, ["roomWinners", { winners: winners || {}, room, recording: isRecording || false }]);
         return;
       }
 
@@ -1879,13 +1873,13 @@ export class GameServer {
           
           const winner = await this._getDataFrom3Layer('cachedLastWeekWinner');
           
-          if (!winner || !winner.username) {
-            return;
+          if (winner && winner.username) {
+            this._safeSend(ws, ["diceLastWeekWinner", winner.username, winner.score || 0, winner.week || ""]);
+          } else {
+            this._safeSend(ws, ["diceLastWeekWinner", "", 0, ""]);
           }
-          
-          this._safeSend(ws, ["diceLastWeekWinner", winner.username, winner.score || 0, winner.week || ""]);
         } catch(e) {
-          return;
+          this._safeSend(ws, ["diceLastWeekWinner", "", 0, ""]);
         }
         return;
       }
@@ -1905,13 +1899,14 @@ export class GameServer {
           let limit = data.length > 1 && typeof data[1] === 'number' ? Math.min(data[1], 30) : 10;
           const points = await this._getDataFrom3Layer('dicePointsBackup');
           if (!points || Object.keys(points).length === 0) {
+            this._safeSend(ws, ["diceLeaderboard", []]);
             return;
           }
           const sorted = Object.entries(points).sort((a, b) => b[1] - a[1]);
           const leaderboard = sorted.slice(0, limit);
           this._safeSend(ws, ["diceLeaderboard", leaderboard.map(([u, s]) => `${u}|${s}`)]);
         } catch(e) { 
-          return;
+          this._safeSend(ws, ["diceLeaderboard", []]);
         }
         return;
       }
@@ -1920,20 +1915,18 @@ export class GameServer {
         try {
           const points = await this._getDataFrom3Layer('dicePointsBackup');
           if (!points || Object.keys(points).length === 0) {
+            this._safeSend(ws, ["dicePoints", {}]);
             return;
           }
           this._safeSend(ws, ["dicePoints", points]);
         } catch(e) { 
-          return;
+          this._safeSend(ws, ["dicePoints", {}]);
         }
         return;
       }
 
       if (evt === "getDiceStatus") {
         const isActive = !!this.currentDiceRoll && this._canSubmitDiceAnswer;
-        if (!isActive) {
-          return;
-        }
         this._safeSend(ws, ["diceStatus", isActive, this._diceRound || 1]);
         return;
       }
@@ -1943,10 +1936,6 @@ export class GameServer {
           const isDiceTime = this.alarmScheduler.isDiceTime();
           const isActive = this.currentDiceRoll && this._canSubmitDiceAnswer;
           const timeLeft = this._getTimeLeftUntilNextDice();
-          
-          if (!isDiceTime && !isActive) {
-            return;
-          }
           
           let notification = "";
           if (isActive) {
@@ -1962,7 +1951,7 @@ export class GameServer {
           
           this._safeSend(ws, ["diceNotification", notification]);
         } catch(e) {
-          return;
+          this._safeSend(ws, ["diceNotification", "Waiting..."]);
         }
         return;
       }
@@ -3127,19 +3116,18 @@ export class GameServer {
   async checkGameRunning(ws, roomname) {
     try {
       if (this.isDestroyed) {
+        this._safeSend(ws, ["gameStatus", "false"]);
         return;
       }
       let room = roomname || ws.room || ws.roomname || this.clientRooms.get(ws._wsId);
       if (!room) {
+        this._safeSend(ws, ["gameStatus", "false"]);
         return;
       }
       const game = this.activeGames.get(room);
       const isRunning = game?._isActive && !game._gameEnded && game.players?.size > 0;
-      if (!isRunning) {
-        return;
-      }
-      this._safeSend(ws, ["gameStatus", "true"]);
-      this._sendGameStateToClient(ws, room);
+      this._safeSend(ws, ["gameStatus", isRunning ? "true" : "false"]);
+      if (isRunning) this._sendGameStateToClient(ws, room);
     } catch(e) {}
   }
 

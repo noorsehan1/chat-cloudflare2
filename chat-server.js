@@ -1,12 +1,12 @@
 // ==================== CHAT-SERVER.JS ====================
-// VERSION: 3.1.0 - WITH HIBERNATION SUPPORT
+// VERSION: 3.2.0 - FULL HIBERNATION SUPPORT
 
 const C = {
   MAX_SEATS: 45,
   MAX_GLOBAL_CONNECTIONS: 150,
   ALARM_INTERVAL_MS: 900000,    // 15 MENIT
   MAX_NUMBER: 6,
-  STORAGE_VERSION: "3.1.0"
+  STORAGE_VERSION: "3.2.0"
 };
 
 const ROOMS = [
@@ -184,6 +184,7 @@ export class ChatServer {
     this.roomClients = new Map();
     this.rooms = new Map();
     this.wsActiveMulti = new Map();
+    this.onlineUsers = new Set();  // <-- TAMBAHAN
     
     // ========== LOCKS ==========
     this._joinLocks = new Map();
@@ -338,6 +339,9 @@ export class ChatServer {
           this.userConnections.set(username, connections);
         }
         connections.add(ws);
+        
+        // ===== TAMBAHAN: Update onlineUsers =====
+        this.onlineUsers.add(username);
         
         if (roomName) {
           const roomClients = this.roomClients.get(roomName);
@@ -498,6 +502,7 @@ export class ChatServer {
         }
         this.userSeat.delete(username);
         this.userRoom.delete(username);
+        this.onlineUsers.delete(username);  // <-- TAMBAHAN
         this._scheduleSave();
       }
     } catch(e) {}
@@ -654,6 +659,12 @@ export class ChatServer {
         const connections = this.userConnections.get(username);
         if (connections) {
           connections.delete(ws);
+          
+          // ===== TAMBAHAN: Update onlineUsers =====
+          if (connections.size === 0) {
+            this.onlineUsers.delete(username);
+          }
+          
           const seatInfo = this.userSeat.get(username);
           const isMulti = seatInfo?.isMulti === true;
           
@@ -780,6 +791,9 @@ export class ChatServer {
             this.userSeat.set(multiUsername, { room: multiRoomname, seat, isMulti: true });
             this.userRoom.set(multiUsername, multiRoomname);
             
+            // ===== TAMBAHAN: Update onlineUsers =====
+            this.onlineUsers.add(multiUsername);
+            
             let connections = this.userConnections.get(multiUsername);
             if (!connections) connections = new Set();
             if (!connections.has(ws)) connections.add(ws);
@@ -832,12 +846,16 @@ export class ChatServer {
             this.userSeat.delete(targetUsername);
             this.userRoom.delete(targetUsername);
             
+            // ===== TAMBAHAN: Update onlineUsers =====
             const connections = this.userConnections.get(targetUsername);
             if (connections) {
               connections.delete(ws);
               if (connections.size === 0) {
+                this.onlineUsers.delete(targetUsername);
                 this.userConnections.delete(targetUsername);
               }
+            } else {
+              this.onlineUsers.delete(targetUsername);
             }
             
             ws.serializeAttachment({
@@ -965,6 +983,7 @@ export class ChatServer {
                 if (info.seat === removeSeat && info.room === removeRoom) {
                   this.userSeat.delete(username);
                   this.userRoom.delete(username);
+                  this.onlineUsers.delete(username);  // <-- TAMBAHAN
                   break;
                 }
               }
@@ -1046,19 +1065,30 @@ export class ChatServer {
           try {
             const [onlineTarget, onlineCallback] = args;
             let isOnline = false;
-            const seatInfo = this.userSeat.get(onlineTarget);
-            if (seatInfo?.seat) {
-              if (seatInfo.isMulti) {
-                isOnline = true;
-              } else {
-                const connections = this.userConnections.get(onlineTarget);
-                if (connections) {
-                  for (const conn of connections) {
-                    if (conn?.readyState === 1) { isOnline = true; break; }
+            
+            // ===== TAMBAHAN: Cek dari onlineUsers =====
+            if (this.onlineUsers.has(onlineTarget)) {
+              isOnline = true;
+            } else {
+              // Fallback: cek dari userSeat
+              const seatInfo = this.userSeat.get(onlineTarget);
+              if (seatInfo?.seat) {
+                if (seatInfo.isMulti) {
+                  isOnline = true;
+                } else {
+                  const connections = this.userConnections.get(onlineTarget);
+                  if (connections) {
+                    for (const conn of connections) {
+                      if (conn?.readyState === 1) { 
+                        isOnline = true; 
+                        break; 
+                      }
+                    }
                   }
                 }
               }
             }
+            
             this.safeSend(ws, ["userOnlineStatus", onlineTarget, isOnline, onlineCallback || ""]);
           } catch(e) {}
           break;
@@ -1066,21 +1096,8 @@ export class ChatServer {
         
         case "getOnlineUsers": {
           try {
-            const users = [];
-            for (const [username, seatInfo] of this.userSeat) {
-              if (seatInfo?.seat) {
-                if (seatInfo.isMulti) {
-                  users.push(username);
-                } else {
-                  const connections = this.userConnections.get(username);
-                  if (connections) {
-                    for (const conn of connections) {
-                      if (conn?.readyState === 1) { users.push(username); break; }
-                    }
-                  }
-                }
-              }
-            }
+            // ===== TAMBAHAN: Kirim dari onlineUsers =====
+            const users = Array.from(this.onlineUsers);
             this.safeSend(ws, ["allOnlineUsers", users]);
           } catch(e) {}
           break;
@@ -1419,6 +1436,10 @@ export class ChatServer {
     try {
       this.userSeat.set(username, { room: roomName, seat, isMulti: false });
       this.userRoom.set(username, roomName);
+      
+      // ===== TAMBAHAN: Update onlineUsers =====
+      this.onlineUsers.add(username);
+      
       ws.room = roomName;
       ws.roomname = roomName;
       ws.idtarget = username;
@@ -1603,6 +1624,7 @@ export class ChatServer {
     this.wsActiveMulti.clear();
     this.roomClients.clear();
     this.rooms.clear();
+    this.onlineUsers.clear();  // <-- TAMBAHAN
     
     try {
       await this.ctx.storage.deleteAlarm();

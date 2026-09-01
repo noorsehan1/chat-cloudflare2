@@ -1,5 +1,5 @@
 // ==================== CHAT-SERVER-HIBERNATION-NO-PING.JS ====================
-// VERSION: 9.9.2 - FULL INDEX BASED (NO LOOP ALL ROOMS)
+// VERSION: 9.9.3 - FIXED DUPLICATE USER ISSUE (NO LOGS)
 
 const C = {
   MAX_SEATS: 45,
@@ -44,6 +44,7 @@ export class ChatServer {
     this._isNumberUpdating = false;
     this._isRestoring = false;
     this._lastRefreshTime = 0;
+    this._multiJoinLock = false;
     
     this._checkAndResetOnDeploy().then(() => {
       this._restoreAllState().then(() => {});
@@ -65,7 +66,7 @@ export class ChatServer {
   async _checkAndResetOnDeploy() {
     try {
       const storedVersion = await this.ctx.storage.get("deployVersion");
-      const currentVersion = "9.9.2";
+      const currentVersion = "9.9.3";
       
       if (storedVersion !== currentVersion) {
         this._roomsDataCache = {};
@@ -327,11 +328,9 @@ export class ChatServer {
   async _removeUserFromAllRooms(username) {
     if (!username) return false;
     
-    // ✅ AMBIL LANGSUNG DARI INDEX (O(1))
     const userRooms = this._getUserRooms(username);
     
     if (this._isUserMulti(username)) {
-      // ✅ MULTI USER: HAPUS KURSI TAPI TETAP MULTI
       for (const [roomName, seat] of Object.entries(userRooms)) {
         const roomData = this._roomsDataCache[roomName];
         if (roomData && roomData.seats && roomData.seats[seat]) {
@@ -352,7 +351,6 @@ export class ChatServer {
       return true;
     }
     
-    // ✅ USER NORMAL: HAPUS SEMUA
     let removed = false;
     
     for (const [roomName, seat] of Object.entries(userRooms)) {
@@ -382,7 +380,6 @@ export class ChatServer {
   async _isUserInAnyRoom(username) {
     if (!username) return null;
     
-    // ✅ AMBIL LANGSUNG DARI INDEX (O(1))
     const userRooms = this._getUserRooms(username);
     const entries = Object.entries(userRooms);
     
@@ -398,7 +395,6 @@ export class ChatServer {
   async _removeUserFromRoom(username, roomName) {
     if (!username || !roomName) return false;
     
-    // ✅ AMBIL LANGSUNG DARI INDEX (O(1))
     const seat = this._getUserSeat(username, roomName);
     if (!seat) return false;
     
@@ -554,6 +550,95 @@ export class ChatServer {
     }
   }
 
+  // ============ VALIDASI KONSISTENSI DATA ============
+
+  async _validateDataConsistency() {
+    let inconsistencies = 0;
+    let fixed = 0;
+
+    // CEK 1: Semua seat di roomsData harus ada di userIndex
+    for (const [roomName, roomData] of Object.entries(this._roomsDataCache)) {
+      if (!roomData || !roomData.seats) continue;
+      
+      for (const [seatNum, seatData] of Object.entries(roomData.seats)) {
+        if (!seatData || !seatData.namauser) continue;
+        
+        const username = seatData.namauser;
+        const userRooms = this._getUserRooms(username);
+        
+        if (!userRooms[roomName] || userRooms[roomName] !== parseInt(seatNum)) {
+          this._addUserToIndex(username, roomName, parseInt(seatNum));
+          fixed++;
+        }
+      }
+    }
+
+    // CEK 2: Semua user di index harus punya seat yang valid
+    for (const [username, userData] of Object.entries(this._userIndex)) {
+      if (!userData || !userData.rooms) continue;
+      
+      for (const [roomName, seat] of Object.entries(userData.rooms)) {
+        const roomData = this._roomsDataCache[roomName];
+        if (!roomData || !roomData.seats || !roomData.seats[seat]) {
+          this._removeUserFromIndex(username, roomName);
+          fixed++;
+        } else if (roomData.seats[seat].namauser !== username) {
+          roomData.seats[seat].namauser = username;
+          fixed++;
+        }
+      }
+    }
+
+    // CEK 3: Duplikat username di room yang sama
+    for (const [roomName, roomData] of Object.entries(this._roomsDataCache)) {
+      if (!roomData || !roomData.seats) continue;
+      
+      const seenUsers = new Map();
+      const toRemove = [];
+      
+      for (const [seatNum, seatData] of Object.entries(roomData.seats)) {
+        if (seatData && seatData.namauser) {
+          const username = seatData.namauser;
+          if (seenUsers.has(username)) {
+            toRemove.push(parseInt(seatNum));
+            inconsistencies++;
+          } else {
+            seenUsers.set(username, parseInt(seatNum));
+          }
+        }
+      }
+      
+      for (const seatNum of toRemove) {
+        delete roomData.seats[seatNum];
+        if (roomData.points) {
+          delete roomData.points[seatNum];
+        }
+        fixed++;
+        this.broadcast(roomName, ["removeKursi", roomName, seatNum]);
+      }
+    }
+
+    // CEK 4: Cleanup index untuk user yang tidak punya room
+    const usersToRemove = [];
+    for (const [username, data] of Object.entries(this._userIndex)) {
+      if (!data || Object.keys(data.rooms).length === 0) {
+        usersToRemove.push(username);
+      }
+    }
+    
+    for (const username of usersToRemove) {
+      delete this._userIndex[username];
+      this._onlineUsers.delete(username);
+      fixed++;
+    }
+
+    if (fixed > 0) {
+      await this._syncAllData();
+    }
+
+    return { inconsistencies: inconsistencies, fixed: fixed };
+  }
+
   // ============ JOIN HANDLING (INDEX BASED) ============
 
   async _handleJoin(ws, roomName) {
@@ -564,20 +649,48 @@ export class ChatServer {
     const username = ws.username;
     const isMulti = ws._isMulti || this._isUserMulti(username);
     
-    // ✅ AMBIL LANGSUNG DARI INDEX (O(1) - NO LOOP ALL ROOMS)
-    const userRooms = this._getUserRooms(username);
+    const existingSeat = this._getUserSeat(username, roomName);
+    if (existingSeat !== null) {
+      this.safeSend(ws, ["rooMasuk", existingSeat, roomName]);
+      this.safeSend(ws, ["numberKursiSaya", existingSeat]);
+      
+      ws.serializeAttachment({
+        username: username,
+        room: roomName,
+        seat: existingSeat,
+        isMulti: isMulti
+      });
+      
+      ws._cachedRoom = roomName;
+      ws._cachedUsername = username;
+      ws.room = roomName;
+      ws.roomname = roomName;
+      ws._multiSeat = existingSeat;
+      
+      setTimeout(() => {
+        try {
+          if (ws && ws.readyState === 1) {
+            this.sendAllStateTo(ws, roomName, true);
+          }
+        } catch(e) {}
+      }, 1000);
+      
+      return true;
+    }
     
+    const userRooms = this._getUserRooms(username);
     for (const [roomNameLoop, seat] of Object.entries(userRooms)) {
       const roomData = this._roomsDataCache[roomNameLoop];
       if (roomData && roomData.seats && roomData.seats[seat]) {
-        delete roomData.seats[seat];
-        if (roomData.points) {
-          delete roomData.points[seat];
+        if (roomData.seats[seat].namauser === username) {
+          delete roomData.seats[seat];
+          if (roomData.points) {
+            delete roomData.points[seat];
+          }
+          this.broadcast(roomNameLoop, ["removeKursi", roomNameLoop, seat]);
+          await this.updateRoomCount(roomNameLoop);
+          await this._deleteRoomIfEmpty(roomNameLoop);
         }
-        
-        this.broadcast(roomNameLoop, ["removeKursi", roomNameLoop, seat]);
-        await this.updateRoomCount(roomNameLoop);
-        await this._deleteRoomIfEmpty(roomNameLoop);
       }
     }
     
@@ -597,6 +710,16 @@ export class ChatServer {
       await this._syncAllData();
     }
     
+    for (const [existingSeatNum, existingData] of Object.entries(roomData.seats)) {
+      if (existingData && existingData.namauser === username) {
+        delete roomData.seats[existingSeatNum];
+        if (roomData.points) {
+          delete roomData.points[existingSeatNum];
+        }
+        this.broadcast(roomName, ["removeKursi", roomName, parseInt(existingSeatNum)]);
+      }
+    }
+    
     const seatCount = Object.keys(roomData.seats).length;
     if (seatCount >= C.MAX_SEATS) {
       this.safeSend(ws, ["roomFull", roomName]);
@@ -604,10 +727,71 @@ export class ChatServer {
     }
     
     const seat = this._findAvailableSeat(roomData, username);
-    
     if (!seat) {
       this.safeSend(ws, ["roomFull", roomName]);
       return false;
+    }
+    
+    if (roomData.seats[seat] && roomData.seats[seat].namauser) {
+      const newSeat = this._findAvailableSeat(roomData, username);
+      if (!newSeat) {
+        this.safeSend(ws, ["roomFull", roomName]);
+        return false;
+      }
+      const finalSeat = newSeat;
+      
+      roomData.seats[finalSeat] = {
+        noimageUrl: "",
+        namauser: username,
+        color: "",
+        itembawah: 0,
+        itematas: 0,
+        vip: 0,
+        viptanda: 0
+      };
+      
+      this._addUserToIndex(username, roomName, finalSeat);
+      this._setUserMulti(username, isMulti);
+      this._onlineUsers.add(username);
+      
+      await this._syncAllData();
+      
+      ws.serializeAttachment({
+        username: username,
+        room: roomName,
+        seat: finalSeat,
+        isMulti: isMulti
+      });
+      
+      ws._cachedRoom = roomName;
+      ws._cachedUsername = username;
+      ws.username = username;
+      ws.room = roomName;
+      ws.roomname = roomName;
+      ws.idtarget = username;
+      ws._isMulti = isMulti;
+      ws._multiRoom = isMulti ? roomName : null;
+      ws._multiSeat = isMulti ? finalSeat : null;
+      
+      this._refreshRoomClients(true);
+      
+      this.safeSend(ws, ["rooMasuk", finalSeat, roomName]);
+      this.safeSend(ws, ["numberKursiSaya", finalSeat]);
+      this.safeSend(ws, ["muteTypeResponse", roomData.muted || false, roomName]);
+      
+      const count = Object.keys(roomData.seats).length;
+      this.safeSend(ws, ["roomUserCount", roomName, count]);
+      this.broadcast(roomName, ["roomUserCount", roomName, count]);
+      
+      setTimeout(() => {
+        try {
+          if (ws && ws.readyState === 1) {
+            this.sendAllStateTo(ws, roomName, true);
+          }
+        } catch(e) {}
+      }, 1000);
+      
+      return true;
     }
     
     roomData.seats[seat] = {
@@ -679,7 +863,6 @@ export class ChatServer {
         return;
       }
       
-      // ✅ AMBIL LANGSUNG DARI INDEX (O(1) - NO LOOP ALL ROOMS)
       const userRooms = this._getUserRooms(username);
       
       for (const [roomNameLoop, seat] of Object.entries(userRooms)) {
@@ -786,7 +969,6 @@ export class ChatServer {
       const allSeats = roomData.seats || {};
       const allPoints = roomData.points || {};
       
-      // ✅ AMBIL LANGSUNG DARI INDEX (O(1))
       const userRooms = this._getUserRooms(ws.username);
       const selfSeat = userRooms[room] || null;
       
@@ -831,6 +1013,7 @@ export class ChatServer {
     await this._checkMultiUsers();
     await this._cleanupStorage();
     await this._cleanupPhantomUsers();
+    await this._validateDataConsistency();
     
     if (!this.closing && !this.isDestroyed) {
       this.ctx.storage.setAlarm(Date.now() + C.NUMBER_INTERVAL_MS);
@@ -1160,6 +1343,12 @@ export class ChatServer {
           break;
         }
         
+        case "validateData": {
+          const result = await this._validateDataConsistency();
+          this.safeSend(ws, ["validateDataResult", result]);
+          break;
+        }
+        
         case "multiJoin": {
           const multiUsername = args[0];
           const multiRoomname = args[1];
@@ -1174,112 +1363,251 @@ export class ChatServer {
             break;
           }
           
-          // ✅ AMBIL LANGSUNG DARI INDEX (O(1) - NO LOOP ALL ROOMS)
-          const userRooms = this._getUserRooms(multiUsername);
-          for (const [roomNameLoop, seat] of Object.entries(userRooms)) {
-            const roomData = this._roomsDataCache[roomNameLoop];
-            if (roomData && roomData.seats && roomData.seats[seat]) {
-              delete roomData.seats[seat];
-              if (roomData.points) {
-                delete roomData.points[seat];
-              }
-              this.broadcast(roomNameLoop, ["removeKursi", roomNameLoop, seat]);
-              await this.updateRoomCount(roomNameLoop);
-              await this._deleteRoomIfEmpty(roomNameLoop);
+          if (this._multiJoinLock) {
+            this.safeSend(ws, ["multiJoinError", "Proses join sedang berjalan"]);
+            break;
+          }
+          this._multiJoinLock = true;
+          
+          try {
+            const existingSeat = this._getUserSeat(multiUsername, multiRoomname);
+            if (existingSeat !== null) {
+              this.safeSend(ws, ["rooMasukMulti", existingSeat, multiRoomname]);
+              
+              ws.serializeAttachment({
+                username: multiUsername,
+                room: multiRoomname,
+                seat: existingSeat,
+                isMulti: true,
+                multiRoom: multiRoomname,
+                multiSeat: existingSeat
+              });
+              
+              ws._multiSeat = existingSeat;
+              this._multiJoinLock = false;
+              break;
             }
-          }
-          
-          this._removeUserFromAllIndex(multiUsername);
-          
-          let roomData = this._roomsDataCache[multiRoomname];
-          if (!roomData) {
-            roomData = { seats: {}, points: {}, muted: false, number: 1 };
-            this._roomsDataCache[multiRoomname] = roomData;
-            await this._syncAllData();
-          }
-          
-          const seatCount = Object.keys(roomData.seats).length;
-          if (seatCount >= C.MAX_SEATS) {
-            this.safeSend(ws, ["multiJoinError", "Room penuh"]);
-            break;
-          }
-          
-          const seat = this._findAvailableSeat(roomData, multiUsername);
-          
-          if (!seat) {
-            this.safeSend(ws, ["multiJoinError", "Tidak ada kursi tersedia"]);
-            break;
-          }
-          
-          roomData.seats[seat] = {
-            noimageUrl: "",
-            namauser: multiUsername,
-            color: "",
-            itembawah: 0,
-            itematas: 0,
-            vip: 0,
-            viptanda: 0
-          };
-          
-          this._addUserToIndex(multiUsername, multiRoomname, seat);
-          this._setUserMulti(multiUsername, true);
-          this._onlineUsers.add(multiUsername);
-          
-          await this._syncAllData();
-          
-          ws.serializeAttachment({
-            username: multiUsername,
-            room: multiRoomname,
-            seat: seat,
-            isMulti: true,
-            multiRoom: multiRoomname,
-            multiSeat: seat
-          });
-          
-          ws._cachedUsername = multiUsername;
-          ws._cachedRoom = multiRoomname;
-          ws.username = multiUsername;
-          ws.idtarget = multiUsername;
-          ws.room = multiRoomname;
-          ws.roomname = multiRoomname;
-          ws._isMulti = true;
-          ws._multiRoom = multiRoomname;
-          ws._multiSeat = seat;
-          
-          const webSockets = this._getActiveWebSockets();
-          for (const wsKey of webSockets) {
-            if (wsKey === ws) continue;
-            try {
-              const uname = wsKey._cachedUsername || 
-                            wsKey.username || 
-                            wsKey.deserializeAttachment()?.username;
-              if (uname === multiUsername && wsKey.readyState === 1) {
-                wsKey.serializeAttachment({
-                  username: multiUsername,
-                  room: multiRoomname,
-                  seat: seat,
-                  isMulti: true,
-                  multiRoom: multiRoomname,
-                  multiSeat: seat
-                });
-                wsKey._cachedUsername = multiUsername;
-                wsKey._cachedRoom = multiRoomname;
-                wsKey.username = multiUsername;
-                wsKey.idtarget = multiUsername;
-                wsKey.room = multiRoomname;
-                wsKey.roomname = multiRoomname;
-                wsKey._isMulti = true;
-                wsKey._multiRoom = multiRoomname;
-                wsKey._multiSeat = seat;
-                wsKey._closing = false;
+            
+            for (const room of ROOMS) {
+              const roomData = this._roomsDataCache[room];
+              if (!roomData || !roomData.seats) continue;
+              
+              for (const [seatNum, seatData] of Object.entries(roomData.seats)) {
+                if (seatData && seatData.namauser === multiUsername) {
+                  delete roomData.seats[seatNum];
+                  if (roomData.points) {
+                    delete roomData.points[seatNum];
+                  }
+                  this.broadcast(room, ["removeKursi", room, parseInt(seatNum)]);
+                }
               }
-            } catch(e) {}
+            }
+            
+            const userRooms = this._getUserRooms(multiUsername);
+            for (const [roomNameLoop, seat] of Object.entries(userRooms)) {
+              const roomData = this._roomsDataCache[roomNameLoop];
+              if (roomData && roomData.seats && roomData.seats[seat]) {
+                if (roomData.seats[seat].namauser === multiUsername) {
+                  delete roomData.seats[seat];
+                  if (roomData.points) {
+                    delete roomData.points[seat];
+                  }
+                  this.broadcast(roomNameLoop, ["removeKursi", roomNameLoop, seat]);
+                  await this.updateRoomCount(roomNameLoop);
+                  await this._deleteRoomIfEmpty(roomNameLoop);
+                }
+              }
+            }
+            
+            this._removeUserFromAllIndex(multiUsername);
+            
+            let roomData = this._roomsDataCache[multiRoomname];
+            if (!roomData) {
+              roomData = { seats: {}, points: {}, muted: false, number: 1 };
+              this._roomsDataCache[multiRoomname] = roomData;
+              await this._syncAllData();
+            }
+            
+            for (const [existingSeatNum, existingData] of Object.entries(roomData.seats)) {
+              if (existingData && existingData.namauser === multiUsername) {
+                delete roomData.seats[existingSeatNum];
+                if (roomData.points) {
+                  delete roomData.points[existingSeatNum];
+                }
+                this.broadcast(multiRoomname, ["removeKursi", multiRoomname, parseInt(existingSeatNum)]);
+              }
+            }
+            
+            const seatCount = Object.keys(roomData.seats).length;
+            if (seatCount >= C.MAX_SEATS) {
+              this.safeSend(ws, ["multiJoinError", "Room penuh"]);
+              this._multiJoinLock = false;
+              break;
+            }
+            
+            const seat = this._findAvailableSeat(roomData, multiUsername);
+            if (!seat) {
+              this.safeSend(ws, ["multiJoinError", "Tidak ada kursi tersedia"]);
+              this._multiJoinLock = false;
+              break;
+            }
+            
+            if (roomData.seats[seat] && roomData.seats[seat].namauser) {
+              const newSeat = this._findAvailableSeat(roomData, multiUsername);
+              if (!newSeat) {
+                this.safeSend(ws, ["multiJoinError", "Tidak ada kursi tersedia"]);
+                this._multiJoinLock = false;
+                break;
+              }
+              const finalSeat = newSeat;
+              
+              roomData.seats[finalSeat] = {
+                noimageUrl: "",
+                namauser: multiUsername,
+                color: "",
+                itembawah: 0,
+                itematas: 0,
+                vip: 0,
+                viptanda: 0
+              };
+              
+              this._addUserToIndex(multiUsername, multiRoomname, finalSeat);
+              this._setUserMulti(multiUsername, true);
+              this._onlineUsers.add(multiUsername);
+              
+              await this._syncAllData();
+              
+              ws.serializeAttachment({
+                username: multiUsername,
+                room: multiRoomname,
+                seat: finalSeat,
+                isMulti: true,
+                multiRoom: multiRoomname,
+                multiSeat: finalSeat
+              });
+              
+              ws._cachedUsername = multiUsername;
+              ws._cachedRoom = multiRoomname;
+              ws.username = multiUsername;
+              ws.idtarget = multiUsername;
+              ws.room = multiRoomname;
+              ws.roomname = multiRoomname;
+              ws._isMulti = true;
+              ws._multiRoom = multiRoomname;
+              ws._multiSeat = finalSeat;
+              
+              const webSockets = this._getActiveWebSockets();
+              for (const wsKey of webSockets) {
+                if (wsKey === ws) continue;
+                try {
+                  const uname = wsKey._cachedUsername || 
+                                wsKey.username || 
+                                wsKey.deserializeAttachment()?.username;
+                  if (uname === multiUsername && wsKey.readyState === 1) {
+                    wsKey.serializeAttachment({
+                      username: multiUsername,
+                      room: multiRoomname,
+                      seat: finalSeat,
+                      isMulti: true,
+                      multiRoom: multiRoomname,
+                      multiSeat: finalSeat
+                    });
+                    wsKey._cachedUsername = multiUsername;
+                    wsKey._cachedRoom = multiRoomname;
+                    wsKey.username = multiUsername;
+                    wsKey.idtarget = multiUsername;
+                    wsKey.room = multiRoomname;
+                    wsKey.roomname = multiRoomname;
+                    wsKey._isMulti = true;
+                    wsKey._multiRoom = multiRoomname;
+                    wsKey._multiSeat = finalSeat;
+                    wsKey._closing = false;
+                  }
+                } catch(e) {}
+              }
+              
+              this._refreshRoomClients(true);
+              
+              this.safeSend(ws, ["rooMasukMulti", finalSeat, multiRoomname]);
+              this.broadcast(multiRoomname, ["roomUserCount", multiRoomname, Object.keys(roomData.seats).length]);
+              
+              this._multiJoinLock = false;
+              break;
+            }
+            
+            roomData.seats[seat] = {
+              noimageUrl: "",
+              namauser: multiUsername,
+              color: "",
+              itembawah: 0,
+              itematas: 0,
+              vip: 0,
+              viptanda: 0
+            };
+            
+            this._addUserToIndex(multiUsername, multiRoomname, seat);
+            this._setUserMulti(multiUsername, true);
+            this._onlineUsers.add(multiUsername);
+            
+            await this._syncAllData();
+            
+            ws.serializeAttachment({
+              username: multiUsername,
+              room: multiRoomname,
+              seat: seat,
+              isMulti: true,
+              multiRoom: multiRoomname,
+              multiSeat: seat
+            });
+            
+            ws._cachedUsername = multiUsername;
+            ws._cachedRoom = multiRoomname;
+            ws.username = multiUsername;
+            ws.idtarget = multiUsername;
+            ws.room = multiRoomname;
+            ws.roomname = multiRoomname;
+            ws._isMulti = true;
+            ws._multiRoom = multiRoomname;
+            ws._multiSeat = seat;
+            
+            const webSockets = this._getActiveWebSockets();
+            for (const wsKey of webSockets) {
+              if (wsKey === ws) continue;
+              try {
+                const uname = wsKey._cachedUsername || 
+                              wsKey.username || 
+                              wsKey.deserializeAttachment()?.username;
+                if (uname === multiUsername && wsKey.readyState === 1) {
+                  wsKey.serializeAttachment({
+                    username: multiUsername,
+                    room: multiRoomname,
+                    seat: seat,
+                    isMulti: true,
+                    multiRoom: multiRoomname,
+                    multiSeat: seat
+                  });
+                  wsKey._cachedUsername = multiUsername;
+                  wsKey._cachedRoom = multiRoomname;
+                  wsKey.username = multiUsername;
+                  wsKey.idtarget = multiUsername;
+                  wsKey.room = multiRoomname;
+                  wsKey.roomname = multiRoomname;
+                  wsKey._isMulti = true;
+                  wsKey._multiRoom = multiRoomname;
+                  wsKey._multiSeat = seat;
+                  wsKey._closing = false;
+                }
+              } catch(e) {}
+            }
+            
+            this._refreshRoomClients(true);
+            
+            this.safeSend(ws, ["rooMasukMulti", seat, multiRoomname]);
+            this.broadcast(multiRoomname, ["roomUserCount", multiRoomname, Object.keys(roomData.seats).length]);
+            
+          } finally {
+            this._multiJoinLock = false;
           }
-          
-          this._refreshRoomClients(true);
-          
-          this.safeSend(ws, ["rooMasukMulti", seat, multiRoomname]);
-          this.broadcast(multiRoomname, ["roomUserCount", multiRoomname, Object.keys(roomData.seats).length]);
           
           break;
         }
@@ -1292,7 +1620,6 @@ export class ChatServer {
             break;
           }
           
-          // ✅ AMBIL LANGSUNG DARI INDEX (O(1))
           let userSeat = null;
           const userRooms = this._getUserRooms(targetUsername);
           const entries = Object.entries(userRooms);
@@ -1375,7 +1702,6 @@ export class ChatServer {
           }
           
           try {
-            // ✅ AMBIL LANGSUNG DARI INDEX (O(1) - NO LOOP ALL ROOMS)
             const userRooms = this._getUserRooms(targetUsername);
             
             for (const [roomNameLoop, seat] of Object.entries(userRooms)) {
@@ -1457,7 +1783,6 @@ export class ChatServer {
           const [chatRoom, chatNoimg, chatUser, chatMsg, chatColor, chatTextColor] = args;
           if (!chatMsg || !ROOMS_SET.has(chatRoom)) break;
           
-          // ✅ AMBIL LANGSUNG DARI INDEX (O(1))
           const userRooms = this._getUserRooms(chatUser);
           if (!userRooms[chatRoom]) {
             break;
@@ -1498,7 +1823,6 @@ export class ChatServer {
         case "private": {
           const [privTarget, privNoimg, privMsg, privSender] = args;
           if (privTarget && privMsg) {
-            // ✅ AMBIL LANGSUNG DARI INDEX (O(1))
             const userRooms = this._getUserRooms(privTarget);
             if (Object.keys(userRooms).length > 0) {
               const webSockets = this._getActiveWebSockets();
@@ -1521,7 +1845,6 @@ export class ChatServer {
         case "gift": {
           const [giftRoom, giftSender, giftReceiver, giftGiftName] = args;
           if (giftRoom && ROOMS_SET.has(giftRoom)) {
-            // ✅ AMBIL LANGSUNG DARI INDEX (O(1))
             const userRooms = this._getUserRooms(giftReceiver);
             if (!userRooms[giftRoom]) break;
             this._broadcastToRoom(giftRoom, JSON.stringify(["gift", giftRoom, giftSender, giftReceiver, giftGiftName, Date.now()]));
@@ -1532,7 +1855,6 @@ export class ChatServer {
         case "rollangak": {
           const [rollRoom, rollUser, rollAngka] = args;
           if (rollRoom && ROOMS_SET.has(rollRoom)) {
-            // ✅ AMBIL LANGSUNG DARI INDEX (O(1))
             const userRooms = this._getUserRooms(rollUser);
             if (!userRooms[rollRoom]) break;
             this._broadcastToRoom(rollRoom, JSON.stringify(["rollangakBroadcast", rollRoom, rollUser, rollAngka]));
@@ -1568,7 +1890,6 @@ export class ChatServer {
           if (this._isUserMulti(onlineTarget)) {
             isOnline = true;
           } else {
-            // ✅ AMBIL LANGSUNG DARI INDEX (O(1))
             const userRooms = this._getUserRooms(onlineTarget);
             if (Object.keys(userRooms).length > 0) {
               isOnline = true;
@@ -1692,11 +2013,76 @@ export class ChatServer {
       const userCounts = await this.ctx.storage.get("userCounts") || {};
       const onlineUsers = await this.ctx.storage.get("onlineUsers") || [];
       
-      this._roomsDataCache = roomsData;
-      this._userIndex = userIndex;
+      const validatedUserIndex = {};
+      const validatedRoomsData = {};
+      
+      for (const [roomName, roomData] of Object.entries(roomsData)) {
+        if (!roomData || !roomData.seats) continue;
+        
+        validatedRoomsData[roomName] = {
+          seats: {},
+          points: roomData.points || {},
+          muted: roomData.muted || false,
+          number: roomData.number || 1
+        };
+        
+        const seenUsers = new Set();
+        
+        for (const [seatNum, seatData] of Object.entries(roomData.seats)) {
+          if (!seatData || !seatData.namauser) continue;
+          
+          const username = seatData.namauser;
+          const seatNumInt = parseInt(seatNum);
+          
+          if (seenUsers.has(username)) {
+            continue;
+          }
+          
+          if (seatNumInt < 1 || seatNumInt > C.MAX_SEATS) {
+            continue;
+          }
+          
+          validatedRoomsData[roomName].seats[seatNum] = seatData;
+          seenUsers.add(username);
+          
+          if (!validatedUserIndex[username]) {
+            validatedUserIndex[username] = { rooms: {}, isMulti: false };
+          }
+          validatedUserIndex[username].rooms[roomName] = seatNumInt;
+        }
+      }
+      
+      for (const [username, userData] of Object.entries(userIndex)) {
+        if (!userData || !userData.rooms) continue;
+        
+        for (const [roomName, seat] of Object.entries(userData.rooms)) {
+          const roomData = validatedRoomsData[roomName];
+          if (!roomData || !roomData.seats || !roomData.seats[seat]) {
+            delete userData.rooms[roomName];
+          } else if (roomData.seats[seat].namauser !== username) {
+            delete userData.rooms[roomName];
+          }
+        }
+        
+        if (Object.keys(userData.rooms).length === 0) {
+          delete validatedUserIndex[username];
+        } else {
+          if (!validatedUserIndex[username]) {
+            validatedUserIndex[username] = { rooms: {}, isMulti: false };
+          }
+          validatedUserIndex[username].rooms = { ...userData.rooms };
+          validatedUserIndex[username].isMulti = userData.isMulti || false;
+        }
+      }
+      
+      this._roomsDataCache = validatedRoomsData;
+      this._userIndex = validatedUserIndex;
       this.currentNumber = currentNumber;
       this._userCounts = userCounts;
       this._onlineUsers = new Set(onlineUsers);
+      
+      await this._saveToStorage(validatedRoomsData, validatedUserIndex, currentNumber);
+      await this.ctx.storage.put("onlineUsers", Array.from(this._onlineUsers));
       
       const webSockets = this.ctx.getWebSockets();
       
@@ -1704,36 +2090,47 @@ export class ChatServer {
         try {
           const attachment = ws.deserializeAttachment();
           if (attachment && attachment.username) {
-            // ✅ AMBIL LANGSUNG DARI INDEX (O(1))
-            const userRooms = this._getUserRooms(attachment.username);
+            const username = attachment.username;
+            const userRooms = this._getUserRooms(username);
             const entries = Object.entries(userRooms);
             
             if (entries.length > 0) {
               const [roomName, seat] = entries[0];
-              const isMulti = this._isUserMulti(attachment.username);
+              const isMulti = this._isUserMulti(username);
               
-              ws.username = attachment.username;
-              ws.room = roomName;
-              ws.roomname = roomName;
-              ws.idtarget = attachment.username;
-              ws._closing = false;
-              ws._isMulti = isMulti;
-              ws._multiRoom = isMulti ? roomName : null;
-              ws._multiSeat = isMulti ? seat : null;
-              ws._cachedUsername = attachment.username;
-              ws._cachedRoom = roomName;
-              
-              ws.serializeAttachment({
-                username: attachment.username,
-                room: roomName,
-                seat: seat,
-                isMulti: isMulti,
-                multiRoom: isMulti ? roomName : null,
-                multiSeat: isMulti ? seat : null
-              });
-              
-              if (ws.readyState === 1) {
-                this._onlineUsers.add(attachment.username);
+              const roomData = this._roomsDataCache[roomName];
+              if (roomData && roomData.seats && roomData.seats[seat]) {
+                ws.username = username;
+                ws.room = roomName;
+                ws.roomname = roomName;
+                ws.idtarget = username;
+                ws._closing = false;
+                ws._isMulti = isMulti;
+                ws._multiRoom = isMulti ? roomName : null;
+                ws._multiSeat = isMulti ? seat : null;
+                ws._cachedUsername = username;
+                ws._cachedRoom = roomName;
+                
+                ws.serializeAttachment({
+                  username: username,
+                  room: roomName,
+                  seat: seat,
+                  isMulti: isMulti,
+                  multiRoom: isMulti ? roomName : null,
+                  multiSeat: isMulti ? seat : null
+                });
+                
+                if (ws.readyState === 1) {
+                  this._onlineUsers.add(username);
+                }
+              } else {
+                ws.serializeAttachment({ username: username });
+                ws.username = username;
+                ws.room = null;
+                ws.roomname = null;
+                ws._cachedRoom = null;
+                ws._multiRoom = null;
+                ws._multiSeat = null;
               }
             }
           }
@@ -1741,10 +2138,10 @@ export class ChatServer {
       }
       
       await this._cleanupPhantomUsers();
+      await this._validateDataConsistency();
       
       this._refreshRoomClients(true);
       await this._updateUserCounts();
-      
       await this._syncAllData();
       
       if (!this.closing && !this.isDestroyed) {
@@ -1844,6 +2241,18 @@ export class ChatServer {
           success: true,
           cleaned: cleaned,
           message: `${cleaned} phantom users cleaned`
+        }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" }
+        });
+      }
+      
+      if (url.pathname === "/validate" && req.method === "POST") {
+        const result = await this._validateDataConsistency();
+        return new Response(JSON.stringify({
+          success: true,
+          inconsistencies: result.inconsistencies,
+          fixed: result.fixed
         }), {
           status: 200,
           headers: { "Content-Type": "application/json" }

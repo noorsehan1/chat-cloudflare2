@@ -1,5 +1,5 @@
 // ==================== CHAT-SERVER-HIBERNATION-NO-PING.JS ====================
-// VERSION: 9.9.0 - FULL SYNC CACHE & STORAGE
+// VERSION: 9.9.2 - FULL INDEX BASED (NO LOOP ALL ROOMS)
 
 const C = {
   MAX_SEATS: 45,
@@ -65,7 +65,7 @@ export class ChatServer {
   async _checkAndResetOnDeploy() {
     try {
       const storedVersion = await this.ctx.storage.get("deployVersion");
-      const currentVersion = "9.9.0";
+      const currentVersion = "9.9.2";
       
       if (storedVersion !== currentVersion) {
         this._roomsDataCache = {};
@@ -168,6 +168,8 @@ export class ChatServer {
       throw e;
     }
   }
+
+  // ============ USER INDEX OPERATIONS (O(1) - NO LOOP) ============
 
   _addUserToIndex(username, roomName, seat) {
     if (!this._userIndex[username]) {
@@ -320,51 +322,38 @@ export class ChatServer {
            this._userIndex.hasOwnProperty(username);
   }
 
-  async _removeUserCompletely(username) {
-    if (!username) return false;
-    
-    // 1. HAPUS DARI SEMUA ROOM
-    const userRooms = this._getUserRooms(username);
-    
-    for (const [roomName, seat] of Object.entries(userRooms)) {
-      const roomData = this._roomsDataCache[roomName];
-      if (roomData && roomData.seats && roomData.seats[seat]) {
-        delete roomData.seats[seat];
-        if (roomData.points) {
-          delete roomData.points[seat];
-        }
-        this.broadcast(roomName, ["removeKursi", roomName, seat]);
-        await this.updateRoomCount(roomName);
-        await this._deleteRoomIfEmpty(roomName);
-      }
-    }
-    
-    // 2. HAPUS DARI INDEX
-    this._removeUserFromAllIndex(username);
-    
-    // 3. HAPUS DARI ONLINE USERS
-    this._onlineUsers.delete(username);
-    
-    // 4. SYNC KE STORAGE
-    await this._syncAllData();
-    
-    // 5. REFRESH ROOM CLIENTS
-    this._refreshRoomClients(true);
-    
-    return true;
-  }
+  // ============ REMOVE USER (INDEX BASED - NO LOOP ALL ROOMS) ============
 
   async _removeUserFromAllRooms(username) {
     if (!username) return false;
     
+    // ✅ AMBIL LANGSUNG DARI INDEX (O(1))
+    const userRooms = this._getUserRooms(username);
+    
     if (this._isUserMulti(username)) {
+      // ✅ MULTI USER: HAPUS KURSI TAPI TETAP MULTI
+      for (const [roomName, seat] of Object.entries(userRooms)) {
+        const roomData = this._roomsDataCache[roomName];
+        if (roomData && roomData.seats && roomData.seats[seat]) {
+          delete roomData.seats[seat];
+          if (roomData.points) {
+            delete roomData.points[seat];
+          }
+          this.broadcast(roomName, ["removeKursi", roomName, seat]);
+          await this.updateRoomCount(roomName);
+          await this._deleteRoomIfEmpty(roomName);
+        }
+      }
+      
+      this._removeUserFromAllIndex(username);
+      this._setUserMulti(username, true);
       this._onlineUsers.add(username);
-      await this.ctx.storage.put("onlineUsers", Array.from(this._onlineUsers));
-      return false;
+      await this._syncAllData();
+      return true;
     }
     
+    // ✅ USER NORMAL: HAPUS SEMUA
     let removed = false;
-    const userRooms = this._getUserRooms(username);
     
     for (const [roomName, seat] of Object.entries(userRooms)) {
       const roomData = this._roomsDataCache[roomName];
@@ -374,7 +363,6 @@ export class ChatServer {
           delete roomData.points[seat];
         }
         removed = true;
-        
         this.broadcast(roomName, ["removeKursi", roomName, seat]);
         await this.updateRoomCount(roomName);
         await this._deleteRoomIfEmpty(roomName);
@@ -382,11 +370,7 @@ export class ChatServer {
     }
     
     this._removeUserFromAllIndex(username);
-    
-    if (this._onlineUsers.has(username)) {
-      this._onlineUsers.delete(username);
-      removed = true;
-    }
+    this._onlineUsers.delete(username);
     
     if (removed) {
       await this._syncAllData();
@@ -398,6 +382,7 @@ export class ChatServer {
   async _isUserInAnyRoom(username) {
     if (!username) return null;
     
+    // ✅ AMBIL LANGSUNG DARI INDEX (O(1))
     const userRooms = this._getUserRooms(username);
     const entries = Object.entries(userRooms);
     
@@ -413,12 +398,7 @@ export class ChatServer {
   async _removeUserFromRoom(username, roomName) {
     if (!username || !roomName) return false;
     
-    if (this._isUserMulti(username)) {
-      this._onlineUsers.add(username);
-      await this.ctx.storage.put("onlineUsers", Array.from(this._onlineUsers));
-      return false;
-    }
-    
+    // ✅ AMBIL LANGSUNG DARI INDEX (O(1))
     const seat = this._getUserSeat(username, roomName);
     if (!seat) return false;
     
@@ -431,10 +411,14 @@ export class ChatServer {
     }
     
     this._removeUserFromIndex(username, roomName);
-    this._onlineUsers.delete(username);
+    
+    if (this._isUserMulti(username)) {
+      this._onlineUsers.add(username);
+    } else {
+      this._onlineUsers.delete(username);
+    }
     
     await this._syncAllData();
-    
     this.broadcast(roomName, ["removeKursi", roomName, seat]);
     await this.updateRoomCount(roomName);
     await this._deleteRoomIfEmpty(roomName);
@@ -480,7 +464,6 @@ export class ChatServer {
     
     this._removeUserFromAllIndex(username);
     this._onlineUsers.delete(username);
-    
     await this._syncAllData();
   }
 
@@ -571,6 +554,8 @@ export class ChatServer {
     }
   }
 
+  // ============ JOIN HANDLING (INDEX BASED) ============
+
   async _handleJoin(ws, roomName) {
     if (!ws || !ws.username || !roomName || !ROOMS_SET.has(roomName) || this.closing || this.isDestroyed) {
       return false;
@@ -579,7 +564,7 @@ export class ChatServer {
     const username = ws.username;
     const isMulti = ws._isMulti || this._isUserMulti(username);
     
-    // ===== HAPUS USER DARI SEMUA ROOM SEBELUM JOIN =====
+    // ✅ AMBIL LANGSUNG DARI INDEX (O(1) - NO LOOP ALL ROOMS)
     const userRooms = this._getUserRooms(username);
     
     for (const [roomNameLoop, seat] of Object.entries(userRooms)) {
@@ -597,14 +582,14 @@ export class ChatServer {
     }
     
     this._removeUserFromAllIndex(username);
+    this._onlineUsers.delete(username);
     
-    if (this._onlineUsers.has(username)) {
-      this._onlineUsers.delete(username);
+    if (isMulti) {
+      this._setUserMulti(username, true);
     }
     
     await this._syncAllData();
     
-    // ===== JOIN KE ROOM BARU =====
     let roomData = this._roomsDataCache[roomName];
     if (!roomData) {
       roomData = { seats: {}, points: {}, muted: false, number: 1 };
@@ -637,7 +622,6 @@ export class ChatServer {
     
     this._addUserToIndex(username, roomName, seat);
     this._setUserMulti(username, isMulti);
-    
     this._onlineUsers.add(username);
     
     await this._syncAllData();
@@ -680,6 +664,8 @@ export class ChatServer {
     return true;
   }
 
+  // ============ CLEANUP (INDEX BASED) ============
+
   async _cleanupUserOnDisconnect(ws) {
     try {
       const username = ws.username || ws._cachedUsername;
@@ -693,6 +679,7 @@ export class ChatServer {
         return;
       }
       
+      // ✅ AMBIL LANGSUNG DARI INDEX (O(1) - NO LOOP ALL ROOMS)
       const userRooms = this._getUserRooms(username);
       
       for (const [roomNameLoop, seat] of Object.entries(userRooms)) {
@@ -710,13 +697,8 @@ export class ChatServer {
       }
       
       this._removeUserFromAllIndex(username);
-      
-      if (this._onlineUsers.has(username)) {
-        this._onlineUsers.delete(username);
-      }
-      
+      this._onlineUsers.delete(username);
       await this._syncAllData();
-      
       this._refreshRoomClients(true);
       
     } catch(e) {}
@@ -804,6 +786,7 @@ export class ChatServer {
       const allSeats = roomData.seats || {};
       const allPoints = roomData.points || {};
       
+      // ✅ AMBIL LANGSUNG DARI INDEX (O(1))
       const userRooms = this._getUserRooms(ws.username);
       const selfSeat = userRooms[room] || null;
       
@@ -1191,6 +1174,7 @@ export class ChatServer {
             break;
           }
           
+          // ✅ AMBIL LANGSUNG DARI INDEX (O(1) - NO LOOP ALL ROOMS)
           const userRooms = this._getUserRooms(multiUsername);
           for (const [roomNameLoop, seat] of Object.entries(userRooms)) {
             const roomData = this._roomsDataCache[roomNameLoop];
@@ -1239,7 +1223,6 @@ export class ChatServer {
           
           this._addUserToIndex(multiUsername, multiRoomname, seat);
           this._setUserMulti(multiUsername, true);
-          
           this._onlineUsers.add(multiUsername);
           
           await this._syncAllData();
@@ -1309,6 +1292,7 @@ export class ChatServer {
             break;
           }
           
+          // ✅ AMBIL LANGSUNG DARI INDEX (O(1))
           let userSeat = null;
           const userRooms = this._getUserRooms(targetUsername);
           const entries = Object.entries(userRooms);
@@ -1391,6 +1375,7 @@ export class ChatServer {
           }
           
           try {
+            // ✅ AMBIL LANGSUNG DARI INDEX (O(1) - NO LOOP ALL ROOMS)
             const userRooms = this._getUserRooms(targetUsername);
             
             for (const [roomNameLoop, seat] of Object.entries(userRooms)) {
@@ -1408,11 +1393,7 @@ export class ChatServer {
             }
             
             this._removeUserFromAllIndex(targetUsername);
-            
-            if (this._onlineUsers.has(targetUsername)) {
-              this._onlineUsers.delete(targetUsername);
-            }
-            
+            this._onlineUsers.delete(targetUsername);
             await this._syncAllData();
             
             const webSockets = this._getActiveWebSockets();
@@ -1476,6 +1457,7 @@ export class ChatServer {
           const [chatRoom, chatNoimg, chatUser, chatMsg, chatColor, chatTextColor] = args;
           if (!chatMsg || !ROOMS_SET.has(chatRoom)) break;
           
+          // ✅ AMBIL LANGSUNG DARI INDEX (O(1))
           const userRooms = this._getUserRooms(chatUser);
           if (!userRooms[chatRoom]) {
             break;
@@ -1516,6 +1498,7 @@ export class ChatServer {
         case "private": {
           const [privTarget, privNoimg, privMsg, privSender] = args;
           if (privTarget && privMsg) {
+            // ✅ AMBIL LANGSUNG DARI INDEX (O(1))
             const userRooms = this._getUserRooms(privTarget);
             if (Object.keys(userRooms).length > 0) {
               const webSockets = this._getActiveWebSockets();
@@ -1538,6 +1521,7 @@ export class ChatServer {
         case "gift": {
           const [giftRoom, giftSender, giftReceiver, giftGiftName] = args;
           if (giftRoom && ROOMS_SET.has(giftRoom)) {
+            // ✅ AMBIL LANGSUNG DARI INDEX (O(1))
             const userRooms = this._getUserRooms(giftReceiver);
             if (!userRooms[giftRoom]) break;
             this._broadcastToRoom(giftRoom, JSON.stringify(["gift", giftRoom, giftSender, giftReceiver, giftGiftName, Date.now()]));
@@ -1548,6 +1532,7 @@ export class ChatServer {
         case "rollangak": {
           const [rollRoom, rollUser, rollAngka] = args;
           if (rollRoom && ROOMS_SET.has(rollRoom)) {
+            // ✅ AMBIL LANGSUNG DARI INDEX (O(1))
             const userRooms = this._getUserRooms(rollUser);
             if (!userRooms[rollRoom]) break;
             this._broadcastToRoom(rollRoom, JSON.stringify(["rollangakBroadcast", rollRoom, rollUser, rollAngka]));
@@ -1583,6 +1568,7 @@ export class ChatServer {
           if (this._isUserMulti(onlineTarget)) {
             isOnline = true;
           } else {
+            // ✅ AMBIL LANGSUNG DARI INDEX (O(1))
             const userRooms = this._getUserRooms(onlineTarget);
             if (Object.keys(userRooms).length > 0) {
               isOnline = true;
@@ -1718,6 +1704,7 @@ export class ChatServer {
         try {
           const attachment = ws.deserializeAttachment();
           if (attachment && attachment.username) {
+            // ✅ AMBIL LANGSUNG DARI INDEX (O(1))
             const userRooms = this._getUserRooms(attachment.username);
             const entries = Object.entries(userRooms);
             

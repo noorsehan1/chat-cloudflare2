@@ -1,5 +1,5 @@
 // ==================== CHAT-SERVER-HIBERNATION-NO-PING.JS ====================
-// VERSION: 9.9.4 - FIXED EXIT & REJOIN DUPLICATE ISSUE (NO LOGS)
+// VERSION: 9.9.5 - FIXED EXIT & REJOIN DATA CORRUPTION
 
 const C = {
   MAX_SEATS: 45,
@@ -66,7 +66,7 @@ export class ChatServer {
   async _checkAndResetOnDeploy() {
     try {
       const storedVersion = await this.ctx.storage.get("deployVersion");
-      const currentVersion = "9.9.4";
+      const currentVersion = "9.9.5";
       
       if (storedVersion !== currentVersion) {
         this._roomsDataCache = {};
@@ -323,7 +323,7 @@ export class ChatServer {
            this._userIndex.hasOwnProperty(username);
   }
 
-  // ============ REMOVE USER (INDEX BASED - NO LOOP ALL ROOMS) ============
+  // ============ REMOVE USER ============
 
   async _removeUserFromAllRooms(username) {
     if (!username) return false;
@@ -388,17 +388,21 @@ export class ChatServer {
     const roomData = this._roomsDataCache[roomName];
     if (!roomData || !roomData.seats || !roomData.seats[seat]) return false;
     
+    // HAPUS DARI SEATS
     delete roomData.seats[seat];
     if (roomData.points) {
       delete roomData.points[seat];
     }
     
+    // HAPUS DARI INDEX
     this._removeUserFromIndex(username, roomName);
     
+    // HAPUS DARI ONLINE USERS
     if (!this._isUserMulti(username)) {
       this._onlineUsers.delete(username);
     }
     
+    // BROADCAST
     this.broadcast(roomName, ["removeKursi", roomName, seat]);
     await this.updateRoomCount(roomName);
     await this._deleteRoomIfEmpty(roomName);
@@ -665,7 +669,7 @@ export class ChatServer {
     return { inconsistencies: inconsistencies, fixed: fixed };
   }
 
-  // ============ JOIN HANDLING ============
+  // ============ JOIN HANDLING - FIXED ============
 
   async _handleJoin(ws, roomName) {
     if (!ws || !ws.username || !roomName || !ROOMS_SET.has(roomName) || this.closing || this.isDestroyed) {
@@ -678,6 +682,17 @@ export class ChatServer {
     // STEP 1: CEK APAKAH USER SUDAH PUNYA KURSI DI ROOM INI
     const existingSeat = this._getUserSeat(username, roomName);
     if (existingSeat !== null) {
+      // ✅ VERIFIKASI - PASTIKAN DATA DI KURSI SESUAI
+      const roomData = this._roomsDataCache[roomName];
+      if (roomData && roomData.seats && roomData.seats[existingSeat]) {
+        const seatData = roomData.seats[existingSeat];
+        if (seatData.namauser !== username) {
+          // DATA CORRUPT! PERBAIKI
+          seatData.namauser = username;
+          await this._syncAllData();
+        }
+      }
+      
       this.safeSend(ws, ["rooMasuk", existingSeat, roomName]);
       this.safeSend(ws, ["numberKursiSaya", existingSeat]);
       
@@ -780,10 +795,10 @@ export class ChatServer {
       seat = newSeat;
     }
     
-    // STEP 9: ASSIGN KURSI
+    // STEP 9: ASSIGN KURSI DENGAN USERNAME YANG BENAR
     roomData.seats[seat] = {
       noimageUrl: "",
-      namauser: username,
+      namauser: username,  // ← PASTIKAN USERNAME YANG BENAR
       color: "",
       itembawah: 0,
       itematas: 0,
@@ -797,6 +812,7 @@ export class ChatServer {
     
     await this._syncAllData();
     
+    // STEP 10: UPDATE WEBSOCKET ATTACHMENT
     ws.serializeAttachment({
       username: username,
       room: roomName,
@@ -823,6 +839,9 @@ export class ChatServer {
     const count = Object.keys(roomData.seats).length;
     this.safeSend(ws, ["roomUserCount", roomName, count]);
     this.broadcast(roomName, ["roomUserCount", roomName, count]);
+    
+    // BROADCAST UPDATE KURSI KE SEMUA USER DI ROOM
+    this.broadcast(roomName, ["kursiBatchUpdate", roomName, [[seat, roomData.seats[seat]]]]);
     
     setTimeout(() => {
       try {
@@ -855,19 +874,38 @@ export class ChatServer {
       for (const [roomNameLoop, seat] of Object.entries(userRooms)) {
         const roomData = this._roomsDataCache[roomNameLoop];
         if (roomData && roomData.seats && roomData.seats[seat]) {
-          delete roomData.seats[seat];
-          if (roomData.points) {
-            delete roomData.points[seat];
+          // ✅ PASTIKAN USERNAME DI KURSI SESUAI
+          if (roomData.seats[seat].namauser === username) {
+            delete roomData.seats[seat];
+            if (roomData.points) {
+              delete roomData.points[seat];
+            }
+            
+            this.broadcast(roomNameLoop, ["removeKursi", roomNameLoop, seat]);
+            await this.updateRoomCount(roomNameLoop);
+            await this._deleteRoomIfEmpty(roomNameLoop);
           }
-          
-          this.broadcast(roomNameLoop, ["removeKursi", roomNameLoop, seat]);
-          await this.updateRoomCount(roomNameLoop);
-          await this._deleteRoomIfEmpty(roomNameLoop);
         }
       }
       
+      // ✅ BERSIHKAN INDEX
       this._removeUserFromAllIndex(username);
       this._onlineUsers.delete(username);
+      
+      // ✅ BERSIHKAN WEBSOCKET STATE
+      ws._cachedRoom = null;
+      ws._cachedUsername = null;
+      ws.room = null;
+      ws.roomname = null;
+      ws._multiRoom = null;
+      ws._multiSeat = null;
+      ws._isMulti = false;
+      
+      ws.serializeAttachment({ 
+        username: username,
+        isMulti: false
+      });
+      
       await this._syncAllData();
       this._refreshRoomClients(true);
       
@@ -1247,10 +1285,12 @@ export class ChatServer {
     
     if (ws.readyState !== 1) return;
     
+    // ✅ BERSIHKAN SEBELUM SET ID
     if (!this._isUserMulti(username)) {
       await this._removeUserFromAllRooms(username);
     }
     
+    // ✅ RESET WEBSOCKET STATE
     ws.username = username;
     ws.idtarget = username;
     ws.room = null;
@@ -1705,12 +1745,15 @@ export class ChatServer {
           }
           
           if (username) {
+            // ✅ HAPUS USER DARI ROOM
             await this._cleanUserFromRoom(username, removeRoom);
             
+            // ✅ JIKA BUKAN MULTI, HAPUS DARI SEMUA ROOM
             if (!this._isUserMulti(username)) {
               await this._removeUserFromAllRooms(username);
             }
             
+            // ✅ RESET WEBSOCKET STATE
             const webSockets = this._getActiveWebSockets();
             for (const wsKey of webSockets) {
               try {
@@ -1720,10 +1763,12 @@ export class ChatServer {
                 if (uname === username && wsKey.readyState === 1) {
                   if (!this._isUserMulti(username)) {
                     wsKey._cachedRoom = null;
+                    wsKey._cachedUsername = null;
                     wsKey.room = null;
                     wsKey.roomname = null;
                     wsKey._multiRoom = null;
                     wsKey._multiSeat = null;
+                    wsKey._isMulti = false;
                     wsKey.serializeAttachment({ 
                       username: username,
                       isMulti: false
@@ -1735,6 +1780,7 @@ export class ChatServer {
             
             this.safeSend(ws, ["removeKursiAndPointSuccess", removeRoom, removeSeat, username]);
           } else {
+            // HAPUS SEAT KOSONG
             if (roomData && roomData.seats && roomData.seats[removeSeat]) {
               delete roomData.seats[removeSeat];
               if (roomData.points) {
@@ -2079,6 +2125,11 @@ export class ChatServer {
               
               const roomData = this._roomsDataCache[roomName];
               if (roomData && roomData.seats && roomData.seats[seat]) {
+                // ✅ VERIFIKASI DATA DI KURSI
+                if (roomData.seats[seat].namauser !== username) {
+                  roomData.seats[seat].namauser = username;
+                }
+                
                 ws.username = username;
                 ws.room = roomName;
                 ws.roomname = roomName;

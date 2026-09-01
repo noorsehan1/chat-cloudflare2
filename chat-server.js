@@ -1,5 +1,5 @@
 // ==================== CHAT-SERVER-HIBERNATION-NO-PING.JS ====================
-// VERSION: 10.0.1 - FIX ROOM SWITCH
+// VERSION: 10.0.2 - FIX MULTI USER ROOM SWITCH
 
 const C = {
   MAX_SEATS: 45,
@@ -44,7 +44,7 @@ export class ChatServer {
       this._userCounts[room] = 0;
     }
     
-    // ========== MAP-BASED TRACKING (NO _userIndex) ==========
+    // ========== MAP-BASED TRACKING ==========
     this.userRooms = new Map();
     this.userSeats = new Map();
     this.multiUsers = new Map();
@@ -552,7 +552,7 @@ export class ChatServer {
   async _checkAndResetOnDeploy() {
     try {
       const storedVersion = await this.ctx.storage.get("deployVersion");
-      const currentVersion = "10.0.1";
+      const currentVersion = "10.0.2";
       
       if (storedVersion !== currentVersion) {
         this._roomsDataCache = {};
@@ -667,7 +667,228 @@ export class ChatServer {
     }
   }
 
-  // ============ JOIN HANDLING - FIXED ============
+  // ============ MULTI JOIN - FIXED ============
+
+  async _handleMultiJoin(ws, multiUsername, multiRoomname) {
+    if (!multiUsername || !multiRoomname) {
+      this.safeSend(ws, ["multiJoinError", "Username dan room harus diisi"]);
+      return;
+    }
+    
+    if (!ROOMS_SET.has(multiRoomname)) {
+      this.safeSend(ws, ["multiJoinError", "Room tidak valid"]);
+      return;
+    }
+    
+    if (this._multiJoinLock) {
+      this.safeSend(ws, ["multiJoinError", "Proses join sedang berjalan"]);
+      return;
+    }
+    this._multiJoinLock = true;
+    
+    try {
+      // ===== RESTORE FRESH DATA =====
+      await this._ensureDataFresh();
+      
+      // ===== STEP 1: CEK APAKAH USER SUDAH PUNYA KURSI DI ROOM INI =====
+      const existingSeat = this._getUserSeat(multiUsername, multiRoomname);
+      if (existingSeat !== null) {
+        this.safeSend(ws, ["rooMasukMulti", existingSeat, multiRoomname]);
+        
+        ws.serializeAttachment({
+          username: multiUsername,
+          room: multiRoomname,
+          seat: existingSeat,
+          isMulti: true,
+          multiRoom: multiRoomname,
+          multiSeat: existingSeat
+        });
+        
+        ws._multiSeat = existingSeat;
+        
+        this._updateUserConnection(multiUsername, ws);
+        this.userSeats.set(multiUsername, { room: multiRoomname, seat: existingSeat });
+        this.wsActiveMulti.set(ws, { username: multiUsername, room: multiRoomname });
+        this._setUserMulti(multiUsername, true);
+        
+        const roomClients = this.roomClients.get(multiRoomname);
+        if (roomClients && !roomClients.has(ws)) roomClients.add(ws);
+        
+        this._multiJoinLock = false;
+        return;
+      }
+      
+      // ===== STEP 2: HAPUS USER DARI SEMUA ROOM LAIN =====
+      // Cari semua room tempat user berada
+      const userRooms = this._getUserRooms(multiUsername);
+      
+      for (const [roomName, seat] of Object.entries(userRooms)) {
+        // Skip jika room sama dengan tujuan
+        if (roomName === multiRoomname) continue;
+        
+        const roomData = this._roomsDataCache[roomName];
+        if (roomData && roomData.seats && roomData.seats[seat]) {
+          if (roomData.seats[seat].namauser === multiUsername) {
+            // HAPUS KURSI DARI ROOM LAMA
+            delete roomData.seats[seat];
+            if (roomData.points) {
+              delete roomData.points[seat];
+            }
+            this.broadcast(roomName, ["removeKursi", roomName, seat]);
+            await this.updateRoomCount(roomName);
+            await this._deleteRoomIfEmpty(roomName);
+          }
+        }
+      }
+      
+      // ===== STEP 3: BERSIHKAN DARI userRooms =====
+      // Hapus semua room dari userRooms (kecuali yang akan di-join)
+      if (this.userRooms.has(multiUsername)) {
+        this.userRooms.delete(multiUsername);
+      }
+      this.userSeats.delete(multiUsername);
+      
+      // ===== STEP 4: PREPARE ROOM DATA TUJUAN =====
+      let roomData = this._roomsDataCache[multiRoomname];
+      if (!roomData) {
+        roomData = { seats: {}, points: {}, muted: false, number: 1 };
+        this._roomsDataCache[multiRoomname] = roomData;
+        await this._syncAllData();
+      }
+      
+      // ===== STEP 5: HAPUS DUPLIKAT DI ROOM TUJUAN =====
+      const seatsToRemove = [];
+      for (const [existingSeatNum, existingData] of Object.entries(roomData.seats)) {
+        if (existingData && existingData.namauser === multiUsername) {
+          seatsToRemove.push(parseInt(existingSeatNum));
+        }
+      }
+      
+      for (const seatNum of seatsToRemove) {
+        delete roomData.seats[seatNum];
+        if (roomData.points) {
+          delete roomData.points[seatNum];
+        }
+        this.broadcast(multiRoomname, ["removeKursi", multiRoomname, seatNum]);
+      }
+      
+      // ===== STEP 6: CEK KAPASITAS =====
+      const seatCount = Object.keys(roomData.seats).length;
+      if (seatCount >= C.MAX_SEATS) {
+        this.safeSend(ws, ["multiJoinError", "Room penuh"]);
+        this._multiJoinLock = false;
+        return;
+      }
+      
+      // ===== STEP 7: CARI KURSI =====
+      let seat = this._findAvailableSeat(roomData, multiUsername);
+      if (!seat) {
+        this.safeSend(ws, ["multiJoinError", "Tidak ada kursi tersedia"]);
+        this._multiJoinLock = false;
+        return;
+      }
+      
+      if (roomData.seats[seat] && roomData.seats[seat].namauser) {
+        const newSeat = this._findAvailableSeat(roomData, multiUsername);
+        if (!newSeat) {
+          this.safeSend(ws, ["multiJoinError", "Tidak ada kursi tersedia"]);
+          this._multiJoinLock = false;
+          return;
+        }
+        seat = newSeat;
+      }
+      
+      // ===== STEP 8: ASSIGN KURSI =====
+      roomData.seats[seat] = {
+        noimageUrl: "",
+        namauser: multiUsername,
+        color: "",
+        itembawah: 0,
+        itematas: 0,
+        vip: 0,
+        viptanda: 0
+      };
+      
+      // ===== STEP 9: UPDATE MAPS =====
+      this._addUserToRoom(multiUsername, multiRoomname, seat);
+      this._setUserMulti(multiUsername, true);
+      this.onlineUsers.add(multiUsername);
+      
+      await this._syncAllData();
+      
+      // ===== STEP 10: UPDATE WEBSOCKET =====
+      ws.serializeAttachment({
+        username: multiUsername,
+        room: multiRoomname,
+        seat: seat,
+        isMulti: true,
+        multiRoom: multiRoomname,
+        multiSeat: seat
+      });
+      
+      ws._cachedUsername = multiUsername;
+      ws._cachedRoom = multiRoomname;
+      ws.username = multiUsername;
+      ws.idtarget = multiUsername;
+      ws.room = multiRoomname;
+      ws.roomname = multiRoomname;
+      ws._isMulti = true;
+      ws._multiRoom = multiRoomname;
+      ws._multiSeat = seat;
+      
+      this._updateUserConnection(multiUsername, ws);
+      this.userSeats.set(multiUsername, { room: multiRoomname, seat: seat });
+      this.wsActiveMulti.set(ws, { username: multiUsername, room: multiRoomname });
+      
+      // ===== STEP 11: UPDATE WEBSOCKET LAIN DENGAN USERNAME SAMA =====
+      const webSockets = this._getActiveWebSockets();
+      for (const wsKey of webSockets) {
+        if (wsKey === ws) continue;
+        try {
+          const uname = wsKey._cachedUsername || 
+                        wsKey.username || 
+                        wsKey.deserializeAttachment()?.username;
+          if (uname === multiUsername && wsKey.readyState === 1) {
+            wsKey.serializeAttachment({
+              username: multiUsername,
+              room: multiRoomname,
+              seat: seat,
+              isMulti: true,
+              multiRoom: multiRoomname,
+              multiSeat: seat
+            });
+            wsKey._cachedUsername = multiUsername;
+            wsKey._cachedRoom = multiRoomname;
+            wsKey.username = multiUsername;
+            wsKey.idtarget = multiUsername;
+            wsKey.room = multiRoomname;
+            wsKey.roomname = multiRoomname;
+            wsKey._isMulti = true;
+            wsKey._multiRoom = multiRoomname;
+            wsKey._multiSeat = seat;
+            wsKey._closing = false;
+            
+            this._updateUserConnection(multiUsername, wsKey);
+          }
+        } catch(e) {}
+      }
+      
+      // ===== STEP 12: UPDATE ROOM CLIENTS =====
+      const roomClients = this.roomClients.get(multiRoomname);
+      if (roomClients && !roomClients.has(ws)) roomClients.add(ws);
+      
+      this._refreshRoomClients(true);
+      
+      // ===== STEP 13: SEND RESPONSE =====
+      this.safeSend(ws, ["rooMasukMulti", seat, multiRoomname]);
+      this.broadcast(multiRoomname, ["roomUserCount", multiRoomname, Object.keys(roomData.seats).length]);
+      
+    } finally {
+      this._multiJoinLock = false;
+    }
+  }
+
+  // ============ JOIN HANDLING ============
 
   async _handleJoin(ws, roomName) {
     if (!ws || !ws.username || !roomName || !ROOMS_SET.has(roomName) || this.closing || this.isDestroyed) {
@@ -686,7 +907,7 @@ export class ChatServer {
     this._joinLocks.set(lockKey, Date.now());
     
     try {
-      // ===== FIX: RESTORE FRESH DATA SEBELUM PROSES =====
+      // ===== RESTORE FRESH DATA =====
       await this._ensureDataFresh();
       
       // ===== STEP 1: CEK APAKAH USER SUDAH PUNYA KURSI DI ROOM INI =====
@@ -704,7 +925,6 @@ export class ChatServer {
         this.safeSend(ws, ["rooMasuk", existingSeat, roomName]);
         this.safeSend(ws, ["numberKursiSaya", existingSeat]);
         
-        // ===== UPDATE ATTACHMENT =====
         ws.serializeAttachment({
           username: username,
           room: roomName,
@@ -736,7 +956,6 @@ export class ChatServer {
       }
       
       // ===== STEP 2: BERSIHKAN USER DARI SEMUA ROOM LAIN =====
-      // IMPORTANT: Hapus dari room lain TERLEBIH DAHULU
       const userRooms = this._getUserRooms(username);
       for (const [roomNameLoop, seat] of Object.entries(userRooms)) {
         const roomData = this._roomsDataCache[roomNameLoop];
@@ -825,7 +1044,8 @@ export class ChatServer {
       this._setUserMulti(username, isMulti);
       this.onlineUsers.add(username);
       
-      // ===== STEP 9: UPDATE ATTACHMENT DAN SYNC =====
+      await this._syncAllData();
+      
       ws.serializeAttachment({
         username: username,
         room: roomName,
@@ -851,9 +1071,6 @@ export class ChatServer {
       
       this._refreshRoomClients(true);
       
-      await this._syncAllData();
-      
-      // ===== STEP 10: SEND RESPONSE =====
       this.safeSend(ws, ["rooMasuk", seat, roomName]);
       this.safeSend(ws, ["numberKursiSaya", seat]);
       this.safeSend(ws, ["muteTypeResponse", roomData.muted || false, roomName]);
@@ -957,208 +1174,6 @@ export class ChatServer {
       this._refreshRoomClients(true);
       
     } catch(e) {}
-  }
-
-  // ============ MULTI JOIN ============
-
-  async _handleMultiJoin(ws, multiUsername, multiRoomname) {
-    if (!multiUsername || !multiRoomname) {
-      this.safeSend(ws, ["multiJoinError", "Username dan room harus diisi"]);
-      return;
-    }
-    
-    if (!ROOMS_SET.has(multiRoomname)) {
-      this.safeSend(ws, ["multiJoinError", "Room tidak valid"]);
-      return;
-    }
-    
-    if (this._multiJoinLock) {
-      this.safeSend(ws, ["multiJoinError", "Proses join sedang berjalan"]);
-      return;
-    }
-    this._multiJoinLock = true;
-    
-    try {
-      // ===== FIX: RESTORE FRESH DATA SEBELUM PROSES =====
-      await this._ensureDataFresh();
-      
-      const existingSeat = this._getUserSeat(multiUsername, multiRoomname);
-      if (existingSeat !== null) {
-        this.safeSend(ws, ["rooMasukMulti", existingSeat, multiRoomname]);
-        
-        ws.serializeAttachment({
-          username: multiUsername,
-          room: multiRoomname,
-          seat: existingSeat,
-          isMulti: true,
-          multiRoom: multiRoomname,
-          multiSeat: existingSeat
-        });
-        
-        ws._multiSeat = existingSeat;
-        
-        this._updateUserConnection(multiUsername, ws);
-        this.userSeats.set(multiUsername, { room: multiRoomname, seat: existingSeat });
-        this.wsActiveMulti.set(ws, { username: multiUsername, room: multiRoomname });
-        this._setUserMulti(multiUsername, true);
-        
-        const roomClients = this.roomClients.get(multiRoomname);
-        if (roomClients && !roomClients.has(ws)) roomClients.add(ws);
-        
-        this._multiJoinLock = false;
-        return;
-      }
-      
-      for (const room of ROOMS) {
-        const roomData = this._roomsDataCache[room];
-        if (!roomData || !roomData.seats) continue;
-        
-        const seatsToRemove = [];
-        for (const [seatNum, seatData] of Object.entries(roomData.seats)) {
-          if (seatData && seatData.namauser === multiUsername) {
-            seatsToRemove.push(parseInt(seatNum));
-          }
-        }
-        
-        for (const seatNum of seatsToRemove) {
-          delete roomData.seats[seatNum];
-          if (roomData.points) {
-            delete roomData.points[seatNum];
-          }
-          this.broadcast(room, ["removeKursi", room, seatNum]);
-        }
-      }
-      
-      this._removeUserFromAllRooms(multiUsername);
-      
-      let roomData = this._roomsDataCache[multiRoomname];
-      if (!roomData) {
-        roomData = { seats: {}, points: {}, muted: false, number: 1 };
-        this._roomsDataCache[multiRoomname] = roomData;
-        await this._syncAllData();
-      }
-      
-      const seatsToRemove2 = [];
-      for (const [existingSeatNum, existingData] of Object.entries(roomData.seats)) {
-        if (existingData && existingData.namauser === multiUsername) {
-          seatsToRemove2.push(parseInt(existingSeatNum));
-        }
-      }
-      
-      for (const seatNum of seatsToRemove2) {
-        delete roomData.seats[seatNum];
-        if (roomData.points) {
-          delete roomData.points[seatNum];
-        }
-        this.broadcast(multiRoomname, ["removeKursi", multiRoomname, seatNum]);
-      }
-      
-      const seatCount = Object.keys(roomData.seats).length;
-      if (seatCount >= C.MAX_SEATS) {
-        this.safeSend(ws, ["multiJoinError", "Room penuh"]);
-        this._multiJoinLock = false;
-        return;
-      }
-      
-      let seat = this._findAvailableSeat(roomData, multiUsername);
-      if (!seat) {
-        this.safeSend(ws, ["multiJoinError", "Tidak ada kursi tersedia"]);
-        this._multiJoinLock = false;
-        return;
-      }
-      
-      if (roomData.seats[seat] && roomData.seats[seat].namauser) {
-        const newSeat = this._findAvailableSeat(roomData, multiUsername);
-        if (!newSeat) {
-          this.safeSend(ws, ["multiJoinError", "Tidak ada kursi tersedia"]);
-          this._multiJoinLock = false;
-          return;
-        }
-        seat = newSeat;
-      }
-      
-      roomData.seats[seat] = {
-        noimageUrl: "",
-        namauser: multiUsername,
-        color: "",
-        itembawah: 0,
-        itematas: 0,
-        vip: 0,
-        viptanda: 0
-      };
-      
-      this._addUserToRoom(multiUsername, multiRoomname, seat);
-      this._setUserMulti(multiUsername, true);
-      this.onlineUsers.add(multiUsername);
-      
-      await this._syncAllData();
-      
-      ws.serializeAttachment({
-        username: multiUsername,
-        room: multiRoomname,
-        seat: seat,
-        isMulti: true,
-        multiRoom: multiRoomname,
-        multiSeat: seat
-      });
-      
-      ws._cachedUsername = multiUsername;
-      ws._cachedRoom = multiRoomname;
-      ws.username = multiUsername;
-      ws.idtarget = multiUsername;
-      ws.room = multiRoomname;
-      ws.roomname = multiRoomname;
-      ws._isMulti = true;
-      ws._multiRoom = multiRoomname;
-      ws._multiSeat = seat;
-      
-      this._updateUserConnection(multiUsername, ws);
-      this.userSeats.set(multiUsername, { room: multiRoomname, seat: seat });
-      this.wsActiveMulti.set(ws, { username: multiUsername, room: multiRoomname });
-      
-      const webSockets = this._getActiveWebSockets();
-      for (const wsKey of webSockets) {
-        if (wsKey === ws) continue;
-        try {
-          const uname = wsKey._cachedUsername || 
-                        wsKey.username || 
-                        wsKey.deserializeAttachment()?.username;
-          if (uname === multiUsername && wsKey.readyState === 1) {
-            wsKey.serializeAttachment({
-              username: multiUsername,
-              room: multiRoomname,
-              seat: seat,
-              isMulti: true,
-              multiRoom: multiRoomname,
-              multiSeat: seat
-            });
-            wsKey._cachedUsername = multiUsername;
-            wsKey._cachedRoom = multiRoomname;
-            wsKey.username = multiUsername;
-            wsKey.idtarget = multiUsername;
-            wsKey.room = multiRoomname;
-            wsKey.roomname = multiRoomname;
-            wsKey._isMulti = true;
-            wsKey._multiRoom = multiRoomname;
-            wsKey._multiSeat = seat;
-            wsKey._closing = false;
-            
-            this._updateUserConnection(multiUsername, wsKey);
-          }
-        } catch(e) {}
-      }
-      
-      const roomClients = this.roomClients.get(multiRoomname);
-      if (roomClients && !roomClients.has(ws)) roomClients.add(ws);
-      
-      this._refreshRoomClients(true);
-      
-      this.safeSend(ws, ["rooMasukMulti", seat, multiRoomname]);
-      this.broadcast(multiRoomname, ["roomUserCount", multiRoomname, Object.keys(roomData.seats).length]);
-      
-    } finally {
-      this._multiJoinLock = false;
-    }
   }
 
   // ============ UPDATE FUNCTIONS ============
@@ -1579,7 +1594,6 @@ export class ChatServer {
     
     if (ws.readyState !== 1) return;
     
-    // ===== FIX: RESTORE FRESH DATA SEBELUM PROSES =====
     await this._ensureDataFresh();
     
     const seatInfo = this.userSeats.get(username);

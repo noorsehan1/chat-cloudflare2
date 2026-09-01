@@ -1,12 +1,12 @@
 // ==================== CHAT-SERVER.JS ====================
-// VERSION: 3.2.3 - AUTO RESTORE ON ANY EVENT (CENTRALIZED)
+// VERSION: 3.2.4 - AUTO RESTORE ON ANY EVENT (CLOUDFLARE HIBERNATION)
 
 const C = {
   MAX_SEATS: 45,
   MAX_GLOBAL_CONNECTIONS: 150,
   ALARM_INTERVAL_MS: 900000,    // 15 MENIT
   MAX_NUMBER: 6,
-  STORAGE_VERSION: "3.2.3"
+  STORAGE_VERSION: "3.2.4"
 };
 
 const ROOMS = [
@@ -199,7 +199,7 @@ export class ChatServer {
       this.roomClients.set(room, new Set());
     }
     
-    // ========== RESTORE FROM STORAGE ==========
+    // ========== RESTORE FROM STORAGE (GLOBAL DATA) ==========
     this._restoreAllState().then(() => {
       this._restoreComplete = true;
       try {
@@ -307,15 +307,17 @@ export class ChatServer {
     }
   }
 
-  // ============ RESTORE WEBSOCKET STATE ============
+  // ============ RESTORE WEBSOCKET STATE (DARI ATTACHMENT) ============
   
   async _restoreWebSocket(ws) {
     try {
+      // Baca attachment dari WebSocket
       let attachment = null;
       try {
         attachment = ws.deserializeAttachment();
       } catch(e) {}
       
+      // Jika tidak ada attachment, skip
       if (!attachment || !attachment.username) {
         return false;
       }
@@ -334,7 +336,7 @@ export class ChatServer {
       ws._isMulti = isMulti;
       ws._restored = true;
       
-      // Add to connections
+      // Tambahkan ke userConnections
       if (ws.readyState === 1) {
         let connections = this.userConnections.get(username);
         if (!connections) {
@@ -343,11 +345,13 @@ export class ChatServer {
         }
         connections.add(ws);
         
+        // Tambahkan ke roomClients
         if (roomName) {
           const roomClients = this.roomClients.get(roomName);
           if (roomClients) roomClients.add(ws);
         }
         
+        // Tambahkan ke wsSet
         this.wsSet.add(ws);
       }
       
@@ -383,9 +387,11 @@ export class ChatServer {
     this._isRestoring = true;
     
     try {
+      // Cek version storage
       const storedVersion = await this.ctx.storage.get("storageVersion");
       
       if (storedVersion !== C.STORAGE_VERSION) {
+        // Reset semua data
         this.rooms.clear();
         for (const room of ROOMS) {
           this.rooms.set(room, new RoomManager(room));
@@ -395,17 +401,21 @@ export class ChatServer {
         this.currentNumber = 1;
         await this._forceSave();
       } else {
+        // Load dari storage
         await this._loadAllFromStorage();
       }
       
+      // Restore semua WebSocket dari attachment
       await this._restoreAllWebSocketStates();
       
+      // Broadcast room count
       for (const [room, roomMan] of this.rooms) {
         const count = roomMan.getCount();
         this.broadcast(room, ["roomUserCount", room, count]);
       }
       
     } catch(e) {
+      // Fallback: reset
       this.rooms.clear();
       for (const room of ROOMS) {
         this.rooms.set(room, new RoomManager(room));
@@ -704,17 +714,6 @@ export class ChatServer {
   async handleMessage(ws, raw) {
     if (!ws) return;
     
-    // ===== OTOMATIS RESTORE JIKA HIBERNATE =====
-    // Cek apakah ws perlu direstore (belum punya state)
-    if (!ws.username || !ws._restored) {
-      try {
-        const restored = await this._restoreWebSocket(ws);
-        if (restored) {
-          ws._restored = true;
-        }
-      } catch(e) {}
-    }
-    
     try {
       if (ws.readyState !== 1 || ws._closing || this.closing || this.isDestroyed) {
         return;
@@ -807,6 +806,7 @@ export class ChatServer {
             const roomClients = this.roomClients.get(multiRoomname);
             if (roomClients && !roomClients.has(ws)) roomClients.add(ws);
             
+            // ===== SIMPAN KE ATTACHMENT =====
             ws.serializeAttachment({
               username: multiUsername,
               room: multiRoomname,
@@ -858,6 +858,7 @@ export class ChatServer {
               }
             }
             
+            // ===== UPDATE ATTACHMENT =====
             ws.serializeAttachment({
               username: targetUsername,
               isMulti: false
@@ -897,6 +898,7 @@ export class ChatServer {
             ws.room = roomName;
             ws.roomname = roomName;
             
+            // ===== UPDATE ATTACHMENT =====
             ws.serializeAttachment({
               username: targetUsername,
               room: roomName,
@@ -1228,6 +1230,7 @@ export class ChatServer {
         ws.roomname = null;
         ws._closing = false;
         
+        // ===== SIMPAN KE ATTACHMENT =====
         ws.serializeAttachment({
           username: username,
           isMulti: true
@@ -1329,6 +1332,7 @@ export class ChatServer {
         ws.roomname = null;
         ws._closing = false;
         
+        // ===== SIMPAN KE ATTACHMENT =====
         ws.serializeAttachment({
           username: username,
           isMulti: false
@@ -1441,6 +1445,7 @@ export class ChatServer {
       ws.roomname = roomName;
       ws.idtarget = username;
       
+      // ===== SIMPAN KE ATTACHMENT =====
       ws.serializeAttachment({
         username: username,
         room: roomName,
@@ -1513,6 +1518,7 @@ export class ChatServer {
       server._isMulti = false;
       server._restored = false;
       
+      // ===== INIT ATTACHMENT KOSONG =====
       server.serializeAttachment({});
       
       if (!this.wsSet.has(server)) {
@@ -1532,6 +1538,7 @@ export class ChatServer {
     if (!ws || ws._closing || this.closing || this.isDestroyed) return;
     
     // ===== OTOMATIS RESTORE JIKA HIBERNATE =====
+    // Cloudflare akan panggil ini, kita restore dari attachment
     if (!ws.username || !ws._restored) {
       try {
         const restored = await this._restoreWebSocket(ws);

@@ -1,12 +1,12 @@
 // ==================== CHAT-SERVER.JS ====================
-// VERSION: 3.2.4 - FULLY OPTIMIZED FOR CLOUDFLARE HIBERNATION
+// VERSION: 3.2.6 - FULL STORAGE PERSISTENCE
 
 const C = {
   MAX_SEATS: 45,
   MAX_GLOBAL_CONNECTIONS: 150,
   ALARM_INTERVAL_MS: 900000,
   MAX_NUMBER: 6,
-  STORAGE_VERSION: "3.2.4"
+  STORAGE_VERSION: "3.2.6"
 };
 
 const ROOMS = [
@@ -166,8 +166,6 @@ export class ChatServer {
     this.closing = false;
     this.isDestroyed = false;
     this._startTime = Date.now();
-    this._saveTimeout = null;
-    this._savePending = false;
     this._restored = false;
     
     // ========== WEBSOCKET ==========
@@ -192,7 +190,7 @@ export class ChatServer {
       this.roomClients.set(room, new Set());
     }
     
-    // ========== RESTORE FROM STORAGE ==========
+    // ========== RESTORE DARI STORAGE ==========
     this._restoreFromStorage().then(() => {
       this._restored = true;
       try {
@@ -201,25 +199,29 @@ export class ChatServer {
     });
   }
 
-  // ============ STORAGE ============
+  // ============ STORAGE - SAVE ============
   
   async _saveAllToStorage() {
     try {
+      // 1. Simpan data room
       const roomsData = {};
       for (const [roomName, roomMan] of this.rooms) {
         roomsData[roomName] = roomMan.toStorage();
       }
       
+      // 2. Simpan posisi user
       const userSeatObj = {};
       for (const [username, info] of this.userSeat) {
         userSeatObj[username] = info;
       }
       
+      // 3. Simpan room user
       const userRoomObj = {};
       for (const [username, room] of this.userRoom) {
         userRoomObj[username] = room;
       }
       
+      // 4. Simpan semua ke storage
       await this.ctx.storage.put({
         roomsData: roomsData,
         userSeat: userSeatObj,
@@ -229,37 +231,14 @@ export class ChatServer {
         lastSaved: Date.now()
       });
       
-      this._savePending = false;
       return true;
     } catch(e) {
       return false;
     }
   }
 
-  _scheduleSave() {
-    if (this.closing || this.isDestroyed) return;
-    this._savePending = true;
-    if (this._saveTimeout) {
-      clearTimeout(this._saveTimeout);
-      this._saveTimeout = null;
-    }
-    this._saveTimeout = setTimeout(async () => {
-      this._saveTimeout = null;
-      if (this._savePending && !this.closing && !this.isDestroyed) {
-        await this._saveAllToStorage();
-      }
-    }, 100);
-  }
-
-  async _forceSave() {
-    if (this.closing || this.isDestroyed) return;
-    if (this._saveTimeout) {
-      clearTimeout(this._saveTimeout);
-      this._saveTimeout = null;
-    }
-    await this._saveAllToStorage();
-  }
-
+  // ============ STORAGE - LOAD ============
+  
   async _loadFromStorage() {
     try {
       const data = await this.ctx.storage.get([
@@ -296,6 +275,7 @@ export class ChatServer {
       const storedVersion = await this.ctx.storage.get("storageVersion");
       
       if (storedVersion !== C.STORAGE_VERSION) {
+        // Reset semua data
         this.rooms.clear();
         for (const room of ROOMS) {
           this.rooms.set(room, new RoomManager(room));
@@ -303,12 +283,13 @@ export class ChatServer {
         this.userSeat.clear();
         this.userRoom.clear();
         this.currentNumber = 1;
-        await this._forceSave();
+        await this._saveAllToStorage();
       } else {
+        // Load dari storage
         await this._loadFromStorage();
       }
       
-      // Restore WebSocket states from attachment
+      // Restore WebSocket dari attachment
       const webSockets = this.ctx.getWebSockets();
       for (const ws of webSockets) {
         try {
@@ -341,6 +322,7 @@ export class ChatServer {
       }
       
     } catch(e) {
+      // Fallback: reset
       this.rooms.clear();
       for (const room of ROOMS) {
         this.rooms.set(room, new RoomManager(room));
@@ -348,14 +330,15 @@ export class ChatServer {
       this.userSeat.clear();
       this.userRoom.clear();
       this.currentNumber = 1;
-      await this._forceSave();
+      await this._saveAllToStorage();
     }
   }
 
   // ============ RESTORE WEBSOCKET SAAT EVENT ============
   
   async _ensureWsRestored(ws) {
-    if (!ws || ws._restored) return true;
+    if (!ws) return false;
+    if (ws._restored && ws.username) return true;
     
     try {
       const att = ws.deserializeAttachment();
@@ -370,14 +353,20 @@ export class ChatServer {
       
       if (ws.readyState === 1) {
         let conn = this.userConnections.get(att.username);
-        if (!conn) { conn = new Set(); this.userConnections.set(att.username, conn); }
+        if (!conn) {
+          conn = new Set();
+          this.userConnections.set(att.username, conn);
+        }
         conn.add(ws);
+        
         if (att.room) {
           const rc = this.roomClients.get(att.room);
           if (rc) rc.add(ws);
         }
+        
         this.wsSet.add(ws);
       }
+      
       return true;
     } catch(e) {
       return false;
@@ -390,6 +379,7 @@ export class ChatServer {
     if (this.closing || this.isDestroyed) return;
     
     try {
+      // Update number
       this.currentNumber = this.currentNumber < C.MAX_NUMBER ? this.currentNumber + 1 : 1;
       
       for (const room of this.rooms.values()) {
@@ -403,13 +393,14 @@ export class ChatServer {
         }
       }
       
-      // Cleanup
+      // Cleanup dead connections
       const toRemove = [];
       for (const ws of this.wsSet) {
         if (!ws || ws.readyState !== 1 || ws._closing) toRemove.push(ws);
       }
       for (const ws of toRemove) this.cleanup(ws);
       
+      // Cleanup locks
       const now = Date.now();
       for (const [key, time] of this._joinLocks) {
         if (now - time > 10000) this._joinLocks.delete(key);
@@ -418,6 +409,7 @@ export class ChatServer {
         if (now - time > 10000) this._kursiLocks.delete(key);
       }
       
+      // Cleanup points
       for (const [roomName, roomMan] of this.rooms) {
         if (roomMan) {
           const toRemovePoints = [];
@@ -428,7 +420,8 @@ export class ChatServer {
         }
       }
       
-      await this._forceSave();
+      // SAVE KE STORAGE
+      await this._saveAllToStorage();
       
     } catch(e) {}
     
@@ -606,7 +599,7 @@ export class ChatServer {
       this.wsSet.delete(ws);
       
       if (needSave) {
-        this._scheduleSave();
+        this._saveAllToStorage();
       }
       
     } catch(e) {} finally {
@@ -624,9 +617,10 @@ export class ChatServer {
   async handleMessage(ws, raw) {
     if (!ws) return;
     
-    // ===== OTOMATIS RESTORE JIKA HIBERNATE =====
-    if (!ws._restored) {
-      await this._ensureWsRestored(ws);
+    // ===== RESTORE JIKA HIBERNATE =====
+    if (!ws._restored || !ws.username) {
+      const restored = await this._ensureWsRestored(ws);
+      if (!restored) return;
     }
     
     try {
@@ -732,7 +726,8 @@ export class ChatServer {
             this.safeSend(ws, ["rooMasukMulti", seat, multiRoomname]);
             this.broadcast(multiRoomname, ["roomUserCount", multiRoomname, roomMan.getCount()]);
             
-            this._scheduleSave();
+            // SAVE KE STORAGE
+            this._saveAllToStorage();
           } catch(e) {}
           break;
         }
@@ -784,7 +779,8 @@ export class ChatServer {
             }
             ws._restored = false;
             
-            this._scheduleSave();
+            // SAVE KE STORAGE
+            this._saveAllToStorage();
           } catch(e) {}
           break;
         }
@@ -851,7 +847,8 @@ export class ChatServer {
               if (updated) {
                 const updatedSeat = roomMan.getSeat(kursiSeat);
                 this.broadcast(kursiRoom, ["kursiBatchUpdate", kursiRoom, [[kursiSeat, updatedSeat]]]);
-                this._scheduleSave();
+                // SAVE KE STORAGE
+                this._saveAllToStorage();
               }
             } finally {
               this._kursiLocks.delete(lockKey);
@@ -879,7 +876,8 @@ export class ChatServer {
               if (roomMan && roomMan.seats.has(pointSeat)) {
                 if (roomMan.updatePoint(pointSeat, pointX, pointY, pointFast === 1)) {
                   this._broadcastToRoom(pointRoom, JSON.stringify(["pointUpdated", pointRoom, pointSeat, pointX, pointY, pointFast]));
-                  this._scheduleSave();
+                  // SAVE KE STORAGE
+                  this._saveAllToStorage();
                 }
               }
             }
@@ -902,7 +900,8 @@ export class ChatServer {
               roomMan.removeSeat(removeSeat);
               this.broadcast(removeRoom, ["removeKursi", removeRoom, removeSeat]);
               this.updateRoomCount(removeRoom);
-              this._scheduleSave();
+              // SAVE KE STORAGE
+              this._saveAllToStorage();
             }
           } catch(e) {}
           break;
@@ -1049,7 +1048,8 @@ export class ChatServer {
             rm.setMuted(muteVal);
             this.broadcast(muteRoom, ["muteStatusChanged", !!muteVal, muteRoom]);
             this.safeSend(ws, ["muteTypeSet", !!muteVal, true, muteRoom]);
-            this._scheduleSave();
+            // SAVE KE STORAGE
+            this._saveAllToStorage();
           } catch(e) {}
           break;
         }
@@ -1373,7 +1373,7 @@ export class ChatServer {
       this.updateRoomCount(roomName);
       
       if (needSave) {
-        this._scheduleSave();
+        this._saveAllToStorage();
       }
       
       setTimeout(() => {
@@ -1445,8 +1445,8 @@ export class ChatServer {
   async webSocketMessage(ws, msg) { 
     if (!ws || ws._closing || this.closing || this.isDestroyed) return;
     
-    // ===== OTOMATIS RESTORE JIKA HIBERNATE =====
-    if (!ws._restored) {
+    // ===== RESTORE JIKA HIBERNATE =====
+    if (!ws._restored || !ws.username) {
       await this._ensureWsRestored(ws);
     }
     
@@ -1458,8 +1458,8 @@ export class ChatServer {
   async webSocketClose(ws) { 
     if (!ws) return;
     
-    // ===== OTOMATIS RESTORE JIKA HIBERNATE =====
-    if (!ws._restored) {
+    // ===== RESTORE JIKA HIBERNATE =====
+    if (!ws._restored || !ws.username) {
       await this._ensureWsRestored(ws);
     }
     
@@ -1471,8 +1471,8 @@ export class ChatServer {
   async webSocketError(ws) { 
     if (!ws) return;
     
-    // ===== OTOMATIS RESTORE JIKA HIBERNATE =====
-    if (!ws._restored) {
+    // ===== RESTORE JIKA HIBERNATE =====
+    if (!ws._restored || !ws.username) {
       await this._ensureWsRestored(ws);
     }
     
@@ -1491,12 +1491,8 @@ export class ChatServer {
     this._joinLocks.clear();
     this._kursiLocks.clear();
     
-    if (this._saveTimeout) {
-      clearTimeout(this._saveTimeout);
-      this._saveTimeout = null;
-    }
-    
-    await this._forceSave();
+    // SAVE SEBELUM DESTROY
+    await this._saveAllToStorage();
     
     const wsCopy = Array.from(this.wsSet);
     for (const ws of wsCopy) {

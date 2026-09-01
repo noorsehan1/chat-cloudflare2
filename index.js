@@ -1,68 +1,51 @@
-import { ChatServer } from './src/chat-server.js';
-import { GameServer } from './src/game-server.js';
+// ==================== INDEX.JS - FULL ROUTER ====================
+// VERSION: 4.0.0 - WITH ADMIN ENDPOINTS
 
-export { ChatServer, GameServer };
+import { ChatServer } from "./chat-server.js";
+import { GameServer } from "./game-server.js";
 
 export default {
-  async fetch(request, env, ctx) {
-    const url = new URL(request.url);
-    const path = url.pathname;
-    
-    // Handle WebSocket upgrade requests
-    const upgradeHeader = request.headers.get('Upgrade');
-    if (upgradeHeader === 'websocket') {
-      // Route to chat server for WebSocket connections
-      const id = env.CHAT_SERVER.idFromName('default');
-      const stub = env.CHAT_SERVER.get(id);
-      return stub.fetch(request);
-    }
-    
-    // Route regular HTTP requests
-    if (path.startsWith('/chat')) {
-      const id = env.CHAT_SERVER.idFromName('default');
-      const stub = env.CHAT_SERVER.get(id);
-      return stub.fetch(request);
-    }
-    
-    if (path.startsWith('/game')) {
-      const id = env.GAME_SERVER.idFromName('default');
-      const stub = env.GAME_SERVER.get(id);
-      return stub.fetch(request);
-    }
-    
-    if (path.startsWith('/api/questions')) {
-      return handleQuizRequest(request, env);
-    }
-    
-    // Health check endpoint
-    if (path === '/health') {
-      return new Response('OK', { 
+  async fetch(request, env) {
+    try {
+      const url = new URL(request.url);
+      const pathname = url.pathname;
+      
+      // ========== CHAT SERVER ==========
+      if (pathname === "/ws" || pathname === "/chat" || pathname === "/") {
+        const id = env.CHAT_SERVER.idFromName("global");
+        const obj = env.CHAT_SERVER.get(id);
+        return obj.fetch(request);
+      }
+      
+      // ========== GAME SERVER ==========
+      if (pathname === "/game/ws" || 
+          pathname.startsWith("/admin/") || 
+          pathname === "/game/health") {
+        const id = env.GAME_SERVER.idFromName("game");
+        const obj = env.GAME_SERVER.get(id);
+        return obj.fetch(request);
+      }
+      
+      // ========== ROOT ==========
+      return new Response("Server running v4.0.0 - Full Admin", { 
         status: 200,
         headers: { 'Content-Type': 'text/plain' }
       });
+      
+    } catch(e) {
+      console.error("Fetch error:", e);
+      return new Response(JSON.stringify({
+        error: "Internal Server Error",
+        message: e.message || "Unknown error"
+      }), { 
+        status: 500,
+        headers: { 
+          'Retry-After': '30',
+          'Content-Type': 'application/json'
+        }
+      });
     }
-    
-    return new Response('Not found', { status: 404 });
   }
 };
 
-async function handleQuizRequest(request, env) {
-  const url = new URL(request.url);
-  const questionId = url.searchParams.get('id');
-  
-  if (questionId) {
-    const question = await env.QUESTIONS.get(questionId, 'json');
-    return Response.json(question || { error: 'Question not found' });
-  }
-  
-  // Get all questions
-  const keys = await env.QUESTIONS.list();
-  const questions = await Promise.all(
-    keys.keys.map(async (key) => ({
-      id: key.name,
-      data: await env.QUESTIONS.get(key.name, 'json')
-    }))
-  );
-  
-  return Response.json(questions);
-}
+export { ChatServer, GameServer };

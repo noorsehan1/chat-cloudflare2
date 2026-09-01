@@ -1,5 +1,5 @@
 // ==================== CHAT-SERVER-HIBERNATION-NO-PING.JS ====================
-// VERSION: 9.3.9 - FIXED EXIT MULTI & RESTORE LOGIC
+// VERSION: 9.4.0 - FIXED JOIN ROOM REMOVE FROM ALL ROOMS
 
 const C = {
   MAX_SEATS: 45,
@@ -448,12 +448,51 @@ export class ChatServer {
     }
     
     const username = ws.username;
-    
     const isMulti = ws._isMulti || this._isUserMulti(username);
-    if (!isMulti) {
-      await this._removeUserFromAllRooms(username);
+    
+    // ===== STEP 1: HAPUS DARI SEMUA ROOM =====
+    for (const [roomNameLoop, roomData] of Object.entries(this._roomsDataCache)) {
+      if (!roomData || !roomData.seats) continue;
+      
+      let seatToRemove = null;
+      for (const [seat, data] of Object.entries(roomData.seats)) {
+        if (data && data.namauser === username) {
+          seatToRemove = parseInt(seat);
+          break;
+        }
+      }
+      
+      if (seatToRemove !== null) {
+        delete roomData.seats[seatToRemove];
+        if (roomData.points) {
+          delete roomData.points[seatToRemove];
+        }
+        
+        this.broadcast(roomNameLoop, ["removeKursi", roomNameLoop, seatToRemove]);
+        await this.updateRoomCount(roomNameLoop);
+        await this._deleteRoomIfEmpty(roomNameLoop);
+      }
     }
     
+    // ===== STEP 2: HAPUS DARI CACHE =====
+    if (this._userSeatDataCache[username]) {
+      delete this._userSeatDataCache[username];
+    }
+    
+    if (this._onlineUsers.has(username)) {
+      this._onlineUsers.delete(username);
+    }
+    
+    // ===== STEP 3: SIMPAN KE STORAGE =====
+    await this._saveToStorage(
+      this._roomsDataCache,
+      this._userSeatDataCache,
+      this.currentNumber
+    );
+    await this.ctx.storage.put("onlineUsers", Array.from(this._onlineUsers));
+    await this._updateUserCounts();
+    
+    // ===== STEP 4: JOIN KE ROOM BARU =====
     let roomData = this._roomsDataCache[roomName];
     if (!roomData) {
       roomData = { seats: {}, points: {}, muted: false, number: 1 };
@@ -493,7 +532,7 @@ export class ChatServer {
     
     await this._saveToStorage(this._roomsDataCache, undefined, undefined);
     
-    const seatInfo = { room: roomName, seat, isMulti: false };
+    const seatInfo = { room: roomName, seat, isMulti: isMulti };
     this._userSeatDataCache[username] = seatInfo;
     await this._saveToStorage(undefined, this._userSeatDataCache, undefined);
     
@@ -505,7 +544,7 @@ export class ChatServer {
       username: username,
       room: roomName,
       seat: seat,
-      isMulti: false,
+      isMulti: isMulti,
       seatInfo: seatInfo
     });
     
@@ -515,9 +554,9 @@ export class ChatServer {
     ws.room = roomName;
     ws.roomname = roomName;
     ws.idtarget = username;
-    ws._isMulti = false;
-    ws._multiRoom = null;
-    ws._multiSeat = null;
+    ws._isMulti = isMulti;
+    ws._multiRoom = isMulti ? roomName : null;
+    ws._multiSeat = isMulti ? seat : null;
     
     this._refreshRoomClients(true);
     

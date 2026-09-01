@@ -1,5 +1,5 @@
 // ==================== CHAT-SERVER-HIBERNATION-NO-PING.JS ====================
-// VERSION: 9.3.8 - FIXED RESTORE LOGIC
+// VERSION: 9.3.9 - FIXED EXIT MULTI & RESTORE LOGIC
 
 const C = {
   MAX_SEATS: 45,
@@ -1375,15 +1375,62 @@ export class ChatServer {
           }
           
           try {
-            await this._removeUserFromAllRooms(targetUsername);
+            // ===== HAPUS SEMUA DATA MULTI USER DARI KURSI =====
             
+            // 1. CARI DAN HAPUS SEMUA KURSI MULTI USER
+            for (const [roomName, roomData] of Object.entries(this._roomsDataCache)) {
+              if (!roomData || !roomData.seats) continue;
+              
+              let seatToRemove = null;
+              for (const [seat, data] of Object.entries(roomData.seats)) {
+                if (data && data.namauser === targetUsername) {
+                  seatToRemove = parseInt(seat);
+                  break;
+                }
+              }
+              
+              if (seatToRemove !== null) {
+                // HAPUS KURSI DARI CACHE
+                delete roomData.seats[seatToRemove];
+                if (roomData.points) {
+                  delete roomData.points[seatToRemove];
+                }
+                
+                // WAJIB: BROADCAST REMOVE KURSI KE SEMUA CLIENT
+                this.broadcast(roomName, ["removeKursi", roomName, seatToRemove]);
+                await this.updateRoomCount(roomName);
+                await this._deleteRoomIfEmpty(roomName);
+              }
+            }
+            
+            // 2. HAPUS DARI USER SEAT DATA CACHE
+            if (this._userSeatDataCache[targetUsername]) {
+              delete this._userSeatDataCache[targetUsername];
+            }
+            
+            // 3. HAPUS DARI ONLINE USERS
+            if (this._onlineUsers.has(targetUsername)) {
+              this._onlineUsers.delete(targetUsername);
+            }
+            
+            // 4. SIMPAN PERUBAHAN KE STORAGE (HAPUS DARI STORAGE)
+            await this._saveToStorage(
+              this._roomsDataCache,
+              this._userSeatDataCache,
+              this.currentNumber
+            );
+            await this.ctx.storage.put("onlineUsers", Array.from(this._onlineUsers));
+            await this._updateUserCounts();
+            
+            // 5. UPDATE WEBSOCKET ATTACHMENT
             const webSockets = this._getActiveWebSockets();
             for (const wsKey of webSockets) {
               try {
                 const uname = wsKey._cachedUsername || 
                               wsKey.username || 
                               wsKey.deserializeAttachment()?.username;
-                if (uname === targetUsername) {
+                if (uname === targetUsername && wsKey.readyState === 1) {
+                  // RESET PROPERTIES
                   wsKey._isMulti = false;
                   wsKey._multiRoom = null;
                   wsKey._multiSeat = null;
@@ -1391,18 +1438,23 @@ export class ChatServer {
                   wsKey.room = null;
                   wsKey.roomname = null;
                   wsKey.idtarget = null;
+                  
+                  // UPDATE ATTACHMENT
                   wsKey.serializeAttachment({ 
                     username: targetUsername,
                     isMulti: false
                   });
                   
+                  // KIRIM KONFIRMASI
                   this.safeSend(wsKey, ["exitMultiSuccess", targetUsername, null, null]);
                 }
               } catch(e) {}
             }
             
+            // 6. REFRESH ROOM CLIENTS
             this._refreshRoomClients(true);
             
+            // 7. KIRIM KONFIRMASI KE PENGIRIM
             this.safeSend(ws, ["exitMultiSuccess", targetUsername, null, null]);
             
           } catch(e) {
@@ -1772,7 +1824,7 @@ export class ChatServer {
                 seatInfo: userSeat
               });
               
-              // ✅ SEMUA USER DENGAN WS AKTIF TETAP ONLINE
+              // SEMUA USER DENGAN WS AKTIF TETAP ONLINE
               if (ws.readyState === 1) {
                 activeUsers.add(attachment.username);
                 this._onlineUsers.add(attachment.username);
@@ -1815,7 +1867,7 @@ export class ChatServer {
               multiSeat: isMulti ? parseInt(seat) : null
             };
             
-            // ✅ HANYA TAMBAHKAN KE ONLINE USERS JIKA ADA WS AKTIF ATAU MULTI
+            // HANYA TAMBAHKAN KE ONLINE USERS JIKA ADA WS AKTIF ATAU MULTI
             if (activeUsers.has(username) || isMulti) {
               this._onlineUsers.add(username);
             }
@@ -1830,10 +1882,10 @@ export class ChatServer {
           if (attachment && attachment.username && ws.readyState === 1) {
             const username = attachment.username;
             
-            // ✅ PASTIKAN USER TETAP ONLINE
+            // PASTIKAN USER TETAP ONLINE
             this._onlineUsers.add(username);
             
-            // ✅ PASTIKAN USER SEAT DATA TETAP ADA
+            // PASTIKAN USER SEAT DATA TETAP ADA
             if (!this._userSeatDataCache[username]) {
               // CARI USER DI ROOMS DATA
               for (const [roomName, roomData] of Object.entries(this._roomsDataCache)) {
@@ -1855,7 +1907,7 @@ export class ChatServer {
               }
             }
             
-            // ✅ UPDATE ATTACHMENT DENGAN SEAT INFO TERBARU
+            // UPDATE ATTACHMENT DENGAN SEAT INFO TERBARU
             if (this._userSeatDataCache[username]) {
               const userSeat = this._userSeatDataCache[username];
               ws.serializeAttachment({
@@ -1882,7 +1934,7 @@ export class ChatServer {
         
         const roomData = this._roomsDataCache[seatInfo.room];
         if (!roomData || !roomData.seats || !roomData.seats[seatInfo.seat]) {
-          // ✅ HANYA MULTI USER YANG DI-RESTORE
+          // HANYA MULTI USER YANG DI-RESTORE
           if (seatInfo.isMulti) {
             let found = false;
             for (const [roomName, roomData2] of Object.entries(this._roomsDataCache)) {
@@ -1908,7 +1960,7 @@ export class ChatServer {
               this._onlineUsers.delete(username);
             }
           } else {
-            // ✅ USER NORMAL TANPA KURSI: HAPUS
+            // USER NORMAL TANPA KURSI: HAPUS
             delete this._userSeatDataCache[username];
             this._onlineUsers.delete(username);
           }

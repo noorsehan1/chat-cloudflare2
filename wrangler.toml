@@ -20,20 +20,3 @@ new_sqlite_classes = ["ChatServer", "GameServer"]
 [[kv_namespaces]]
 binding = "QUESTIONS"
 id = "556345248fb6411fa1b9bacd4740b922"
-
-# ==================== OBSERVABILITY (Wrangler v3.109.0+) ====================
-[observability]
-enabled = true
-
-# ==================== LOGGING (Wrangler v3.109.0+) ====================
-[logging]
-enabled = true
-
-# ==================== ENVIRONMENT VARIABLES ====================
-[vars]
-ENVIRONMENT = "production"
-
-# ==================== DEV SETTINGS ====================
-[dev]
-port = 8787
-local_protocol = "http"

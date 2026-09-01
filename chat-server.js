@@ -1,5 +1,5 @@
 // ==================== CHAT-SERVER-HIBERNATION-NO-PING.JS ====================
-// VERSION: 9.3.7 - INSTANT CLEANUP ON DISCONNECT
+// VERSION: 9.3.8 - FIXED RESTORE LOGIC
 
 const C = {
   MAX_SEATS: 45,
@@ -1736,6 +1736,53 @@ export class ChatServer {
       this._userCounts = userCounts;
       this._onlineUsers = new Set(onlineUsers);
       
+      // ===== RESTORE WEBSOCKET ATTACHMENT & ONLINE STATUS =====
+      const webSockets = this.ctx.getWebSockets();
+      const activeUsers = new Set();
+      
+      // 1️⃣ RESTORE WEBSOCKET ATTACHMENT
+      for (const ws of webSockets) {
+        try {
+          const attachment = ws.deserializeAttachment();
+          if (attachment && attachment.username) {
+            const userSeat = this._userSeatDataCache[attachment.username];
+            if (userSeat) {
+              const isMulti = attachment.isMulti || userSeat.isMulti || false;
+              const roomName = attachment.room || userSeat.room;
+              const seatNumber = attachment.seat || userSeat.seat;
+              
+              ws.username = attachment.username;
+              ws.room = roomName;
+              ws.roomname = roomName;
+              ws.idtarget = attachment.username;
+              ws._closing = false;
+              ws._isMulti = isMulti;
+              ws._multiRoom = attachment.multiRoom || (isMulti ? roomName : null);
+              ws._multiSeat = attachment.multiSeat || (isMulti ? seatNumber : null);
+              ws._cachedUsername = attachment.username;
+              ws._cachedRoom = roomName;
+              
+              ws.serializeAttachment({
+                username: attachment.username,
+                room: roomName,
+                seat: seatNumber,
+                isMulti: isMulti,
+                multiRoom: attachment.multiRoom || (isMulti ? roomName : null),
+                multiSeat: attachment.multiSeat || (isMulti ? seatNumber : null),
+                seatInfo: userSeat
+              });
+              
+              // ✅ SEMUA USER DENGAN WS AKTIF TETAP ONLINE
+              if (ws.readyState === 1) {
+                activeUsers.add(attachment.username);
+                this._onlineUsers.add(attachment.username);
+              }
+            }
+          }
+        } catch(e) {}
+      }
+      
+      // 2️⃣ RESTORE USER SEAT DATA DARI ROOMS DATA
       for (const [roomName, roomData] of Object.entries(roomsData)) {
         if (!roomData || !roomData.seats) continue;
         
@@ -1744,28 +1791,98 @@ export class ChatServer {
           
           const username = data.namauser;
           
+          // CEK APAKAH USER SUDAH ADA DI userSeatData
           if (!this._userSeatDataCache[username]) {
+            // CEK APAKAH USER MULTI DARI DATA LAMA
+            let isMulti = false;
+            
+            // CEK DI onlineUsers
+            if (this._onlineUsers.has(username)) {
+              // CEK APAKAH USER INI MULTI
+              for (const [uname, seatInfo] of Object.entries(userSeatData)) {
+                if (uname === username && seatInfo.isMulti) {
+                  isMulti = true;
+                  break;
+                }
+              }
+            }
+            
             this._userSeatDataCache[username] = {
               room: roomName,
               seat: parseInt(seat),
-              isMulti: true,
-              multiRoom: roomName,
-              multiSeat: parseInt(seat)
+              isMulti: isMulti,
+              multiRoom: isMulti ? roomName : null,
+              multiSeat: isMulti ? parseInt(seat) : null
             };
             
-            this._onlineUsers.add(username);
+            // ✅ HANYA TAMBAHKAN KE ONLINE USERS JIKA ADA WS AKTIF ATAU MULTI
+            if (activeUsers.has(username) || isMulti) {
+              this._onlineUsers.add(username);
+            }
           }
         }
       }
       
+      // 3️⃣ VALIDASI: PASTIKAN USER YANG PUNYA WS AKTIF TETAP ONLINE
+      for (const ws of webSockets) {
+        try {
+          const attachment = ws.deserializeAttachment();
+          if (attachment && attachment.username && ws.readyState === 1) {
+            const username = attachment.username;
+            
+            // ✅ PASTIKAN USER TETAP ONLINE
+            this._onlineUsers.add(username);
+            
+            // ✅ PASTIKAN USER SEAT DATA TETAP ADA
+            if (!this._userSeatDataCache[username]) {
+              // CARI USER DI ROOMS DATA
+              for (const [roomName, roomData] of Object.entries(this._roomsDataCache)) {
+                if (!roomData || !roomData.seats) continue;
+                for (const [seat, data] of Object.entries(roomData.seats)) {
+                  if (data && data.namauser === username) {
+                    const isMulti = attachment.isMulti || false;
+                    this._userSeatDataCache[username] = {
+                      room: roomName,
+                      seat: parseInt(seat),
+                      isMulti: isMulti,
+                      multiRoom: isMulti ? roomName : null,
+                      multiSeat: isMulti ? parseInt(seat) : null
+                    };
+                    break;
+                  }
+                }
+                if (this._userSeatDataCache[username]) break;
+              }
+            }
+            
+            // ✅ UPDATE ATTACHMENT DENGAN SEAT INFO TERBARU
+            if (this._userSeatDataCache[username]) {
+              const userSeat = this._userSeatDataCache[username];
+              ws.serializeAttachment({
+                username: username,
+                room: userSeat.room,
+                seat: userSeat.seat,
+                isMulti: userSeat.isMulti || false,
+                multiRoom: userSeat.multiRoom || null,
+                multiSeat: userSeat.multiSeat || null,
+                seatInfo: userSeat
+              });
+            }
+          }
+        } catch(e) {}
+      }
+      
+      // 4️⃣ VALIDASI: HAPUS DATA YANG TIDAK VALID
       for (const [username, seatInfo] of Object.entries(this._userSeatDataCache)) {
         if (!seatInfo || !seatInfo.room) {
           delete this._userSeatDataCache[username];
           this._onlineUsers.delete(username);
           continue;
         }
+        
         const roomData = this._roomsDataCache[seatInfo.room];
         if (!roomData || !roomData.seats || !roomData.seats[seatInfo.seat]) {
+          // ✅ HANYA MULTI USER YANG DI-RESTORE
           if (seatInfo.isMulti) {
             let found = false;
             for (const [roomName, roomData2] of Object.entries(this._roomsDataCache)) {
@@ -1791,53 +1908,18 @@ export class ChatServer {
               this._onlineUsers.delete(username);
             }
           } else {
+            // ✅ USER NORMAL TANPA KURSI: HAPUS
             delete this._userSeatDataCache[username];
             this._onlineUsers.delete(username);
           }
         }
       }
       
-      const webSockets = this.ctx.getWebSockets();
-      for (const ws of webSockets) {
-        try {
-          const attachment = ws.deserializeAttachment();
-          if (attachment && attachment.username) {
-            const userSeat = this._userSeatDataCache[attachment.username];
-            if (userSeat) {
-              const isMulti = attachment.isMulti || userSeat.isMulti || false;
-              const roomName = attachment.room || userSeat.room;
-              const seatNumber = attachment.seat || userSeat.seat;
-              
-              ws.username = attachment.username;
-              ws.room = roomName;
-              ws.roomname = roomName;
-              ws.idtarget = attachment.username;
-              ws._closing = false;
-              ws._isMulti = isMulti;
-              ws._multiRoom = attachment.multiRoom || roomName;
-              ws._multiSeat = attachment.multiSeat || seatNumber;
-              ws._cachedUsername = attachment.username;
-              ws._cachedRoom = roomName;
-              
-              ws.serializeAttachment({
-                username: attachment.username,
-                room: roomName,
-                seat: seatNumber,
-                isMulti: isMulti,
-                multiRoom: attachment.multiRoom || roomName,
-                multiSeat: attachment.multiSeat || seatNumber,
-                seatInfo: userSeat
-              });
-              
-              this._onlineUsers.add(attachment.username);
-            }
-          }
-        } catch(e) {}
-      }
-      
+      // 5️⃣ REFRESH & UPDATE
       this._refreshRoomClients(true);
       await this._updateUserCounts();
       
+      // 6️⃣ SIMPAN KE STORAGE
       await this._saveToStorage(
         this._roomsDataCache,
         this._userSeatDataCache,
@@ -1845,6 +1927,7 @@ export class ChatServer {
       );
       await this.ctx.storage.put("onlineUsers", Array.from(this._onlineUsers));
       
+      // 7️⃣ SET ALARM
       if (!this.closing && !this.isDestroyed) {
         const existingAlarm = await this.ctx.storage.getAlarm();
         if (!existingAlarm) {

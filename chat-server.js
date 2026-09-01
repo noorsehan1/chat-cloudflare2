@@ -1,5 +1,5 @@
 // ==================== CHAT-SERVER-HIBERNATION-NO-PING.JS ====================
-// VERSION: 9.8.0 - FIXED MULTI USER SEAT OVERWRITE
+// VERSION: 9.9.0 - FULL SYNC CACHE & STORAGE
 
 const C = {
   MAX_SEATS: 45,
@@ -50,10 +50,22 @@ export class ChatServer {
     });
   }
 
+  // ============ SYNC CACHE & STORAGE ============
+
+  async _syncAllData() {
+    await this._saveToStorage(
+      this._roomsDataCache,
+      this._userIndex,
+      this.currentNumber
+    );
+    await this.ctx.storage.put("onlineUsers", Array.from(this._onlineUsers));
+    await this.ctx.storage.put("userCounts", this._userCounts);
+  }
+
   async _checkAndResetOnDeploy() {
     try {
       const storedVersion = await this.ctx.storage.get("deployVersion");
-      const currentVersion = "9.8.0";
+      const currentVersion = "9.9.0";
       
       if (storedVersion !== currentVersion) {
         this._roomsDataCache = {};
@@ -215,14 +227,12 @@ export class ChatServer {
   }
 
   _findAvailableSeat(roomData, username) {
-    // CEK APAKAH USER SUDAH PUNYA KURSI DI ROOM INI
     for (const [seat, data] of Object.entries(roomData.seats)) {
       if (data && data.namauser === username) {
         return parseInt(seat);
       }
     }
     
-    // CARI KURSI KOSONG
     for (let s = 1; s <= C.MAX_SEATS; s++) {
       if (!roomData.seats[s]) {
         return s;
@@ -310,6 +320,40 @@ export class ChatServer {
            this._userIndex.hasOwnProperty(username);
   }
 
+  async _removeUserCompletely(username) {
+    if (!username) return false;
+    
+    // 1. HAPUS DARI SEMUA ROOM
+    const userRooms = this._getUserRooms(username);
+    
+    for (const [roomName, seat] of Object.entries(userRooms)) {
+      const roomData = this._roomsDataCache[roomName];
+      if (roomData && roomData.seats && roomData.seats[seat]) {
+        delete roomData.seats[seat];
+        if (roomData.points) {
+          delete roomData.points[seat];
+        }
+        this.broadcast(roomName, ["removeKursi", roomName, seat]);
+        await this.updateRoomCount(roomName);
+        await this._deleteRoomIfEmpty(roomName);
+      }
+    }
+    
+    // 2. HAPUS DARI INDEX
+    this._removeUserFromAllIndex(username);
+    
+    // 3. HAPUS DARI ONLINE USERS
+    this._onlineUsers.delete(username);
+    
+    // 4. SYNC KE STORAGE
+    await this._syncAllData();
+    
+    // 5. REFRESH ROOM CLIENTS
+    this._refreshRoomClients(true);
+    
+    return true;
+  }
+
   async _removeUserFromAllRooms(username) {
     if (!username) return false;
     
@@ -345,13 +389,7 @@ export class ChatServer {
     }
     
     if (removed) {
-      await this._saveToStorage(
-        this._roomsDataCache,
-        this._userIndex,
-        this.currentNumber
-      );
-      await this.ctx.storage.put("onlineUsers", Array.from(this._onlineUsers));
-      await this._updateUserCounts();
+      await this._syncAllData();
     }
     
     return removed;
@@ -395,13 +433,7 @@ export class ChatServer {
     this._removeUserFromIndex(username, roomName);
     this._onlineUsers.delete(username);
     
-    await this._saveToStorage(
-      this._roomsDataCache,
-      this._userIndex,
-      this.currentNumber
-    );
-    await this.ctx.storage.put("onlineUsers", Array.from(this._onlineUsers));
-    await this._updateUserCounts();
+    await this._syncAllData();
     
     this.broadcast(roomName, ["removeKursi", roomName, seat]);
     await this.updateRoomCount(roomName);
@@ -424,7 +456,7 @@ export class ChatServer {
       viptanda: data.viptanda || 0
     };
     
-    await this._saveToStorage(this._roomsDataCache, undefined, undefined);
+    await this._syncAllData();
     return true;
   }
 
@@ -435,7 +467,7 @@ export class ChatServer {
     if (!roomData.points) roomData.points = {};
     roomData.points[seat] = { x: x || 0, y: y || 0, fast: !!fast };
     
-    await this._saveToStorage(this._roomsDataCache, undefined, undefined);
+    await this._syncAllData();
     return true;
   }
 
@@ -449,13 +481,7 @@ export class ChatServer {
     this._removeUserFromAllIndex(username);
     this._onlineUsers.delete(username);
     
-    await this._saveToStorage(
-      undefined,
-      this._userIndex,
-      undefined
-    );
-    await this.ctx.storage.put("onlineUsers", Array.from(this._onlineUsers));
-    await this._updateUserCounts();
+    await this._syncAllData();
   }
 
   async _deleteRoomIfEmpty(roomName) {
@@ -467,8 +493,7 @@ export class ChatServer {
     
     if (!hasSeats && !hasPoints) {
       delete this._roomsDataCache[roomName];
-      await this._saveToStorage(this._roomsDataCache, undefined, undefined);
-      await this._updateUserCounts();
+      await this._syncAllData();
     }
   }
 
@@ -536,12 +561,7 @@ export class ChatServer {
       }
       
       if (cleaned > 0) {
-        await this._saveToStorage(
-          this._roomsDataCache,
-          this._userIndex,
-          this.currentNumber
-        );
-        await this.ctx.storage.put("onlineUsers", Array.from(this._onlineUsers));
+        await this._syncAllData();
       }
       
       return cleaned;
@@ -559,6 +579,7 @@ export class ChatServer {
     const username = ws.username;
     const isMulti = ws._isMulti || this._isUserMulti(username);
     
+    // ===== HAPUS USER DARI SEMUA ROOM SEBELUM JOIN =====
     const userRooms = this._getUserRooms(username);
     
     for (const [roomNameLoop, seat] of Object.entries(userRooms)) {
@@ -581,19 +602,14 @@ export class ChatServer {
       this._onlineUsers.delete(username);
     }
     
-    await this._saveToStorage(
-      this._roomsDataCache,
-      this._userIndex,
-      this.currentNumber
-    );
-    await this.ctx.storage.put("onlineUsers", Array.from(this._onlineUsers));
-    await this._updateUserCounts();
+    await this._syncAllData();
     
+    // ===== JOIN KE ROOM BARU =====
     let roomData = this._roomsDataCache[roomName];
     if (!roomData) {
       roomData = { seats: {}, points: {}, muted: false, number: 1 };
       this._roomsDataCache[roomName] = roomData;
-      await this._saveToStorage(this._roomsDataCache, undefined, undefined);
+      await this._syncAllData();
     }
     
     const seatCount = Object.keys(roomData.seats).length;
@@ -619,16 +635,12 @@ export class ChatServer {
       viptanda: 0
     };
     
-    await this._saveToStorage(this._roomsDataCache, undefined, undefined);
-    
     this._addUserToIndex(username, roomName, seat);
     this._setUserMulti(username, isMulti);
     
-    await this._saveToStorage(undefined, this._userIndex, undefined);
-    
     this._onlineUsers.add(username);
-    await this.ctx.storage.put("onlineUsers", Array.from(this._onlineUsers));
-    await this._updateUserCounts();
+    
+    await this._syncAllData();
     
     ws.serializeAttachment({
       username: username,
@@ -703,13 +715,7 @@ export class ChatServer {
         this._onlineUsers.delete(username);
       }
       
-      await this._saveToStorage(
-        this._roomsDataCache,
-        this._userIndex,
-        this.currentNumber
-      );
-      await this.ctx.storage.put("onlineUsers", Array.from(this._onlineUsers));
-      await this._updateUserCounts();
+      await this._syncAllData();
       
       this._refreshRoomClients(true);
       
@@ -963,8 +969,7 @@ export class ChatServer {
       }
       
       if (changed) {
-        await this._saveToStorage(undefined, this._userIndex, undefined);
-        await this.ctx.storage.put("onlineUsers", Array.from(this._onlineUsers));
+        await this._syncAllData();
       }
       
     } catch(e) {}
@@ -1206,7 +1211,7 @@ export class ChatServer {
           if (!roomData) {
             roomData = { seats: {}, points: {}, muted: false, number: 1 };
             this._roomsDataCache[multiRoomname] = roomData;
-            await this._saveToStorage(this._roomsDataCache, undefined, undefined);
+            await this._syncAllData();
           }
           
           const seatCount = Object.keys(roomData.seats).length;
@@ -1232,16 +1237,12 @@ export class ChatServer {
             viptanda: 0
           };
           
-          await this._saveToStorage(this._roomsDataCache, undefined, undefined);
-          
           this._addUserToIndex(multiUsername, multiRoomname, seat);
           this._setUserMulti(multiUsername, true);
           
-          await this._saveToStorage(undefined, this._userIndex, undefined);
-          
           this._onlineUsers.add(multiUsername);
-          await this.ctx.storage.put("onlineUsers", Array.from(this._onlineUsers));
-          await this._updateUserCounts();
+          
+          await this._syncAllData();
           
           ws.serializeAttachment({
             username: multiUsername,
@@ -1325,7 +1326,7 @@ export class ChatServer {
           const seatNumber = userSeat.seat;
           
           this._setUserMulti(targetUsername, true);
-          await this._saveToStorage(undefined, this._userIndex, undefined);
+          await this._syncAllData();
           
           this._onlineUsers.add(targetUsername);
           await this.ctx.storage.put("onlineUsers", Array.from(this._onlineUsers));
@@ -1412,13 +1413,7 @@ export class ChatServer {
               this._onlineUsers.delete(targetUsername);
             }
             
-            await this._saveToStorage(
-              this._roomsDataCache,
-              this._userIndex,
-              this.currentNumber
-            );
-            await this.ctx.storage.put("onlineUsers", Array.from(this._onlineUsers));
-            await this._updateUserCounts();
+            await this._syncAllData();
             
             const webSockets = this._getActiveWebSockets();
             for (const wsKey of webSockets) {
@@ -1665,7 +1660,7 @@ export class ChatServer {
           const roomData = this._roomsDataCache[muteRoom];
           if (roomData) {
             roomData.muted = !!muteVal;
-            await this._saveToStorage(this._roomsDataCache, undefined, undefined);
+            await this._syncAllData();
           }
           
           this.broadcast(muteRoom, ["muteStatusChanged", !!muteVal, muteRoom]);
@@ -1763,12 +1758,7 @@ export class ChatServer {
       this._refreshRoomClients(true);
       await this._updateUserCounts();
       
-      await this._saveToStorage(
-        this._roomsDataCache,
-        this._userIndex,
-        this.currentNumber
-      );
-      await this.ctx.storage.put("onlineUsers", Array.from(this._onlineUsers));
+      await this._syncAllData();
       
       if (!this.closing && !this.isDestroyed) {
         const existingAlarm = await this.ctx.storage.getAlarm();

@@ -1,5 +1,5 @@
 // ==================== CHAT-SERVER-HIBERNATION-FULL-FIXED.JS ====================
-// VERSION: 9.6.0 - FIXED MULTI ID
+// VERSION: 9.6.0 - FIXED MULTI USER DATA PERSISTENCE
 
 const C = {
   MAX_SEATS: 45,
@@ -47,13 +47,10 @@ export class ChatServer {
     this._saveQueue = [];
     this._isSaving = false;
     
-    // ============ FIX: TRACK WS ID TO USER MAPPING ============
+    // Track WS ID to user mapping
     this._wsIdToUser = new Map();
     
-    // ============ FIX: TRACK ACTIVE MULTI USERS ============
-    this._activeMultiUsers = new Set();
-    
-    // ============ RESTORE STATE TERLEBIH DAHULU ============
+    // Restore state terlebih dahulu
     this._restoreAllState().then(() => {
       if (!this.closing && !this.isDestroyed) {
         this.ctx.storage.setAlarm(Date.now() + C.NUMBER_INTERVAL_MS);
@@ -71,7 +68,7 @@ export class ChatServer {
     }
   }
 
-  // ============ FIX: RESTORE USER STATE DARI WEBSOCKET ============
+  // ============ RESTORE WEB SOCKET STATE ============
   _restoreWebSocketState(ws) {
     if (!ws) return false;
     
@@ -101,13 +98,6 @@ export class ChatServer {
           this._userSeatDataCache[attachment.username] = attachment.seatInfo;
         }
         
-        // ============ FIX: Jika multi, tambahkan ke active multi ============
-        if (attachment.isMulti) {
-          this._activeMultiUsers.add(attachment.username);
-        } else {
-          this._activeMultiUsers.delete(attachment.username);
-        }
-        
         this._wsIdToUser.set(ws._wsId, attachment.username);
         return true;
       }
@@ -135,12 +125,6 @@ export class ChatServer {
             seatInfo: seatInfo
           });
         } catch(e) {}
-        
-        if (seatInfo.isMulti) {
-          this._activeMultiUsers.add(ws.username);
-        } else {
-          this._activeMultiUsers.delete(ws.username);
-        }
         
         this._wsIdToUser.set(ws._wsId, ws.username);
         return true;
@@ -175,7 +159,6 @@ export class ChatServer {
                 });
               } catch(e) {}
               
-              this._activeMultiUsers.delete(ws.username);
               this._wsIdToUser.set(ws._wsId, ws.username);
               return true;
             }
@@ -189,7 +172,7 @@ export class ChatServer {
     }
   }
 
-  // ============ FIX: GET USER SEAT DENGAN FALLBACK ============
+  // ============ GET USER SEAT ============
   _getUserSeat(username) {
     if (!username) return null;
     
@@ -362,11 +345,20 @@ export class ChatServer {
 
   // ============ CLEANUP USER DATA ============
 
-  async _cleanupAllUserData(username) {
+  async _cleanupAllUserData(username, preserveMulti = false) {
     if (!username) return false;
+    
+    // Jika preserveMulti true dan user adalah multi, jangan hapus
+    if (preserveMulti) {
+      const seatInfo = this._userSeatDataCache[username];
+      if (seatInfo && seatInfo.isMulti) {
+        return false;
+      }
+    }
     
     let removed = false;
     
+    // 1. Hapus dari semua room
     for (const [roomName, roomData] of Object.entries(this._roomsDataCache)) {
       if (!roomData || !roomData.seats) continue;
       
@@ -391,28 +383,26 @@ export class ChatServer {
       }
     }
     
+    // 2. Hapus dari user seat data
     if (this._userSeatDataCache[username]) {
       delete this._userSeatDataCache[username];
       removed = true;
     }
     
+    // 3. Hapus dari online users
     if (this._onlineUsers.has(username)) {
       this._onlineUsers.delete(username);
       removed = true;
     }
     
-    // ============ FIX: Hapus dari active multi ============
-    if (this._activeMultiUsers.has(username)) {
-      this._activeMultiUsers.delete(username);
-      removed = true;
-    }
-    
+    // 4. Hapus dari WS mapping
     for (const [wsId, uname] of this._wsIdToUser) {
       if (uname === username) {
         this._wsIdToUser.delete(wsId);
       }
     }
     
+    // 5. Sync save ke storage
     if (removed) {
       await this._syncSave(
         this._roomsDataCache,
@@ -427,7 +417,7 @@ export class ChatServer {
   }
 
   async _removeUserFromAllRooms(username) {
-    return await this._cleanupAllUserData(username);
+    return await this._cleanupAllUserData(username, true); // Preserve multi
   }
 
   async _isUserInAnyRoom(username) {
@@ -447,10 +437,13 @@ export class ChatServer {
           }
         }
       }
-      delete this._userSeatDataCache[username];
-      await this._syncSave(undefined, this._userSeatDataCache, undefined);
-      this._onlineUsers.delete(username);
-      await this.ctx.storage.put("onlineUsers", Array.from(this._onlineUsers));
+      // Hanya hapus jika bukan multi
+      if (!seatInfo.isMulti) {
+        delete this._userSeatDataCache[username];
+        await this._syncSave(undefined, this._userSeatDataCache, undefined);
+        this._onlineUsers.delete(username);
+        await this.ctx.storage.put("onlineUsers", Array.from(this._onlineUsers));
+      }
     }
     
     for (const [roomName, roomData] of Object.entries(this._roomsDataCache)) {
@@ -499,11 +492,13 @@ export class ChatServer {
     if (roomData.points) {
       delete roomData.points[seat];
     }
-    delete this._userSeatDataCache[username];
-    this._onlineUsers.delete(username);
     
-    // ============ FIX: Hapus dari active multi ============
-    this._activeMultiUsers.delete(username);
+    // Hanya hapus dari cache jika bukan multi
+    const seatInfo = this._userSeatDataCache[username];
+    if (!seatInfo || !seatInfo.isMulti) {
+      delete this._userSeatDataCache[username];
+      this._onlineUsers.delete(username);
+    }
     
     await this._syncSave(
       this._roomsDataCache,
@@ -551,10 +546,15 @@ export class ChatServer {
   }
 
   async _deleteUserSeat(username) {
+    const seatInfo = this._userSeatDataCache[username];
+    // Jangan hapus jika multi
+    if (seatInfo && seatInfo.isMulti) {
+      return;
+    }
+    
     delete this._userSeatDataCache[username];
     await this._syncSave(undefined, this._userSeatDataCache, undefined);
     this._onlineUsers.delete(username);
-    this._activeMultiUsers.delete(username);
     await this.ctx.storage.put("onlineUsers", Array.from(this._onlineUsers));
     await this._updateUserCounts();
   }
@@ -582,7 +582,14 @@ export class ChatServer {
     
     const username = ws.username;
     
-    await this._cleanupAllUserData(username);
+    // Cek jika user adalah multi, jangan hapus
+    const seatInfo = this._userSeatDataCache[username];
+    if (seatInfo && seatInfo.isMulti) {
+      this.safeSend(ws, ["error", "User is in multi mode, cannot join regular room"]);
+      return false;
+    }
+    
+    await this._cleanupAllUserData(username, true); // Preserve multi
     
     let roomData = this._roomsDataCache[roomName];
     if (!roomData) {
@@ -623,12 +630,11 @@ export class ChatServer {
     
     await this._syncSave(this._roomsDataCache, undefined, undefined);
     
-    const seatInfo = { room: roomName, seat, isMulti: false };
-    this._userSeatDataCache[username] = seatInfo;
+    const newSeatInfo = { room: roomName, seat, isMulti: false };
+    this._userSeatDataCache[username] = newSeatInfo;
     await this._syncSave(undefined, this._userSeatDataCache, undefined);
     
     this._onlineUsers.add(username);
-    this._activeMultiUsers.delete(username);
     await this.ctx.storage.put("onlineUsers", Array.from(this._onlineUsers));
     await this._updateUserCounts();
     
@@ -637,7 +643,7 @@ export class ChatServer {
       room: roomName,
       seat: seat,
       isMulti: false,
-      seatInfo: seatInfo
+      seatInfo: newSeatInfo
     };
     
     try {
@@ -701,18 +707,16 @@ export class ChatServer {
       }
       
       if (username) {
-        // ============ FIX: Jangan hapus multi user dari active multi ============
-        // Cek apakah ini multi user yang sedang active
-        if (this._activeMultiUsers.has(username)) {
-          // Multi user tetap dianggap online, tapi hapus WS mapping
+        // Cek jika user adalah multi, jangan hapus
+        const seatInfo = this._userSeatDataCache[username];
+        if (seatInfo && seatInfo.isMulti) {
+          // Multi user tetap dipertahankan, hanya hapus WS mapping
           if (ws._wsId) {
             this._wsIdToUser.delete(ws._wsId);
           }
-          // Jangan hapus data, tetap dianggap online
-        } else {
-          // Non-multi user, hapus semua data
-          await this._cleanupAllUserData(username);
+          return;
         }
+        await this._cleanupAllUserData(username, true);
       }
       
       if (ws._wsId) {
@@ -917,9 +921,6 @@ export class ChatServer {
         } catch(e) {}
       }
       
-      // ============ FIX: Gabungkan dengan active multi users ============
-      const allActiveUsers = new Set([...connectedUsers, ...this._activeMultiUsers]);
-      
       for (const [username, seatInfo] of Object.entries(this._userSeatDataCache)) {
         if (!seatInfo || !seatInfo.room) {
           delete this._userSeatDataCache[username];
@@ -927,8 +928,12 @@ export class ChatServer {
           continue;
         }
         
-        // ============ FIX: Cek apakah user masih active (WS atau multi) ============
-        if (!allActiveUsers.has(username)) {
+        // JANGAN HAPUS USER MULTI
+        if (seatInfo.isMulti) {
+          continue;
+        }
+        
+        if (!connectedUsers.has(username)) {
           delete this._userSeatDataCache[username];
           changed = true;
         }
@@ -1001,7 +1006,14 @@ export class ChatServer {
     
     if (ws.readyState !== 1) return;
     
-    await this._cleanupAllUserData(username);
+    // Cek jika user adalah multi, jangan hapus
+    const seatInfo = this._userSeatDataCache[username];
+    if (seatInfo && seatInfo.isMulti) {
+      this.safeSend(ws, ["error", "Cannot set ID for multi user"]);
+      return;
+    }
+    
+    await this._cleanupAllUserData(username, true);
     
     ws.username = username;
     ws.idtarget = username;
@@ -1018,9 +1030,6 @@ export class ChatServer {
       ws._wsId = Date.now() + '_' + Math.random().toString(36).substring(2, 8);
     }
     this._wsIdToUser.set(ws._wsId, username);
-    
-    // ============ FIX: Hapus dari active multi ============
-    this._activeMultiUsers.delete(username);
     
     try {
       ws.serializeAttachment({ username: username });
@@ -1086,7 +1095,7 @@ export class ChatServer {
           const isNewUser = args[1];
           
           if (username) {
-            await this._cleanupAllUserData(username);
+            await this._cleanupAllUserData(username, true);
           }
           
           await this._handleSetId(ws, username, isNewUser);
@@ -1111,7 +1120,7 @@ export class ChatServer {
             break;
           }
           
-          await this._cleanupAllUserData(multiUsername);
+          await this._cleanupAllUserData(multiUsername, true);
           
           let roomData = this._roomsDataCache[multiRoomname];
           if (!roomData) {
@@ -1163,10 +1172,6 @@ export class ChatServer {
           await this._syncSave(undefined, this._userSeatDataCache, undefined);
           
           this._onlineUsers.add(multiUsername);
-          
-          // ============ FIX: Tambahkan ke active multi ============
-          this._activeMultiUsers.add(multiUsername);
-          
           await this.ctx.storage.put("onlineUsers", Array.from(this._onlineUsers));
           await this._updateUserCounts();
           
@@ -1226,7 +1231,6 @@ export class ChatServer {
                   wsKey._wsId = Date.now() + '_' + Math.random().toString(36).substring(2, 8);
                 }
                 this._wsIdToUser.set(wsKey._wsId, multiUsername);
-                this._activeMultiUsers.add(multiUsername);
               }
             } catch(e) {}
           }
@@ -1273,13 +1277,6 @@ export class ChatServer {
           
           const roomName = userSeat.room;
           const seatNumber = userSeat.seat;
-          
-          // ============ FIX: Hanya set active untuk user ini ============
-          // Hapus semua active multi users
-          this._activeMultiUsers.clear();
-          
-          // Tambahkan user ini
-          this._activeMultiUsers.add(targetUsername);
           
           this._userSeatDataCache[targetUsername] = {
             room: roomName,
@@ -1366,10 +1363,6 @@ export class ChatServer {
           }
           
           try {
-            // ============ FIX: Hapus dari active multi ============
-            this._activeMultiUsers.delete(targetUsername);
-            
-            // Hapus data user
             await this._cleanupAllUserData(targetUsername);
             
             const webSockets = this._getActiveWebSockets();
@@ -1488,7 +1481,7 @@ export class ChatServer {
           }
           
           if (username) {
-            await this._cleanupAllUserData(username);
+            await this._cleanupAllUserData(username, true);
           }
           break;
         }
@@ -1554,32 +1547,30 @@ export class ChatServer {
           break;
         }
         
-        // ============ FIX: isUserOnline untuk multi selalu true ============
         case "isUserOnline": {
           const [onlineTarget, onlineCallback] = args;
           let isOnline = false;
+          const userSeat = this._getUserSeat(onlineTarget);
           
-          // ============ FIX: Cek apakah user adalah active multi ============
-          if (this._activeMultiUsers.has(onlineTarget)) {
-            isOnline = true;
-          } else {
-            const userSeat = this._getUserSeat(onlineTarget);
-            
-            if (userSeat) {
-              if (userSeat.isMulti) {
-                isOnline = true;
-              } else {
-                const webSockets = this._getActiveWebSockets();
-                for (const wsKey of webSockets) {
-                  try {
-                    this._restoreWebSocketState(wsKey);
-                    const uname = wsKey._cachedUsername || wsKey.username;
-                    if (uname === onlineTarget && wsKey.readyState === 1 && !wsKey._isMulti) {
+          if (userSeat) {
+            // Jika user ada di multi room, SELALU online
+            if (userSeat.isMulti) {
+              isOnline = true;
+            } else {
+              // Cek WebSocket aktif untuk non-multi
+              const webSockets = this._getActiveWebSockets();
+              for (const wsKey of webSockets) {
+                try {
+                  this._restoreWebSocketState(wsKey);
+                  const uname = wsKey._cachedUsername || wsKey.username;
+                  if (uname === onlineTarget && wsKey.readyState === 1) {
+                    // Pastikan bukan multi
+                    if (!wsKey._isMulti) {
                       isOnline = true;
                       break;
                     }
-                  } catch(e) {}
-                }
+                  }
+                } catch(e) {}
               }
             }
           }
@@ -1590,30 +1581,30 @@ export class ChatServer {
         
         case "getOnlineUsers": {
           const users = [];
+          // Ambil semua user dari userSeatDataCache
           for (const [username, seatInfo] of Object.entries(this._userSeatDataCache)) {
             if (seatInfo) {
-              // ============ FIX: Multi user selalu dianggap online ============
-              if (seatInfo.isMulti || this._activeMultiUsers.has(username)) {
+              // Jika multi, langsung tambahkan
+              if (seatInfo.isMulti) {
                 users.push(username);
               } else {
+                // Cek WebSocket aktif untuk non-multi
                 const webSockets = this._getActiveWebSockets();
+                let found = false;
                 for (const wsKey of webSockets) {
                   try {
                     this._restoreWebSocketState(wsKey);
                     const uname = wsKey._cachedUsername || wsKey.username;
                     if (uname === username && wsKey.readyState === 1 && !wsKey._isMulti) {
-                      users.push(username);
+                      found = true;
                       break;
                     }
                   } catch(e) {}
                 }
+                if (found) {
+                  users.push(username);
+                }
               }
-            }
-          }
-          // ============ FIX: Tambahkan semua active multi users ============
-          for (const multiUser of this._activeMultiUsers) {
-            if (!users.includes(multiUser)) {
-              users.push(multiUser);
             }
           }
           this.safeSend(ws, ["allOnlineUsers", users]);
@@ -1701,26 +1692,20 @@ export class ChatServer {
       this._userCounts = userCounts;
       this._onlineUsers = new Set(onlineUsers);
       
-      // ============ FIX: Restore active multi users ============
-      for (const [username, seatInfo] of Object.entries(this._userSeatDataCache)) {
-        if (seatInfo && seatInfo.isMulti) {
-          this._activeMultiUsers.add(username);
-        }
-      }
-      
-      // Validasi data
+      // Validasi data - jangan hapus multi
       for (const [username, seatInfo] of Object.entries(this._userSeatDataCache)) {
         if (!seatInfo || !seatInfo.room) {
           delete this._userSeatDataCache[username];
           this._onlineUsers.delete(username);
-          this._activeMultiUsers.delete(username);
           continue;
         }
         const roomData = this._roomsDataCache[seatInfo.room];
         if (!roomData || !roomData.seats || !roomData.seats[seatInfo.seat]) {
-          delete this._userSeatDataCache[username];
-          this._onlineUsers.delete(username);
-          this._activeMultiUsers.delete(username);
+          // Hanya hapus jika bukan multi
+          if (!seatInfo.isMulti) {
+            delete this._userSeatDataCache[username];
+            this._onlineUsers.delete(username);
+          }
         }
       }
       
@@ -1763,7 +1748,6 @@ export class ChatServer {
       this._userSeatDataCache = {};
       this.currentNumber = 1;
       this._onlineUsers.clear();
-      this._activeMultiUsers.clear();
       this._userCounts = {};
       for (const room of ROOMS) {
         this._userCounts[room] = 0;
@@ -1937,7 +1921,6 @@ export class ChatServer {
     
     this.roomClients.clear();
     this._onlineUsers.clear();
-    this._activeMultiUsers.clear();
     this._wsIdToUser.clear();
     
     try {

@@ -1,5 +1,5 @@
 // ==================== CHAT-SERVER-HIBERNATION-NO-PING.JS ====================
-// VERSION: 9.9.5 - FIXED EXIT & REJOIN DATA CORRUPTION
+// VERSION: 9.9.6 - MERGED WITH MULTI ID LOGIC FROM V3.0.0
 
 const C = {
   MAX_SEATS: 45,
@@ -7,6 +7,10 @@ const C = {
   MAX_MESSAGE_SIZE: 5000,
   NUMBER_INTERVAL_MS: 900000,
   MAX_NUMBER: 6,
+  LOCK_TIMEOUT: 10000,
+  BATCH_SIZE: 20,
+  MAX_EVENT_QUEUE: 100,
+  MAX_PROCESS_TIME_MS: 500,
 };
 
 const ROOMS = [
@@ -46,6 +50,21 @@ export class ChatServer {
     this._lastRefreshTime = 0;
     this._multiJoinLock = false;
     
+    // ========== MULTI ID TRACKING (DARI V3.0.0) ==========
+    this.wsActiveMulti = new Map();  // ws -> { username, room }
+    this.userConnections = new Map(); // username -> Set(ws)
+    this.userSeat = new Map();       // username -> { room, seat, isMulti }
+    this.userRoom = new Map();       // username -> room
+    
+    // ========== LOCKS ==========
+    this._joinLocks = new Map();
+    this._kursiLocks = new Map();
+    
+    // ========== EVENT QUEUE ==========
+    this._eventQueue = [];
+    this._isProcessingQueue = false;
+    this._processingMessages = new Set();
+    
     this._checkAndResetOnDeploy().then(() => {
       this._restoreAllState().then(() => {});
     });
@@ -66,7 +85,7 @@ export class ChatServer {
   async _checkAndResetOnDeploy() {
     try {
       const storedVersion = await this.ctx.storage.get("deployVersion");
-      const currentVersion = "9.9.5";
+      const currentVersion = "9.9.6";
       
       if (storedVersion !== currentVersion) {
         this._roomsDataCache = {};
@@ -130,6 +149,7 @@ export class ChatServer {
           }
         }
         
+        // CEK MULTI ACTIVE
         if (room && username) {
           const roomClients = this.roomClients.get(room);
           if (roomClients) {
@@ -370,6 +390,11 @@ export class ChatServer {
     this._removeUserFromAllIndex(username);
     this._onlineUsers.delete(username);
     
+    // CLEANUP MULTI TRACKING
+    this.userSeat.delete(username);
+    this.userRoom.delete(username);
+    this.userConnections.delete(username);
+    
     if (removed) {
       await this._syncAllData();
     }
@@ -388,21 +413,21 @@ export class ChatServer {
     const roomData = this._roomsDataCache[roomName];
     if (!roomData || !roomData.seats || !roomData.seats[seat]) return false;
     
-    // HAPUS DARI SEATS
     delete roomData.seats[seat];
     if (roomData.points) {
       delete roomData.points[seat];
     }
     
-    // HAPUS DARI INDEX
     this._removeUserFromIndex(username, roomName);
     
-    // HAPUS DARI ONLINE USERS
     if (!this._isUserMulti(username)) {
       this._onlineUsers.delete(username);
     }
     
-    // BROADCAST
+    // CLEANUP MULTI TRACKING
+    this.userSeat.delete(username);
+    this.userRoom.delete(username);
+    
     this.broadcast(roomName, ["removeKursi", roomName, seat]);
     await this.updateRoomCount(roomName);
     await this._deleteRoomIfEmpty(roomName);
@@ -539,6 +564,9 @@ export class ChatServer {
       for (const username of usersToRemove) {
         delete this._userIndex[username];
         this._onlineUsers.delete(username);
+        this.userSeat.delete(username);
+        this.userRoom.delete(username);
+        this.userConnections.delete(username);
         cleaned++;
       }
       
@@ -669,7 +697,7 @@ export class ChatServer {
     return { inconsistencies: inconsistencies, fixed: fixed };
   }
 
-  // ============ JOIN HANDLING - FIXED ============
+  // ============ JOIN HANDLING ============
 
   async _handleJoin(ws, roomName) {
     if (!ws || !ws.username || !roomName || !ROOMS_SET.has(roomName) || this.closing || this.isDestroyed) {
@@ -678,36 +706,190 @@ export class ChatServer {
     
     const username = ws.username;
     const isMulti = ws._isMulti || this._isUserMulti(username);
+    const lockKey = `join_${roomName}_${username}`;
     
-    // STEP 1: CEK APAKAH USER SUDAH PUNYA KURSI DI ROOM INI
-    const existingSeat = this._getUserSeat(username, roomName);
-    if (existingSeat !== null) {
-      // ✅ VERIFIKASI - PASTIKAN DATA DI KURSI SESUAI
-      const roomData = this._roomsDataCache[roomName];
-      if (roomData && roomData.seats && roomData.seats[existingSeat]) {
-        const seatData = roomData.seats[existingSeat];
-        if (seatData.namauser !== username) {
-          // DATA CORRUPT! PERBAIKI
-          seatData.namauser = username;
-          await this._syncAllData();
+    if (this._joinLocks.has(lockKey)) {
+      this.safeSend(ws, ["roomFull", roomName]);
+      return false;
+    }
+    
+    this._joinLocks.set(lockKey, Date.now());
+    
+    try {
+      // STEP 1: CEK APAKAH USER SUDAH PUNYA KURSI DI ROOM INI
+      const existingSeat = this._getUserSeat(username, roomName);
+      if (existingSeat !== null) {
+        const roomData = this._roomsDataCache[roomName];
+        if (roomData && roomData.seats && roomData.seats[existingSeat]) {
+          const seatData = roomData.seats[existingSeat];
+          if (seatData.namauser !== username) {
+            seatData.namauser = username;
+            await this._syncAllData();
+          }
+        }
+        
+        this.safeSend(ws, ["rooMasuk", existingSeat, roomName]);
+        this.safeSend(ws, ["numberKursiSaya", existingSeat]);
+        
+        ws.serializeAttachment({
+          username: username,
+          room: roomName,
+          seat: existingSeat,
+          isMulti: isMulti
+        });
+        
+        ws._cachedRoom = roomName;
+        ws._cachedUsername = username;
+        ws.room = roomName;
+        ws.roomname = roomName;
+        ws._multiSeat = existingSeat;
+        
+        // UPDATE MULTI TRACKING
+        this._updateUserConnection(username, ws);
+        this.userSeat.set(username, { room: roomName, seat: existingSeat, isMulti: isMulti });
+        this.userRoom.set(username, roomName);
+        
+        const roomClients = this.roomClients.get(roomName);
+        if (roomClients && !roomClients.has(ws)) roomClients.add(ws);
+        
+        setTimeout(() => {
+          try {
+            if (ws && ws.readyState === 1) {
+              this.sendAllStateTo(ws, roomName, true);
+            }
+          } catch(e) {}
+        }, 1000);
+        
+        return true;
+      }
+      
+      // STEP 2: BERSIHKAN USER DARI SEMUA ROOM LAIN
+      const userRooms = this._getUserRooms(username);
+      for (const [roomNameLoop, seat] of Object.entries(userRooms)) {
+        const roomData = this._roomsDataCache[roomNameLoop];
+        if (roomData && roomData.seats && roomData.seats[seat]) {
+          if (roomData.seats[seat].namauser === username) {
+            delete roomData.seats[seat];
+            if (roomData.points) {
+              delete roomData.points[seat];
+            }
+            this.broadcast(roomNameLoop, ["removeKursi", roomNameLoop, seat]);
+            await this.updateRoomCount(roomNameLoop);
+            await this._deleteRoomIfEmpty(roomNameLoop);
+          }
         }
       }
       
-      this.safeSend(ws, ["rooMasuk", existingSeat, roomName]);
-      this.safeSend(ws, ["numberKursiSaya", existingSeat]);
+      // STEP 3: BERSIHKAN INDEX
+      this._removeUserFromAllIndex(username);
+      this._onlineUsers.delete(username);
+      
+      if (isMulti) {
+        this._setUserMulti(username, true);
+      }
+      
+      await this._syncAllData();
+      
+      // STEP 4: PREPARE ROOM DATA
+      let roomData = this._roomsDataCache[roomName];
+      if (!roomData) {
+        roomData = { seats: {}, points: {}, muted: false, number: 1 };
+        this._roomsDataCache[roomName] = roomData;
+        await this._syncAllData();
+      }
+      
+      // STEP 5: DOUBLE CHECK - HAPUS SEMUA DUPLIKAT DI ROOM TUJUAN
+      const seatsToRemove = [];
+      for (const [existingSeatNum, existingData] of Object.entries(roomData.seats)) {
+        if (existingData && existingData.namauser === username) {
+          seatsToRemove.push(parseInt(existingSeatNum));
+        }
+      }
+      
+      for (const seatNum of seatsToRemove) {
+        delete roomData.seats[seatNum];
+        if (roomData.points) {
+          delete roomData.points[seatNum];
+        }
+        this.broadcast(roomName, ["removeKursi", roomName, seatNum]);
+      }
+      
+      // STEP 6: CEK KAPASITAS
+      const seatCount = Object.keys(roomData.seats).length;
+      if (seatCount >= C.MAX_SEATS) {
+        this.safeSend(ws, ["roomFull", roomName]);
+        return false;
+      }
+      
+      // STEP 7: CARI KURSI TERSEDIA
+      let seat = this._findAvailableSeat(roomData, username);
+      if (!seat) {
+        this.safeSend(ws, ["roomFull", roomName]);
+        return false;
+      }
+      
+      // STEP 8: PASTIKAN KURSI TIDAK TERISI
+      if (roomData.seats[seat] && roomData.seats[seat].namauser) {
+        const newSeat = this._findAvailableSeat(roomData, username);
+        if (!newSeat) {
+          this.safeSend(ws, ["roomFull", roomName]);
+          return false;
+        }
+        seat = newSeat;
+      }
+      
+      // STEP 9: ASSIGN KURSI
+      roomData.seats[seat] = {
+        noimageUrl: "",
+        namauser: username,
+        color: "",
+        itembawah: 0,
+        itematas: 0,
+        vip: 0,
+        viptanda: 0
+      };
+      
+      this._addUserToIndex(username, roomName, seat);
+      this._setUserMulti(username, isMulti);
+      this._onlineUsers.add(username);
+      
+      await this._syncAllData();
       
       ws.serializeAttachment({
         username: username,
         room: roomName,
-        seat: existingSeat,
+        seat: seat,
         isMulti: isMulti
       });
       
       ws._cachedRoom = roomName;
       ws._cachedUsername = username;
+      ws.username = username;
       ws.room = roomName;
       ws.roomname = roomName;
-      ws._multiSeat = existingSeat;
+      ws.idtarget = username;
+      ws._isMulti = isMulti;
+      ws._multiRoom = isMulti ? roomName : null;
+      ws._multiSeat = isMulti ? seat : null;
+      
+      // UPDATE MULTI TRACKING
+      this._updateUserConnection(username, ws);
+      this.userSeat.set(username, { room: roomName, seat: seat, isMulti: isMulti });
+      this.userRoom.set(username, roomName);
+      
+      const roomClients = this.roomClients.get(roomName);
+      if (roomClients && !roomClients.has(ws)) roomClients.add(ws);
+      
+      this._refreshRoomClients(true);
+      
+      this.safeSend(ws, ["rooMasuk", seat, roomName]);
+      this.safeSend(ws, ["numberKursiSaya", seat]);
+      this.safeSend(ws, ["muteTypeResponse", roomData.muted || false, roomName]);
+      
+      const count = Object.keys(roomData.seats).length;
+      this.safeSend(ws, ["roomUserCount", roomName, count]);
+      this.broadcast(roomName, ["roomUserCount", roomName, count]);
+      this.broadcast(roomName, ["kursiBatchUpdate", roomName, [[seat, roomData.seats[seat]]]]);
       
       setTimeout(() => {
         try {
@@ -718,140 +900,25 @@ export class ChatServer {
       }, 1000);
       
       return true;
+      
+    } finally {
+      this._joinLocks.delete(lockKey);
     }
+  }
+
+  // ============ MULTI TRACKING HELPERS ============
+  
+  _updateUserConnection(username, ws) {
+    if (!username || !ws) return;
     
-    // STEP 2: BERSIHKAN USER DARI SEMUA ROOM LAIN
-    const userRooms = this._getUserRooms(username);
-    for (const [roomNameLoop, seat] of Object.entries(userRooms)) {
-      const roomData = this._roomsDataCache[roomNameLoop];
-      if (roomData && roomData.seats && roomData.seats[seat]) {
-        if (roomData.seats[seat].namauser === username) {
-          delete roomData.seats[seat];
-          if (roomData.points) {
-            delete roomData.points[seat];
-          }
-          this.broadcast(roomNameLoop, ["removeKursi", roomNameLoop, seat]);
-          await this.updateRoomCount(roomNameLoop);
-          await this._deleteRoomIfEmpty(roomNameLoop);
-        }
-      }
+    let connections = this.userConnections.get(username);
+    if (!connections) {
+      connections = new Set();
+      this.userConnections.set(username, connections);
     }
-    
-    // STEP 3: BERSIHKAN INDEX
-    this._removeUserFromAllIndex(username);
-    this._onlineUsers.delete(username);
-    
-    if (isMulti) {
-      this._setUserMulti(username, true);
+    if (!connections.has(ws)) {
+      connections.add(ws);
     }
-    
-    await this._syncAllData();
-    
-    // STEP 4: PREPARE ROOM DATA
-    let roomData = this._roomsDataCache[roomName];
-    if (!roomData) {
-      roomData = { seats: {}, points: {}, muted: false, number: 1 };
-      this._roomsDataCache[roomName] = roomData;
-      await this._syncAllData();
-    }
-    
-    // STEP 5: DOUBLE CHECK - HAPUS SEMUA DUPLIKAT DI ROOM TUJUAN
-    const seatsToRemove = [];
-    for (const [existingSeatNum, existingData] of Object.entries(roomData.seats)) {
-      if (existingData && existingData.namauser === username) {
-        seatsToRemove.push(parseInt(existingSeatNum));
-      }
-    }
-    
-    for (const seatNum of seatsToRemove) {
-      delete roomData.seats[seatNum];
-      if (roomData.points) {
-        delete roomData.points[seatNum];
-      }
-      this.broadcast(roomName, ["removeKursi", roomName, seatNum]);
-    }
-    
-    // STEP 6: CEK KAPASITAS
-    const seatCount = Object.keys(roomData.seats).length;
-    if (seatCount >= C.MAX_SEATS) {
-      this.safeSend(ws, ["roomFull", roomName]);
-      return false;
-    }
-    
-    // STEP 7: CARI KURSI TERSEDIA
-    let seat = this._findAvailableSeat(roomData, username);
-    if (!seat) {
-      this.safeSend(ws, ["roomFull", roomName]);
-      return false;
-    }
-    
-    // STEP 8: PASTIKAN KURSI TIDAK TERISI
-    if (roomData.seats[seat] && roomData.seats[seat].namauser) {
-      const newSeat = this._findAvailableSeat(roomData, username);
-      if (!newSeat) {
-        this.safeSend(ws, ["roomFull", roomName]);
-        return false;
-      }
-      seat = newSeat;
-    }
-    
-    // STEP 9: ASSIGN KURSI DENGAN USERNAME YANG BENAR
-    roomData.seats[seat] = {
-      noimageUrl: "",
-      namauser: username,  // ← PASTIKAN USERNAME YANG BENAR
-      color: "",
-      itembawah: 0,
-      itematas: 0,
-      vip: 0,
-      viptanda: 0
-    };
-    
-    this._addUserToIndex(username, roomName, seat);
-    this._setUserMulti(username, isMulti);
-    this._onlineUsers.add(username);
-    
-    await this._syncAllData();
-    
-    // STEP 10: UPDATE WEBSOCKET ATTACHMENT
-    ws.serializeAttachment({
-      username: username,
-      room: roomName,
-      seat: seat,
-      isMulti: isMulti
-    });
-    
-    ws._cachedRoom = roomName;
-    ws._cachedUsername = username;
-    ws.username = username;
-    ws.room = roomName;
-    ws.roomname = roomName;
-    ws.idtarget = username;
-    ws._isMulti = isMulti;
-    ws._multiRoom = isMulti ? roomName : null;
-    ws._multiSeat = isMulti ? seat : null;
-    
-    this._refreshRoomClients(true);
-    
-    this.safeSend(ws, ["rooMasuk", seat, roomName]);
-    this.safeSend(ws, ["numberKursiSaya", seat]);
-    this.safeSend(ws, ["muteTypeResponse", roomData.muted || false, roomName]);
-    
-    const count = Object.keys(roomData.seats).length;
-    this.safeSend(ws, ["roomUserCount", roomName, count]);
-    this.broadcast(roomName, ["roomUserCount", roomName, count]);
-    
-    // BROADCAST UPDATE KURSI KE SEMUA USER DI ROOM
-    this.broadcast(roomName, ["kursiBatchUpdate", roomName, [[seat, roomData.seats[seat]]]]);
-    
-    setTimeout(() => {
-      try {
-        if (ws && ws.readyState === 1) {
-          this.sendAllStateTo(ws, roomName, true);
-        }
-      } catch(e) {}
-    }, 1000);
-    
-    return true;
   }
 
   // ============ CLEANUP ON DISCONNECT ============
@@ -863,36 +930,69 @@ export class ChatServer {
       
       const isMulti = ws._isMulti || this._isUserMulti(username);
       
-      if (isMulti) {
-        this._onlineUsers.add(username);
-        await this.ctx.storage.put("onlineUsers", Array.from(this._onlineUsers));
-        return;
+      // CLEANUP MULTI TRACKING
+      const activeData = this.wsActiveMulti.get(ws);
+      if (activeData) {
+        this.wsActiveMulti.delete(ws);
       }
       
-      const userRooms = this._getUserRooms(username);
-      
-      for (const [roomNameLoop, seat] of Object.entries(userRooms)) {
-        const roomData = this._roomsDataCache[roomNameLoop];
-        if (roomData && roomData.seats && roomData.seats[seat]) {
-          // ✅ PASTIKAN USERNAME DI KURSI SESUAI
-          if (roomData.seats[seat].namauser === username) {
-            delete roomData.seats[seat];
-            if (roomData.points) {
-              delete roomData.points[seat];
+      const connections = this.userConnections.get(username);
+      if (connections) {
+        connections.delete(ws);
+        if (connections.size === 0) {
+          this.userConnections.delete(username);
+          
+          if (!isMulti) {
+            // HAPUS DARI ROOM
+            const userRooms = this._getUserRooms(username);
+            for (const [roomNameLoop, seat] of Object.entries(userRooms)) {
+              const roomData = this._roomsDataCache[roomNameLoop];
+              if (roomData && roomData.seats && roomData.seats[seat]) {
+                if (roomData.seats[seat].namauser === username) {
+                  delete roomData.seats[seat];
+                  if (roomData.points) {
+                    delete roomData.points[seat];
+                  }
+                  this.broadcast(roomNameLoop, ["removeKursi", roomNameLoop, seat]);
+                  await this.updateRoomCount(roomNameLoop);
+                  await this._deleteRoomIfEmpty(roomNameLoop);
+                }
+              }
             }
             
-            this.broadcast(roomNameLoop, ["removeKursi", roomNameLoop, seat]);
-            await this.updateRoomCount(roomNameLoop);
-            await this._deleteRoomIfEmpty(roomNameLoop);
+            this._removeUserFromAllIndex(username);
+            this._onlineUsers.delete(username);
+            this.userSeat.delete(username);
+            this.userRoom.delete(username);
+            await this._syncAllData();
           }
         }
+      } else if (!isMulti) {
+        // TIDAK ADA KONEKSI, HAPUS SEMUA
+        const userRooms = this._getUserRooms(username);
+        for (const [roomNameLoop, seat] of Object.entries(userRooms)) {
+          const roomData = this._roomsDataCache[roomNameLoop];
+          if (roomData && roomData.seats && roomData.seats[seat]) {
+            if (roomData.seats[seat].namauser === username) {
+              delete roomData.seats[seat];
+              if (roomData.points) {
+                delete roomData.points[seat];
+              }
+              this.broadcast(roomNameLoop, ["removeKursi", roomNameLoop, seat]);
+              await this.updateRoomCount(roomNameLoop);
+              await this._deleteRoomIfEmpty(roomNameLoop);
+            }
+          }
+        }
+        
+        this._removeUserFromAllIndex(username);
+        this._onlineUsers.delete(username);
+        this.userSeat.delete(username);
+        this.userRoom.delete(username);
+        await this._syncAllData();
       }
       
-      // ✅ BERSIHKAN INDEX
-      this._removeUserFromAllIndex(username);
-      this._onlineUsers.delete(username);
-      
-      // ✅ BERSIHKAN WEBSOCKET STATE
+      // RESET WEBSOCKET STATE
       ws._cachedRoom = null;
       ws._cachedUsername = null;
       ws.room = null;
@@ -906,7 +1006,6 @@ export class ChatServer {
         isMulti: false
       });
       
-      await this._syncAllData();
       this._refreshRoomClients(true);
       
     } catch(e) {}
@@ -925,22 +1024,26 @@ export class ChatServer {
     const clientArray = Array.from(clients);
     const toRemove = new Set();
     
-    for (const ws of clientArray) {
-      if (!ws) { toRemove.add(ws); continue; }
+    for (let i = 0; i < clientArray.length; i += C.BATCH_SIZE) {
+      const batch = clientArray.slice(i, Math.min(i + C.BATCH_SIZE, clientArray.length));
       
-      try {
-        const wsRoom = ws._cachedRoom || ws.room || ws.roomname;
-        if (wsRoom !== room) {
-          toRemove.add(ws);
-          continue;
-        }
+      for (const ws of batch) {
+        if (!ws) { toRemove.add(ws); continue; }
         
-        if (ws.readyState === 1 && !ws._closing) {
-          ws.send(msgStr);
-        } else {
-          toRemove.add(ws);
-        }
-      } catch(e) { toRemove.add(ws); }
+        try {
+          const wsRoom = ws._cachedRoom || ws.room || ws.roomname;
+          if (wsRoom !== room) {
+            toRemove.add(ws);
+            continue;
+          }
+          
+          if (ws.readyState === 1 && !ws._closing) {
+            ws.send(msgStr);
+          } else {
+            toRemove.add(ws);
+          }
+        } catch(e) { toRemove.add(ws); }
+      }
     }
     
     if (toRemove.size > 0) {
@@ -1285,12 +1388,33 @@ export class ChatServer {
     
     if (ws.readyState !== 1) return;
     
-    // ✅ BERSIHKAN SEBELUM SET ID
+    // CEK MULTI USER
+    const existingSeatInfo = this.userSeat.get(username);
+    if (existingSeatInfo?.isMulti === true && isNewUser === false) {
+      // MULTI USER ACTIVE
+      this._updateUserConnection(username, ws);
+      
+      ws.username = username;
+      ws.idtarget = username;
+      ws.room = null;
+      ws.roomname = null;
+      ws._closing = false;
+      ws._isMulti = true;
+      
+      ws.serializeAttachment({ 
+        username: username,
+        isMulti: true
+      });
+      
+      this.safeSend(ws, ["multiUserActive", username]);
+      return;
+    }
+    
+    // NORMAL USER
     if (!this._isUserMulti(username)) {
       await this._removeUserFromAllRooms(username);
     }
     
-    // ✅ RESET WEBSOCKET STATE
     ws.username = username;
     ws.idtarget = username;
     ws.room = null;
@@ -1304,10 +1428,38 @@ export class ChatServer {
     
     ws.serializeAttachment({ username: username });
     
+    this._updateUserConnection(username, ws);
+    
     if (isNewUser) { 
       this.safeSend(ws, ["joinroomawal"]); 
     } else { 
       this.safeSend(ws, ["needJoinRoom"]); 
+    }
+  }
+
+  // ============ EVENT QUEUE ============
+  
+  _processEventQueue() {
+    try {
+      if (this._isProcessingQueue || this._eventQueue.length === 0) return;
+      this._isProcessingQueue = true;
+      
+      const startTime = Date.now();
+      let processed = 0;
+      
+      while (this._eventQueue.length > 0 && processed < 5) {
+        if (Date.now() - startTime > C.MAX_PROCESS_TIME_MS) break;
+        
+        const item = this._eventQueue.shift();
+        try {
+          this._handleEventInternal(item.ws, item.data);
+        } catch(e) {}
+        processed++;
+      }
+      
+      this._isProcessingQueue = false;
+    } catch(e) {
+      this._isProcessingQueue = false;
     }
   }
 
@@ -1318,6 +1470,9 @@ export class ChatServer {
         return;
       }
     } catch(e) { return; }
+    
+    if (this._processingMessages.has(ws)) return;
+    this._processingMessages.add(ws);
     
     try {
       let str = typeof raw === 'string' ? raw : new TextDecoder().decode(raw);
@@ -1334,8 +1489,18 @@ export class ChatServer {
         if (room && !ROOMS_SET.has(room)) return;
       }
       
-      await this._handleEventInternal(ws, [evt, ...args]);
-    } catch(e) {}
+      if (this._eventQueue.length < C.MAX_EVENT_QUEUE) {
+        this._eventQueue.push({ ws, data: [evt, ...args] });
+        if (!this._isProcessingQueue) {
+          this._processEventQueue();
+        }
+      }
+      
+    } catch(e) {} finally {
+      try {
+        this._processingMessages.delete(ws);
+      } catch(e) {}
+    }
   }
 
   // ============ EVENT HANDLER ============
@@ -1407,6 +1572,7 @@ export class ChatServer {
           this._multiJoinLock = true;
           
           try {
+            // CEK APAKAH USER SUDAH PUNYA KURSI DI ROOM INI
             const existingSeat = this._getUserSeat(multiUsername, multiRoomname);
             if (existingSeat !== null) {
               this.safeSend(ws, ["rooMasukMulti", existingSeat, multiRoomname]);
@@ -1421,10 +1587,21 @@ export class ChatServer {
               });
               
               ws._multiSeat = existingSeat;
+              
+              // UPDATE MULTI TRACKING
+              this._updateUserConnection(multiUsername, ws);
+              this.userSeat.set(multiUsername, { room: multiRoomname, seat: existingSeat, isMulti: true });
+              this.userRoom.set(multiUsername, multiRoomname);
+              this.wsActiveMulti.set(ws, { username: multiUsername, room: multiRoomname });
+              
+              const roomClients = this.roomClients.get(multiRoomname);
+              if (roomClients && !roomClients.has(ws)) roomClients.add(ws);
+              
               this._multiJoinLock = false;
               break;
             }
             
+            // HAPUS DUPLIKAT DI SEMUA ROOM
             for (const room of ROOMS) {
               const roomData = this._roomsDataCache[room];
               if (!roomData || !roomData.seats) continue;
@@ -1445,6 +1622,7 @@ export class ChatServer {
               }
             }
             
+            // BERSIHKAN INDEX
             const userRooms = this._getUserRooms(multiUsername);
             for (const [roomNameLoop, seat] of Object.entries(userRooms)) {
               const roomData = this._roomsDataCache[roomNameLoop];
@@ -1463,6 +1641,7 @@ export class ChatServer {
             
             this._removeUserFromAllIndex(multiUsername);
             
+            // PREPARE ROOM DATA
             let roomData = this._roomsDataCache[multiRoomname];
             if (!roomData) {
               roomData = { seats: {}, points: {}, muted: false, number: 1 };
@@ -1470,6 +1649,7 @@ export class ChatServer {
               await this._syncAllData();
             }
             
+            // DOUBLE CHECK - HAPUS DUPLIKAT DI ROOM TUJUAN
             const seatsToRemove2 = [];
             for (const [existingSeatNum, existingData] of Object.entries(roomData.seats)) {
               if (existingData && existingData.namauser === multiUsername) {
@@ -1485,6 +1665,7 @@ export class ChatServer {
               this.broadcast(multiRoomname, ["removeKursi", multiRoomname, seatNum]);
             }
             
+            // CEK KAPASITAS
             const seatCount = Object.keys(roomData.seats).length;
             if (seatCount >= C.MAX_SEATS) {
               this.safeSend(ws, ["multiJoinError", "Room penuh"]);
@@ -1492,6 +1673,7 @@ export class ChatServer {
               break;
             }
             
+            // CARI KURSI
             let seat = this._findAvailableSeat(roomData, multiUsername);
             if (!seat) {
               this.safeSend(ws, ["multiJoinError", "Tidak ada kursi tersedia"]);
@@ -1509,6 +1691,7 @@ export class ChatServer {
               seat = newSeat;
             }
             
+            // ASSIGN KURSI
             roomData.seats[seat] = {
               noimageUrl: "",
               namauser: multiUsername,
@@ -1544,6 +1727,12 @@ export class ChatServer {
             ws._multiRoom = multiRoomname;
             ws._multiSeat = seat;
             
+            // UPDATE MULTI TRACKING
+            this._updateUserConnection(multiUsername, ws);
+            this.userSeat.set(multiUsername, { room: multiRoomname, seat: seat, isMulti: true });
+            this.userRoom.set(multiUsername, multiRoomname);
+            this.wsActiveMulti.set(ws, { username: multiUsername, room: multiRoomname });
+            
             const webSockets = this._getActiveWebSockets();
             for (const wsKey of webSockets) {
               if (wsKey === ws) continue;
@@ -1570,9 +1759,14 @@ export class ChatServer {
                   wsKey._multiRoom = multiRoomname;
                   wsKey._multiSeat = seat;
                   wsKey._closing = false;
+                  
+                  this._updateUserConnection(multiUsername, wsKey);
                 }
               } catch(e) {}
             }
+            
+            const roomClients = this.roomClients.get(multiRoomname);
+            if (roomClients && !roomClients.has(ws)) roomClients.add(ws);
             
             this._refreshRoomClients(true);
             
@@ -1594,76 +1788,45 @@ export class ChatServer {
             break;
           }
           
-          let userSeat = null;
-          const userRooms = this._getUserRooms(targetUsername);
-          const entries = Object.entries(userRooms);
-          if (entries.length > 0) {
-            const [roomName, seat] = entries[0];
-            userSeat = { room: roomName, seat: seat, isMulti: true };
-          }
-          
-          if (!userSeat) {
-            this.safeSend(ws, ["activeChangedMultiError", `User ${targetUsername} tidak ditemukan`]);
-            break;
-          }
-          
-          const roomName = userSeat.room;
-          const seatNumber = userSeat.seat;
-          
-          this._setUserMulti(targetUsername, true);
-          await this._syncAllData();
-          
-          this._onlineUsers.add(targetUsername);
-          await this.ctx.storage.put("onlineUsers", Array.from(this._onlineUsers));
-          
-          const webSockets = this._getActiveWebSockets();
-          let foundAny = false;
-          
-          for (const wsKey of webSockets) {
-            try {
-              const uname = wsKey._cachedUsername || 
-                            wsKey.username || 
-                            wsKey.deserializeAttachment()?.username;
-              
-              if (uname === targetUsername && wsKey.readyState === 1) {
-                wsKey.serializeAttachment({
-                  username: targetUsername,
-                  room: roomName,
-                  seat: seatNumber,
-                  isMulti: true,
-                  multiRoom: roomName,
-                  multiSeat: seatNumber
-                });
-                
-                wsKey._cachedUsername = targetUsername;
-                wsKey._cachedRoom = roomName;
-                wsKey.username = targetUsername;
-                wsKey.idtarget = targetUsername;
-                wsKey.room = roomName;
-                wsKey.roomname = roomName;
-                wsKey._isMulti = true;
-                wsKey._multiRoom = roomName;
-                wsKey._multiSeat = seatNumber;
-                wsKey._closing = false;
-                
-                foundAny = true;
-                
-                this.safeSend(wsKey, ["activeChangedMulti", targetUsername, seatNumber, roomName]);
-                
-                if (wsKey !== ws) {
-                  this.safeSend(ws, ["activeChangedMulti", targetUsername, seatNumber, roomName]);
-                }
-              }
-            } catch(e) {}
-          }
-          
-          if (!foundAny) {
+          try {
+            const seatInfo = this.userSeat.get(targetUsername);
+            if (!seatInfo) {
+              this.safeSend(ws, ["activeChangedMultiError", `User ${targetUsername} tidak ditemukan`]);
+              break;
+            }
+            
+            const roomName = seatInfo.room;
+            const seatNumber = seatInfo.seat;
+            
+            // HAPUS DARI ROOM LAMA
+            const oldActive = this.wsActiveMulti.get(ws);
+            if (oldActive?.room) {
+              const oldClients = this.roomClients.get(oldActive.room);
+              if (oldClients) oldClients.delete(ws);
+            }
+            
+            // SET ACTIVE MULTI
+            this.wsActiveMulti.set(ws, { username: targetUsername, room: roomName });
+            const roomClients = this.roomClients.get(roomName);
+            if (roomClients && !roomClients.has(ws)) roomClients.add(ws);
+            
+            ws.username = targetUsername;
+            ws.idtarget = targetUsername;
+            ws.room = roomName;
+            ws.roomname = roomName;
+            ws._isMulti = true;
+            ws._multiRoom = roomName;
+            ws._multiSeat = seatNumber;
+            
+            this._updateUserConnection(targetUsername, ws);
+            
             this.safeSend(ws, ["activeChangedMulti", targetUsername, seatNumber, roomName]);
+            this.broadcast(roomName, ["userActiveChanged", targetUsername, seatNumber]);
+            this._refreshRoomClients(true);
+            
+          } catch(e) {
+            this.safeSend(ws, ["activeChangedMultiError", e.message]);
           }
-          
-          this.broadcast(roomName, ["userActiveChanged", targetUsername, seatNumber]);
-          this._refreshRoomClients(true);
-          
           break;
         }
         
@@ -1676,53 +1839,67 @@ export class ChatServer {
           }
           
           try {
-            const userRooms = this._getUserRooms(targetUsername);
+            const seatInfo = this.userSeat.get(targetUsername);
+            if (!seatInfo) break;
             
-            for (const [roomNameLoop, seat] of Object.entries(userRooms)) {
-              const roomData = this._roomsDataCache[roomNameLoop];
-              if (roomData && roomData.seats && roomData.seats[seat]) {
-                delete roomData.seats[seat];
+            const roomName = seatInfo.room;
+            const seatNumber = seatInfo.seat;
+            
+            // HAPUS DARI MULTI TRACKING
+            const activeData = this.wsActiveMulti.get(ws);
+            if (activeData?.username === targetUsername) {
+              const roomClients = this.roomClients.get(roomName);
+              if (roomClients) roomClients.delete(ws);
+              this.wsActiveMulti.delete(ws);
+            }
+            
+            // HAPUS DARI ROOM
+            const roomData = this._roomsDataCache[roomName];
+            if (roomData && roomData.seats && roomData.seats[seatNumber]) {
+              if (roomData.seats[seatNumber].namauser === targetUsername) {
+                delete roomData.seats[seatNumber];
                 if (roomData.points) {
-                  delete roomData.points[seat];
+                  delete roomData.points[seatNumber];
                 }
-                
-                this.broadcast(roomNameLoop, ["removeKursi", roomNameLoop, seat]);
-                await this.updateRoomCount(roomNameLoop);
-                await this._deleteRoomIfEmpty(roomNameLoop);
+                this.broadcast(roomName, ["removeKursi", roomName, seatNumber]);
+                await this.updateRoomCount(roomName);
+                await this._deleteRoomIfEmpty(roomName);
               }
             }
             
-            this._removeUserFromAllIndex(targetUsername);
+            // BERSIHKAN INDEX
+            this._removeUserFromIndex(targetUsername, roomName);
             this._onlineUsers.delete(targetUsername);
-            await this._syncAllData();
+            this.userSeat.delete(targetUsername);
+            this.userRoom.delete(targetUsername);
             
-            const webSockets = this._getActiveWebSockets();
-            for (const wsKey of webSockets) {
-              try {
-                const uname = wsKey._cachedUsername || 
-                              wsKey.username || 
-                              wsKey.deserializeAttachment()?.username;
-                if (uname === targetUsername && wsKey.readyState === 1) {
-                  wsKey._isMulti = false;
-                  wsKey._multiRoom = null;
-                  wsKey._multiSeat = null;
-                  wsKey._cachedRoom = null;
-                  wsKey.room = null;
-                  wsKey.roomname = null;
-                  wsKey.idtarget = null;
-                  
-                  wsKey.serializeAttachment({ 
-                    username: targetUsername,
-                    isMulti: false
-                  });
-                  
-                  this.safeSend(wsKey, ["exitMultiSuccess", targetUsername, null, null]);
-                }
-              } catch(e) {}
+            // BERSIHKAN KONEKSI
+            const connections = this.userConnections.get(targetUsername);
+            if (connections) {
+              connections.delete(ws);
+              if (connections.size === 0) {
+                this.userConnections.delete(targetUsername);
+              }
             }
             
-            this._refreshRoomClients(true);
+            await this._syncAllData();
+            
+            // RESET WEBSOCKET
+            ws._isMulti = false;
+            ws._multiRoom = null;
+            ws._multiSeat = null;
+            ws._cachedRoom = null;
+            ws.room = null;
+            ws.roomname = null;
+            ws.idtarget = null;
+            
+            ws.serializeAttachment({ 
+              username: targetUsername,
+              isMulti: false
+            });
+            
             this.safeSend(ws, ["exitMultiSuccess", targetUsername, null, null]);
+            this._refreshRoomClients(true);
             
           } catch(e) {
             this.safeSend(ws, ["exitMultiError", e.message]);
@@ -1745,15 +1922,13 @@ export class ChatServer {
           }
           
           if (username) {
-            // ✅ HAPUS USER DARI ROOM
             await this._cleanUserFromRoom(username, removeRoom);
             
-            // ✅ JIKA BUKAN MULTI, HAPUS DARI SEMUA ROOM
             if (!this._isUserMulti(username)) {
               await this._removeUserFromAllRooms(username);
             }
             
-            // ✅ RESET WEBSOCKET STATE
+            // RESET WEBSOCKET STATE
             const webSockets = this._getActiveWebSockets();
             for (const wsKey of webSockets) {
               try {
@@ -1780,7 +1955,6 @@ export class ChatServer {
             
             this.safeSend(ws, ["removeKursiAndPointSuccess", removeRoom, removeSeat, username]);
           } else {
-            // HAPUS SEAT KOSONG
             if (roomData && roomData.seats && roomData.seats[removeSeat]) {
               delete roomData.seats[removeSeat];
               if (roomData.points) {
@@ -1799,22 +1973,33 @@ export class ChatServer {
         case "updateKursi": {
           const [kursiRoom, kursiSeat, kursiNoimg, kursiName, kursiColor, kursiBawah, kursiAtas, kursiVip, kursiVt] = args;
           
-          const updated = await this._updateKursi(kursiRoom, kursiSeat, {
-            noimageUrl: kursiNoimg || "",
-            namauser: kursiName || "",
-            color: kursiColor || "",
-            itembawah: kursiBawah || 0,
-            itematas: kursiAtas || 0,
-            vip: kursiVip || 0,
-            viptanda: kursiVt || 0
-          });
+          const lockKey = `kursi_${kursiRoom}_${kursiSeat}`;
           
-          if (updated) {
-            const roomData = this._roomsDataCache[kursiRoom];
-            const updatedSeat = roomData?.seats?.[kursiSeat];
-            if (updatedSeat) {
-              this.broadcast(kursiRoom, ["kursiBatchUpdate", kursiRoom, [[kursiSeat, updatedSeat]]]);
+          if (this._kursiLocks.has(lockKey)) {
+            break;
+          }
+          this._kursiLocks.set(lockKey, Date.now());
+          
+          try {
+            const updated = await this._updateKursi(kursiRoom, kursiSeat, {
+              noimageUrl: kursiNoimg || "",
+              namauser: kursiName || "",
+              color: kursiColor || "",
+              itembawah: kursiBawah || 0,
+              itematas: kursiAtas || 0,
+              vip: kursiVip || 0,
+              viptanda: kursiVt || 0
+            });
+            
+            if (updated) {
+              const roomData = this._roomsDataCache[kursiRoom];
+              const updatedSeat = roomData?.seats?.[kursiSeat];
+              if (updatedSeat) {
+                this.broadcast(kursiRoom, ["kursiBatchUpdate", kursiRoom, [[kursiSeat, updatedSeat]]]);
+              }
             }
+          } finally {
+            this._kursiLocks.delete(lockKey);
           }
           break;
         }
@@ -2125,7 +2310,6 @@ export class ChatServer {
               
               const roomData = this._roomsDataCache[roomName];
               if (roomData && roomData.seats && roomData.seats[seat]) {
-                // ✅ VERIFIKASI DATA DI KURSI
                 if (roomData.seats[seat].namauser !== username) {
                   roomData.seats[seat].namauser = username;
                 }
@@ -2152,6 +2336,9 @@ export class ChatServer {
                 
                 if (ws.readyState === 1) {
                   this._onlineUsers.add(username);
+                  this._updateUserConnection(username, ws);
+                  this.userSeat.set(username, { room: roomName, seat: seat, isMulti: isMulti });
+                  this.userRoom.set(username, roomName);
                 }
               } else {
                 ws.serializeAttachment({ username: username });
@@ -2366,6 +2553,9 @@ export class ChatServer {
     this.closing = true;
     this.isDestroyed = true;
     
+    this._joinLocks.clear();
+    this._kursiLocks.clear();
+    
     await this._cleanupStorage();
     
     const webSockets = this._getActiveWebSockets();
@@ -2376,6 +2566,10 @@ export class ChatServer {
       }
     }
     
+    this.wsActiveMulti.clear();
+    this.userConnections.clear();
+    this.userSeat.clear();
+    this.userRoom.clear();
     this.roomClients.clear();
     this._onlineUsers.clear();
     

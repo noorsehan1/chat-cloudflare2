@@ -1,5 +1,5 @@
 // ==================== CHAT-SERVER-HIBERNATION-NO-PING.JS ====================
-// VERSION: 9.7.0 - WITH PHANTOM USER CLEANUP & AUTO RESET ON DEPLOY
+// VERSION: 9.8.0 - FIXED MULTI USER SEAT OVERWRITE
 
 const C = {
   MAX_SEATS: 45,
@@ -26,18 +26,15 @@ export class ChatServer {
     this.isDestroyed = false;
     this._startTime = Date.now();
     
-    // ===== ROOM CLIENTS =====
     this.roomClients = new Map();
     for (const room of ROOMS) {
       this.roomClients.set(room, new Set());
     }
     
-    // ===== CACHE DATA =====
     this._roomsDataCache = {};
     this._userIndex = {};
     this.currentNumber = 1;
     
-    // ===== USER COUNTER =====
     this._onlineUsers = new Set();
     this._userCounts = {};
     for (const room of ROOMS) {
@@ -48,25 +45,17 @@ export class ChatServer {
     this._isRestoring = false;
     this._lastRefreshTime = 0;
     
-    // ✅ AUTO RESET ON DEPLOY + RESTORE
     this._checkAndResetOnDeploy().then(() => {
       this._restoreAllState().then(() => {});
     });
   }
 
-  // ============ CHECK AND RESET ON DEPLOY ============
-
   async _checkAndResetOnDeploy() {
     try {
       const storedVersion = await this.ctx.storage.get("deployVersion");
-      const currentVersion = "9.7.0";
+      const currentVersion = "9.8.0";
       
       if (storedVersion !== currentVersion) {
-        console.log(`🔄 New deploy detected! Resetting all data...`);
-        console.log(`   Old version: ${storedVersion || 'none'}`);
-        console.log(`   New version: ${currentVersion}`);
-        
-        // RESET SEMUA DATA
         this._roomsDataCache = {};
         this._userIndex = {};
         this.currentNumber = 1;
@@ -82,14 +71,10 @@ export class ChatServer {
         await this.ctx.storage.delete("userCounts");
         await this.ctx.storage.delete("onlineUsers");
         
-        // SIMPAN VERSION BARU
         await this.ctx.storage.put("deployVersion", currentVersion);
         await this.ctx.storage.put("lastReset", Date.now());
         
-        console.log(`✅ Reset complete! New version: ${currentVersion}`);
-        
-        // KIRIM NOTIFIKASI KE SEMUA CLIENT
-        const resetMessage = JSON.stringify(["serverReset", `Server updated to version ${currentVersion} - All data reset`]);
+        const resetMessage = JSON.stringify(["serverReset", "Server updated - All data reset"]);
         const webSockets = this._getActiveWebSockets();
         for (const ws of webSockets) {
           try {
@@ -99,15 +84,9 @@ export class ChatServer {
             }
           } catch(e) {}
         }
-      } else {
-        console.log(`✅ Version match: ${currentVersion}, no reset needed`);
       }
-    } catch(e) {
-      console.error("Check reset error:", e);
-    }
+    } catch(e) {}
   }
-
-  // ============ WEBSOCKET MANAGEMENT ============
 
   _getActiveWebSockets() {
     try {
@@ -148,8 +127,6 @@ export class ChatServer {
     }
   }
 
-  // ============ CORE: UPDATE STORAGE ============
-
   async _saveToStorage(roomsData, userIndex, currentNumber) {
     try {
       const updates = {};
@@ -179,8 +156,6 @@ export class ChatServer {
       throw e;
     }
   }
-
-  // ============ USER INDEX OPERATIONS ============
 
   _addUserToIndex(username, roomName, seat) {
     if (!this._userIndex[username]) {
@@ -239,7 +214,23 @@ export class ChatServer {
     return false;
   }
 
-  // ============ USER COUNT MANAGEMENT ============
+  _findAvailableSeat(roomData, username) {
+    // CEK APAKAH USER SUDAH PUNYA KURSI DI ROOM INI
+    for (const [seat, data] of Object.entries(roomData.seats)) {
+      if (data && data.namauser === username) {
+        return parseInt(seat);
+      }
+    }
+    
+    // CARI KURSI KOSONG
+    for (let s = 1; s <= C.MAX_SEATS; s++) {
+      if (!roomData.seats[s]) {
+        return s;
+      }
+    }
+    
+    return null;
+  }
 
   async _updateUserCounts() {
     try {
@@ -271,8 +262,6 @@ export class ChatServer {
       return { counts: this._userCounts, total: this._onlineUsers.size };
     }
   }
-
-  // ============ STORAGE OPERATIONS ============
 
   async _loadFromStorage() {
     try {
@@ -314,8 +303,6 @@ export class ChatServer {
       };
     }
   }
-
-  // ============ USER MANAGEMENT ============
 
   _isUsernameExists(username) {
     if (!username) return false;
@@ -485,13 +472,10 @@ export class ChatServer {
     }
   }
 
-  // ============ CLEANUP PHANTOM USERS ============
-
   async _cleanupPhantomUsers() {
     try {
       let cleaned = 0;
       
-      // 1. CEK SEMUA USER DI INDEX - HAPUS YANG TIDAK PUNYA KURSI
       const usersToRemove = [];
       
       for (const [username, data] of Object.entries(this._userIndex)) {
@@ -520,7 +504,6 @@ export class ChatServer {
         cleaned++;
       }
       
-      // 2. CEK ROOMS DATA - TAMBAHKAN USER YANG ADA DI KURSI TAPI TIDAK DI INDEX
       for (const [roomName, roomData] of Object.entries(this._roomsDataCache)) {
         if (!roomData || !roomData.seats) continue;
         
@@ -552,7 +535,6 @@ export class ChatServer {
         }
       }
       
-      // 3. SIMPAN PERUBAHAN
       if (cleaned > 0) {
         await this._saveToStorage(
           this._roomsDataCache,
@@ -568,8 +550,6 @@ export class ChatServer {
       return 0;
     }
   }
-
-  // ============ JOIN HANDLING ============
 
   async _handleJoin(ws, roomName) {
     if (!ws || !ws.username || !roomName || !ROOMS_SET.has(roomName) || this.closing || this.isDestroyed) {
@@ -616,20 +596,13 @@ export class ChatServer {
       await this._saveToStorage(this._roomsDataCache, undefined, undefined);
     }
     
-    let seat = null;
-    
     const seatCount = Object.keys(roomData.seats).length;
     if (seatCount >= C.MAX_SEATS) {
       this.safeSend(ws, ["roomFull", roomName]);
       return false;
     }
     
-    for (let s = 1; s <= C.MAX_SEATS; s++) {
-      if (!roomData.seats[s]) {
-        seat = s;
-        break;
-      }
-    }
+    const seat = this._findAvailableSeat(roomData, username);
     
     if (!seat) {
       this.safeSend(ws, ["roomFull", roomName]);
@@ -695,8 +668,6 @@ export class ChatServer {
     return true;
   }
 
-  // ============ CLEANUP ============
-
   async _cleanupUserOnDisconnect(ws) {
     try {
       const username = ws.username || ws._cachedUsername;
@@ -744,8 +715,6 @@ export class ChatServer {
       
     } catch(e) {}
   }
-
-  // ============ BROADCAST ============
 
   _broadcastToRoom(room, msgStr) {
     if (this.closing || this.isDestroyed || !room) return;
@@ -800,8 +769,6 @@ export class ChatServer {
       return false;
     }
   }
-
-  // ============ STATE MANAGEMENT ============
 
   async updateRoomCount(room) {
     if (this.closing || this.isDestroyed || !room) return 0;
@@ -867,8 +834,6 @@ export class ChatServer {
       }
     } catch(e) {}
   }
-
-  // ============ ALARM / NUMBER UPDATER ============
 
   async alarm() {
     if (this.closing || this.isDestroyed) return;
@@ -1065,8 +1030,6 @@ export class ChatServer {
     } catch(e) {}
   }
 
-  // ============ WEBSOCKET EVENT HANDLERS ============
-
   async webSocketMessage(ws, message) {
     if (!ws || ws._closing || this.closing || this.isDestroyed) return;
     
@@ -1093,9 +1056,7 @@ export class ChatServer {
       }
       
       await this.handleMessage(ws, message);
-    } catch(e) {
-      console.error("WebSocket message error:", e);
-    }
+    } catch(e) {}
   }
 
   async webSocketClose(ws, code, reason, wasClean) {
@@ -1111,8 +1072,6 @@ export class ChatServer {
       await this._cleanupUserOnDisconnect(ws);
     } catch(e) {}
   }
-
-  // ============ HANDLE SET ID ============
 
   async _handleSetId(ws, username, isNewUser) {
     if (!ws || !username || typeof username !== 'string' || username.length === 0 || this.closing || this.isDestroyed) {
@@ -1146,8 +1105,6 @@ export class ChatServer {
     }
   }
 
-  // ============ HANDLE MESSAGE ============
-
   async handleMessage(ws, raw) {
     if (!ws) return;
     try {
@@ -1174,8 +1131,6 @@ export class ChatServer {
       await this._handleEventInternal(ws, [evt, ...args]);
     } catch(e) {}
   }
-
-  // ============ EVENT HANDLER INTERNAL ============
 
   async _handleEventInternal(ws, data) {
     try {
@@ -1254,20 +1209,13 @@ export class ChatServer {
             await this._saveToStorage(this._roomsDataCache, undefined, undefined);
           }
           
-          let seat = null;
-          
           const seatCount = Object.keys(roomData.seats).length;
           if (seatCount >= C.MAX_SEATS) {
             this.safeSend(ws, ["multiJoinError", "Room penuh"]);
             break;
           }
           
-          for (let s = 1; s <= C.MAX_SEATS; s++) {
-            if (!roomData.seats[s]) {
-              seat = s;
-              break;
-            }
-          }
+          const seat = this._findAvailableSeat(roomData, multiUsername);
           
           if (!seat) {
             this.safeSend(ws, ["multiJoinError", "Tidak ada kursi tersedia"]);
@@ -1752,8 +1700,6 @@ export class ChatServer {
     } catch(e) {}
   }
 
-  // ============ RESTORE STATE ============
-
   async _restoreAllState() {
     if (this._isRestoring) return;
     this._isRestoring = true;
@@ -1832,13 +1778,10 @@ export class ChatServer {
       }
       
     } catch(e) {
-      console.error("Restore state error:", e);
     } finally {
       this._isRestoring = false;
     }
   }
-
-  // ============ RESET ALL DATA ============
 
   async resetAllData() {
     const timestamp = Date.now();
@@ -1902,8 +1845,6 @@ export class ChatServer {
     }
   }
 
-  // ============ FETCH ============
-
   async fetch(req) {
     if (this.closing || this.isDestroyed) {
       return new Response("Shutting down", { status: 503 });
@@ -1942,8 +1883,7 @@ export class ChatServer {
           isClosing: this.closing,
           isDestroyed: this.isDestroyed,
           uptime: Date.now() - this._startTime,
-          userIndexSize: Object.keys(this._userIndex).length,
-          deployVersion: await this.ctx.storage.get("deployVersion") || "unknown"
+          userIndexSize: Object.keys(this._userIndex).length
         };
         return new Response(JSON.stringify(status), {
           status: 200,
@@ -1995,12 +1935,9 @@ export class ChatServer {
       });
       
     } catch(e) {
-      console.error("Fetch error:", e);
       return new Response("Internal Server Error", { status: 500 });
     }
   }
-
-  // ============ DESTROY ============
 
   async destroy() {
     if (this.isDestroyed) return;

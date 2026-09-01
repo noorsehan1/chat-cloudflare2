@@ -1,12 +1,12 @@
 // ==================== CHAT-SERVER.JS ====================
-// VERSION: 3.2.4 - AUTO RESTORE ON ANY EVENT (CLOUDFLARE HIBERNATION)
+// VERSION: 3.1.0 - WITH HIBERNATION SUPPORT
 
 const C = {
   MAX_SEATS: 45,
   MAX_GLOBAL_CONNECTIONS: 150,
   ALARM_INTERVAL_MS: 900000,    // 15 MENIT
   MAX_NUMBER: 6,
-  STORAGE_VERSION: "3.2.4"
+  STORAGE_VERSION: "3.1.0"
 };
 
 const ROOMS = [
@@ -175,7 +175,6 @@ export class ChatServer {
     this._restoreComplete = false;
     this._saveTimeout = null;
     this._savePending = false;
-    this._lastRestoreTime = 0;
     
     // ========== WEBSOCKET ==========
     this.wsSet = new Set();
@@ -199,7 +198,7 @@ export class ChatServer {
       this.roomClients.set(room, new Set());
     }
     
-    // ========== RESTORE FROM STORAGE (GLOBAL DATA) ==========
+    // ========== RESTORE FROM STORAGE ==========
     this._restoreAllState().then(() => {
       this._restoreComplete = true;
       try {
@@ -243,39 +242,6 @@ export class ChatServer {
     }
   }
 
-  // ============ SAVE WITH DEBOUNCE ============
-  
-  _scheduleSave() {
-    if (this.closing || this.isDestroyed) return;
-    
-    this._savePending = true;
-    
-    if (this._saveTimeout) {
-      clearTimeout(this._saveTimeout);
-      this._saveTimeout = null;
-    }
-    
-    this._saveTimeout = setTimeout(async () => {
-      this._saveTimeout = null;
-      if (this._savePending && !this.closing && !this.isDestroyed) {
-        await this._saveAllToStorage();
-      }
-    }, 100);
-  }
-
-  // ============ FORCE SAVE IMMEDIATE ============
-  
-  async _forceSave() {
-    if (this.closing || this.isDestroyed) return;
-    
-    if (this._saveTimeout) {
-      clearTimeout(this._saveTimeout);
-      this._saveTimeout = null;
-    }
-    
-    await this._saveAllToStorage();
-  }
-
   async _loadAllFromStorage() {
     try {
       const data = await this.ctx.storage.get([
@@ -299,7 +265,6 @@ export class ChatServer {
       }
       
       this.currentNumber = data.currentNumber || 1;
-      this._lastRestoreTime = Date.now();
       
       return true;
     } catch(e) {
@@ -307,17 +272,46 @@ export class ChatServer {
     }
   }
 
-  // ============ RESTORE WEBSOCKET STATE (DARI ATTACHMENT) ============
+  // ============ SAVE WITH DEBOUNCE ============
+  
+  _scheduleSave() {
+    if (this.closing || this.isDestroyed) return;
+    
+    this._savePending = true;
+    
+    if (this._saveTimeout) {
+      clearTimeout(this._saveTimeout);
+      this._saveTimeout = null;
+    }
+    
+    this._saveTimeout = setTimeout(async () => {
+      this._saveTimeout = null;
+      if (this._savePending && !this.closing && !this.isDestroyed) {
+        await this._saveAllToStorage();
+      }
+    }, 100);
+  }
+
+  async _forceSave() {
+    if (this.closing || this.isDestroyed) return;
+    
+    if (this._saveTimeout) {
+      clearTimeout(this._saveTimeout);
+      this._saveTimeout = null;
+    }
+    
+    await this._saveAllToStorage();
+  }
+
+  // ============ RESTORE WEBSOCKET STATE ============
   
   async _restoreWebSocket(ws) {
     try {
-      // Baca attachment dari WebSocket
       let attachment = null;
       try {
         attachment = ws.deserializeAttachment();
       } catch(e) {}
       
-      // Jika tidak ada attachment, skip
       if (!attachment || !attachment.username) {
         return false;
       }
@@ -336,7 +330,7 @@ export class ChatServer {
       ws._isMulti = isMulti;
       ws._restored = true;
       
-      // Tambahkan ke userConnections
+      // Add to connections
       if (ws.readyState === 1) {
         let connections = this.userConnections.get(username);
         if (!connections) {
@@ -345,13 +339,11 @@ export class ChatServer {
         }
         connections.add(ws);
         
-        // Tambahkan ke roomClients
         if (roomName) {
           const roomClients = this.roomClients.get(roomName);
           if (roomClients) roomClients.add(ws);
         }
         
-        // Tambahkan ke wsSet
         this.wsSet.add(ws);
       }
       
@@ -387,11 +379,9 @@ export class ChatServer {
     this._isRestoring = true;
     
     try {
-      // Cek version storage
       const storedVersion = await this.ctx.storage.get("storageVersion");
       
       if (storedVersion !== C.STORAGE_VERSION) {
-        // Reset semua data
         this.rooms.clear();
         for (const room of ROOMS) {
           this.rooms.set(room, new RoomManager(room));
@@ -401,21 +391,17 @@ export class ChatServer {
         this.currentNumber = 1;
         await this._forceSave();
       } else {
-        // Load dari storage
         await this._loadAllFromStorage();
       }
       
-      // Restore semua WebSocket dari attachment
       await this._restoreAllWebSocketStates();
       
-      // Broadcast room count
       for (const [room, roomMan] of this.rooms) {
         const count = roomMan.getCount();
         this.broadcast(room, ["roomUserCount", room, count]);
       }
       
     } catch(e) {
-      // Fallback: reset
       this.rooms.clear();
       for (const room of ROOMS) {
         this.rooms.set(room, new RoomManager(room));
@@ -435,7 +421,6 @@ export class ChatServer {
     if (this.closing || this.isDestroyed) return;
     
     try {
-      // Update number (setiap 15 menit)
       this.currentNumber = this.currentNumber < C.MAX_NUMBER ? this.currentNumber + 1 : 1;
       
       for (const room of this.rooms.values()) {
@@ -475,7 +460,7 @@ export class ChatServer {
         }
       }
       
-      // Cleanup memory (points without seats)
+      // Cleanup memory
       for (const [roomName, roomMan] of this.rooms) {
         if (roomMan) {
           const pointsToRemove = [];
@@ -490,7 +475,6 @@ export class ChatServer {
         }
       }
       
-      // Save to storage
       await this._forceSave();
       
     } catch(e) {}
@@ -713,7 +697,6 @@ export class ChatServer {
   
   async handleMessage(ws, raw) {
     if (!ws) return;
-    
     try {
       if (ws.readyState !== 1 || ws._closing || this.closing || this.isDestroyed) {
         return;
@@ -806,7 +789,6 @@ export class ChatServer {
             const roomClients = this.roomClients.get(multiRoomname);
             if (roomClients && !roomClients.has(ws)) roomClients.add(ws);
             
-            // ===== SIMPAN KE ATTACHMENT =====
             ws.serializeAttachment({
               username: multiUsername,
               room: multiRoomname,
@@ -858,7 +840,6 @@ export class ChatServer {
               }
             }
             
-            // ===== UPDATE ATTACHMENT =====
             ws.serializeAttachment({
               username: targetUsername,
               isMulti: false
@@ -898,7 +879,6 @@ export class ChatServer {
             ws.room = roomName;
             ws.roomname = roomName;
             
-            // ===== UPDATE ATTACHMENT =====
             ws.serializeAttachment({
               username: targetUsername,
               room: roomName,
@@ -1230,7 +1210,6 @@ export class ChatServer {
         ws.roomname = null;
         ws._closing = false;
         
-        // ===== SIMPAN KE ATTACHMENT =====
         ws.serializeAttachment({
           username: username,
           isMulti: true
@@ -1332,7 +1311,6 @@ export class ChatServer {
         ws.roomname = null;
         ws._closing = false;
         
-        // ===== SIMPAN KE ATTACHMENT =====
         ws.serializeAttachment({
           username: username,
           isMulti: false
@@ -1445,7 +1423,6 @@ export class ChatServer {
       ws.roomname = roomName;
       ws.idtarget = username;
       
-      // ===== SIMPAN KE ATTACHMENT =====
       ws.serializeAttachment({
         username: username,
         room: roomName,
@@ -1518,7 +1495,6 @@ export class ChatServer {
       server._isMulti = false;
       server._restored = false;
       
-      // ===== INIT ATTACHMENT KOSONG =====
       server.serializeAttachment({});
       
       if (!this.wsSet.has(server)) {
@@ -1537,8 +1513,7 @@ export class ChatServer {
   async webSocketMessage(ws, msg) { 
     if (!ws || ws._closing || this.closing || this.isDestroyed) return;
     
-    // ===== OTOMATIS RESTORE JIKA HIBERNATE =====
-    // Cloudflare akan panggil ini, kita restore dari attachment
+    // ===== RESTORE DARI ATTACHMENT JIKA HIBERNATE =====
     if (!ws.username || !ws._restored) {
       try {
         const restored = await this._restoreWebSocket(ws);
@@ -1556,7 +1531,7 @@ export class ChatServer {
   async webSocketClose(ws) { 
     if (!ws) return;
     
-    // ===== OTOMATIS RESTORE JIKA HIBERNATE =====
+    // ===== RESTORE DARI ATTACHMENT JIKA HIBERNATE =====
     if (!ws.username || !ws._restored) {
       try {
         const restored = await this._restoreWebSocket(ws);
@@ -1574,7 +1549,7 @@ export class ChatServer {
   async webSocketError(ws) { 
     if (!ws) return;
     
-    // ===== OTOMATIS RESTORE JIKA HIBERNATE =====
+    // ===== RESTORE DARI ATTACHMENT JIKA HIBERNATE =====
     if (!ws.username || !ws._restored) {
       try {
         const restored = await this._restoreWebSocket(ws);
